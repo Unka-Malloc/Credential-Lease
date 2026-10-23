@@ -1,0 +1,15 @@
+[package]
+name = "credential-lease"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host-neutral credential lease contract: custody holds root credentials; runtimes receive process-bound, revocable, time-limited leases."
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+licoup-foundation.workspace = true
