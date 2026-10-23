@@ -33,6 +33,26 @@ impl CredentialKind for TestKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum EscapedKind {
+    Control,
+}
+
+impl CredentialKind for EscapedKind {
+    const HANDOFF_SCHEMA: &'static str = "test.escaped-family.handoff.v1";
+
+    fn as_str(self) -> &'static str {
+        "es\u{1}cap\"e\\d"
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "es\u{1}cap\"e\\d" => Some(Self::Control),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum OtherKind {
     Gamma,
 }
@@ -248,6 +268,26 @@ fn handoff_round_trip_preserves_credentials_duration_and_epoch() {
         rebuilt.resolve(TestKind::Beta).unwrap().expose_bytes(),
         b"synthetic-beta-key-1"
     );
+}
+
+#[test]
+fn handoff_size_estimate_covers_escaped_names() {
+    // A kind name carrying a control character and quotes escapes to more
+    // bytes than its raw length; the serialized reserve must still cover the
+    // emitted document, or the buffer would grow after secrets were written.
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let mut credentials = BTreeMap::new();
+    credentials.insert(
+        EscapedKind::Control,
+        vec![test_credential("synthetic-esc-key")],
+    );
+    let handoff =
+        CredentialHandoff::<EscapedKind>::new(credentials, Duration::from_secs(60), epoch.clone())
+            .unwrap();
+    let payload = handoff.to_json().unwrap();
+    assert!(payload.expose_bytes().len() <= handoff.serialized_len_upper_bound());
+    let reparsed = CredentialHandoff::<EscapedKind>::from_json(payload.expose_bytes()).unwrap();
+    assert_eq!(reparsed.epoch(), epoch.as_str());
 }
 
 #[test]

@@ -66,9 +66,11 @@ rejection — no partial credential set may ever be constructed from a
 truncated or tampered document. Three contract rules apply before and
 during parsing:
 
-- **Size.** A serialized document is at most `2115584` bytes
-  (`64 * (8192 * 4 + 160) + 1024`); larger inputs are refused before any
-  parsing work begins.
+- **Size.** A serialized document is at most `2117632` bytes
+  (`64 * (8192 * 4 + 192) + 8192`); larger inputs are refused before any
+  parsing work begins, and producers refuse to emit above it.
+- **Name bounds.** `schemaVersion` values are at most 128 bytes; `kind`
+  names are at most 64 bytes. Larger values reject the document.
 - **Duplicate member names.** Every object member name must be unique;
   a duplicate name rejects the whole document — the closed contract has
   no last-wins semantics.
