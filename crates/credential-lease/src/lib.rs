@@ -26,7 +26,7 @@ pub use credential::{
     LeasedCredential, MAX_CREDENTIAL_BYTES, MAX_LEASED_CREDENTIALS, MAX_LEASE_DURATION_SECONDS,
 };
 pub use epoch::LeaseEpochSource;
-pub use handoff::CredentialHandoff;
+pub use handoff::{CredentialHandoff, HandoffDocument};
 pub use kind::CredentialKind;
 pub use lease::{CredentialLease, CredentialSlot};
 pub use port::CustodyPort;

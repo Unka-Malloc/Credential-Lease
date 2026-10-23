@@ -53,6 +53,27 @@ impl CredentialKind for EscapedKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum OversizeSchemaKind {
+    Only,
+}
+
+impl CredentialKind for OversizeSchemaKind {
+    // Over the contract's 128-byte schema-name bound.
+    const HANDOFF_SCHEMA: &'static str = "test.oversize.schema.family.this.constant.is.made.deliberately.longer.than.one.hundred.and.twenty.eight.bytes.for.the.rejection.test";
+
+    fn as_str(self) -> &'static str {
+        "only"
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "only" => Some(Self::Only),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum OtherKind {
     Gamma,
 }
@@ -288,6 +309,52 @@ fn handoff_size_estimate_covers_escaped_names() {
     assert!(payload.expose_bytes().len() <= handoff.serialized_len_upper_bound());
     let reparsed = CredentialHandoff::<EscapedKind>::from_json(payload.expose_bytes()).unwrap();
     assert_eq!(reparsed.epoch(), epoch.as_str());
+}
+
+#[test]
+fn handoff_rejects_oversize_schema_name() {
+    // A family whose schema constant exceeds the contract's 128-byte bound
+    // must be refused at parse time, matching the producer-side refusal.
+    let document = serde_json::json!({
+        "schemaVersion": OversizeSchemaKind::HANDOFF_SCHEMA,
+        "leaseDurationSeconds": 60,
+        "epoch": uuid::Uuid::new_v4().to_string(),
+        "credentials": [{"kind": "only", "keys": [handoff_key(serde_json::json!([120]))]}],
+    });
+    assert!(CredentialHandoff::<OversizeSchemaKind>::from_json(
+        &serde_json::to_vec(&document).unwrap()
+    )
+    .is_err());
+}
+
+#[test]
+fn maximal_inventory_serializes_within_document_bound() {
+    // The documented bound must cover the largest inventory the contract
+    // admits: 64 credentials of 8192 secret bytes with maximal expiries.
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let mut credentials = BTreeMap::new();
+    credentials.insert(
+        TestKind::Alpha,
+        (0..MAX_LEASED_CREDENTIALS)
+            .map(|_| {
+                LeasedCredential::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    SecretBytes::try_from_bytes(vec![0xAA; MAX_CREDENTIAL_BYTES]).unwrap(),
+                    Some(u64::MAX),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>(),
+    );
+    let handoff = CredentialHandoff::<TestKind>::new(
+        credentials,
+        Duration::from_secs(MAX_LEASE_DURATION_SECONDS),
+        epoch,
+    )
+    .unwrap();
+    let payload = handoff.to_json().unwrap();
+    assert!(payload.expose_bytes().len() <= handoff.serialized_len_upper_bound());
+    assert!(payload.expose_bytes().len() <= MAX_HANDOFF_DOC_BYTES);
 }
 
 #[test]
