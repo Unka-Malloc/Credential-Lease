@@ -36,7 +36,7 @@ Closed set — any additional or missing field rejects the document.
 | Field | Type | Rule |
 | --- | --- | --- |
 | `schemaVersion` | string | Must equal the family schema constant pinned by the kind family. A document minted under one family's schema must never parse as another family. |
-| `leaseDurationSeconds` | unsigned integer | `1..=31689600` (366 days). The upper bound of the runtime lease minted from this handoff. |
+| `leaseDurationSeconds` | unsigned integer | `1..=31622400` (366 days). The upper bound of the runtime lease minted from this handoff. |
 | `epoch` | string | Canonical lowercase UUID; identifies the custody epoch this handoff was minted under. |
 | `credentials` | array | Entries below; may be empty when a disconnected projection is serialized. |
 
@@ -63,7 +63,17 @@ Closed set — `credentialId`, `expiresAtEpochSeconds`, `secret` only.
 
 Every malformed shape fails closed with a single indistinguishable
 rejection — no partial credential set may ever be constructed from a
-truncated or tampered document.
+truncated or tampered document. Three contract rules apply before and
+during parsing:
+
+- **Size.** A serialized document is at most `2115584` bytes
+  (`64 * (8192 * 4 + 160) + 1024`); larger inputs are refused before any
+  parsing work begins.
+- **Duplicate member names.** Every object member name must be unique;
+  a duplicate name rejects the whole document — the closed contract has
+  no last-wins semantics.
+- **Closed fields.** Only the fields listed above may appear, at every
+  level.
 
 ## Lease semantics (runtime side)
 
@@ -72,10 +82,11 @@ exit. Two independent liveness checks apply on every use:
 
 1. The lease's own duration — an `Instant`-relative upper bound minted at
    rebuild time.
-2. The custody epoch — the runtime's epoch source must still report the
-   handoff's epoch. An owner-initiated revocation rotates the epoch and
-   kills every outstanding lease on its next use. Rechecks are throttled to
-   at most once per second.
+2. The custody epoch — the runtime's epoch source is consulted on every
+   resolution and must still report the handoff's epoch. An
+   owner-initiated revocation rotates the epoch and kills every
+   outstanding lease on its very next use; there is no cached
+   authorization window.
 
 Credentials past their own `expiresAtEpochSeconds` never resolve. Resolving
 yields copies of secret material; the lease retains its own bytes.
