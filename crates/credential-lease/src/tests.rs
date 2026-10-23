@@ -53,6 +53,34 @@ impl CredentialKind for EscapedKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum MaxEscapedKind {
+    Only,
+}
+
+impl CredentialKind for MaxEscapedKind {
+    // Exactly the 128-byte bound: 32 control bytes escape to 6 JSON bytes
+    // each, so the emitted schema spans 290 bytes.
+    const HANDOFF_SCHEMA: &'static str =
+        "\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\
+         \u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\
+         test.schema.family.name.padded.to.the.bound.exactly.for.the.escape.test.zzzzzzzzzzzzzzzzzzzzzzzz";
+
+    fn as_str(self) -> &'static str {
+        // Exactly the 64-byte bound: 16 control bytes plus 48 name bytes
+        // escape to a 146-byte emitted name.
+        "\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\u{7}\
+         kind.name.padded.to.the.bound.for.escape.test.zz"
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            v if v == Self::Only.as_str() => Some(Self::Only),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum OversizeSchemaKind {
     Only,
 }
@@ -330,11 +358,13 @@ fn handoff_rejects_oversize_schema_name() {
 #[test]
 fn maximal_inventory_serializes_within_document_bound() {
     // The documented bound must cover the largest inventory the contract
-    // admits: 64 credentials of 8192 secret bytes with maximal expiries.
+    // admits: 64 credentials of 8192 secret bytes with maximal expiries,
+    // under a schema and kind name at their byte bounds with heavy
+    // escaping.
     let epoch = uuid::Uuid::new_v4().to_string();
     let mut credentials = BTreeMap::new();
     credentials.insert(
-        TestKind::Alpha,
+        MaxEscapedKind::Only,
         (0..MAX_LEASED_CREDENTIALS)
             .map(|_| {
                 LeasedCredential::new(
@@ -346,7 +376,7 @@ fn maximal_inventory_serializes_within_document_bound() {
             })
             .collect::<Vec<_>>(),
     );
-    let handoff = CredentialHandoff::<TestKind>::new(
+    let handoff = CredentialHandoff::<MaxEscapedKind>::new(
         credentials,
         Duration::from_secs(MAX_LEASE_DURATION_SECONDS),
         epoch,
