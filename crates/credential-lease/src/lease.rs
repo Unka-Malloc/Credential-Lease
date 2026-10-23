@@ -214,29 +214,27 @@ impl<K: CredentialKind> CredentialSlot<K> {
     }
 
     /// Resolve one currently valid secret for `kind`, rotating the
-    /// selection across candidates and copying only the chosen secret.
+    /// selection across candidates and copying only the chosen secret. The
+    /// candidate list is snapshotted once so counting and selection cannot
+    /// disagree across an expiry boundary.
     pub fn resolve(&self, kind: K) -> Result<SecretBytes> {
         let guard = self
             .inner
             .lock()
             .map_err(|_| anyhow!("credential_lease_validation_unavailable"))?;
-        let count = guard.valid_candidates(kind)?.count();
-        ensure!(count > 0, "credential_lease_unavailable");
+        let candidates: Vec<&LeasedCredential> = guard.valid_candidates(kind)?.collect();
+        ensure!(!candidates.is_empty(), "credential_lease_unavailable");
         let start = {
             let mut cursors = self
                 .selection_cursors
                 .lock()
                 .map_err(|_| anyhow!("credential_lease_validation_unavailable"))?;
             let cursor = cursors.entry(kind).or_insert(0);
-            let start = *cursor % count;
+            let start = *cursor % candidates.len();
             *cursor = cursor.wrapping_add(1);
             start
         };
-        let selected = guard
-            .valid_candidates(kind)?
-            .nth(start)
-            .map(LeasedCredential::copy_secret);
-        selected.ok_or_else(|| anyhow!("credential_lease_unavailable"))
+        Ok(candidates[start].copy_secret())
     }
 
     /// Returns every currently valid credential in rotating order.
