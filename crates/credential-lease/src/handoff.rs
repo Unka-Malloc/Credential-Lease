@@ -19,12 +19,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::Duration;
 
+/// Upper bound on a kind family's schema name.
+pub const MAX_HANDOFF_SCHEMA_BYTES: usize = 128;
+
+/// Upper bound on one kind name inside a handoff document.
+pub const MAX_KIND_NAME_BYTES: usize = 64;
+
 /// Upper bound on a serialized handoff document, derived from the
 /// credential inventory bounds: every credential serializes to an id, an
-/// expiry, and a byte array of at most ~4 characters per secret byte.
-/// Inputs above the bound are refused before any parsing work begins.
+/// expiry, and a byte array of at most ~4 characters per secret byte, plus
+/// per-entry, per-key, and document structure overhead. Inputs above the
+/// bound are refused before any parsing work begins, and serialization
+/// refuses to produce a document above it.
 pub const MAX_HANDOFF_DOC_BYTES: usize =
-    MAX_LEASED_CREDENTIALS * (MAX_CREDENTIAL_BYTES * 4 + 160) + 1024;
+    MAX_LEASED_CREDENTIALS * (MAX_CREDENTIAL_BYTES * 4 + 192) + 8192;
 
 /// A portable projection of unlocked credentials for one kind family.
 pub struct CredentialHandoff<K: CredentialKind> {
@@ -90,10 +98,21 @@ impl<K: CredentialKind> CredentialHandoff<K> {
 
     /// Serialize the handoff as a closed JSON document. The output is a
     /// [`SecretBytes`] so the serialized secret material zeroizes on drop.
-    /// Serialization writes secrets straight from their slices — no
-    /// intermediate `Value` or `Vec<u8>` plaintext copies are produced.
+    ///
+    /// The buffer is reserved to a computed upper bound before writing, so
+    /// it never grows: exactly one allocation holds secret material, and it
+    /// moves straight into the returned `SecretBytes` — no intermediate
+    /// `Value`, `Vec<u8>`, or freed plaintext remnants are produced.
     pub fn to_json(&self) -> Result<SecretBytes> {
-        let mut document = String::with_capacity(MAX_HANDOFF_DOC_BYTES.min(1 << 20));
+        ensure!(
+            K::HANDOFF_SCHEMA.len() <= MAX_HANDOFF_SCHEMA_BYTES
+                && self
+                    .credentials
+                    .keys()
+                    .all(|kind| kind.as_str().len() <= MAX_KIND_NAME_BYTES),
+            "credential_lease_handoff_invalid"
+        );
+        let mut document = String::with_capacity(self.serialized_len_upper_bound());
         document.push_str("{\"schemaVersion\":");
         push_json_string(&mut document, K::HANDOFF_SCHEMA);
         document.push_str(",\"leaseDurationSeconds\":");
@@ -124,15 +143,37 @@ impl<K: CredentialKind> CredentialHandoff<K> {
                     if byte_index > 0 {
                         document.push(',');
                     }
-                    document.push_str(&byte.to_string());
+                    push_decimal(&mut document, *byte);
                 }
                 document.push_str("]}");
             }
             document.push_str("]}");
         }
         document.push_str("]}");
+        ensure!(
+            document.len() <= MAX_HANDOFF_DOC_BYTES,
+            "credential_lease_handoff_invalid"
+        );
         SecretBytes::try_from_bytes(document.into_bytes())
             .map_err(|_| anyhow!("credential_lease_handoff_serialize_failed"))
+    }
+
+    /// An upper bound on this handoff's serialized length: every structural
+    /// byte plus, per credential, its id, expiry, and at most 4 characters
+    /// per secret byte. Reserving this much means the document string never
+    /// re-allocates while secrets are being written into it.
+    fn serialized_len_upper_bound(&self) -> usize {
+        let mut length = 96 + K::HANDOFF_SCHEMA.len() + self.epoch.len() + 20;
+        for (kind, keys) in &self.credentials {
+            length += 32 + kind.as_str().len();
+            for key in keys {
+                length += 96
+                    + key.credential_id().len()
+                    + key.expires_at_epoch_seconds().map_or(4, decimal_digits)
+                    + key.copy_secret().expose_bytes().len() * 4;
+            }
+        }
+        length
     }
 
     /// Parse and fully validate a handoff document for this kind family.
@@ -199,6 +240,7 @@ impl<K: CredentialKind> CredentialHandoff<K> {
             let kind_value = entry_object
                 .get("kind")
                 .and_then(serde_json::Value::as_str)
+                .filter(|value| value.len() <= MAX_KIND_NAME_BYTES)
                 .ok_or_else(invalid)?;
             let kind = K::from_str(kind_value).ok_or_else(invalid)?;
             ensure!(
@@ -303,6 +345,27 @@ pub(crate) fn validate_credentials<K: CredentialKind>(
         );
     }
     Ok(())
+}
+
+fn decimal_digits(mut value: u64) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+/// Append a byte's decimal form straight into the document — no temporary
+/// allocation is produced per byte.
+fn push_decimal(buffer: &mut String, value: u8) {
+    if value >= 100 {
+        buffer.push((b'0' + value / 100) as char);
+    }
+    if value >= 10 {
+        buffer.push((b'0' + value / 10 % 10) as char);
+    }
+    buffer.push((b'0' + value % 10) as char);
 }
 
 /// Append `value` as a JSON string literal with the escaping the contract

@@ -233,6 +233,21 @@ fn handoff_round_trip_preserves_credentials_duration_and_epoch() {
     assert_eq!(parsed.lease_duration(), Duration::from_secs(7200));
     assert_eq!(parsed.epoch(), epoch.as_str());
     assert_eq!(parsed.kinds().count(), 2);
+    // The serialized secret bytes round-trip intact: a lease rebuilt from
+    // the parsed handoff resolves the same credentials.
+    let rebuilt = CredentialLease::from_handoff(
+        parsed,
+        Arc::new(TestEpochSource(StdMutex::new(Some(epoch)))),
+    )
+    .unwrap();
+    assert_eq!(
+        rebuilt.resolve(TestKind::Alpha).unwrap().expose_bytes(),
+        b"synthetic-alpha-key-1"
+    );
+    assert_eq!(
+        rebuilt.resolve(TestKind::Beta).unwrap().expose_bytes(),
+        b"synthetic-beta-key-1"
+    );
 }
 
 #[test]

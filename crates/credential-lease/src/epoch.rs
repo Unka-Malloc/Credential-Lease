@@ -2,7 +2,8 @@
 //!
 //! A lease is valid only while the custody owner's active epoch still equals
 //! the epoch the lease was minted under. The host supplies the epoch; the
-//! lease rechecks it lazily on use, at most once per validation interval.
+//! lease consults it on every credential resolution — there is no cached
+//! authorization window — so the source should be cheap to consult.
 //!
 //! A custody owner rotates the epoch to revoke every outstanding lease at
 //! once — credential rotation, lock, or reset all mint a new epoch, so a
