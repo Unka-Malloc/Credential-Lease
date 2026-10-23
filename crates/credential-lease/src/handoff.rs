@@ -139,7 +139,7 @@ impl<K: CredentialKind> CredentialHandoff<K> {
                     None => document.push_str("null"),
                 }
                 document.push_str(",\"secret\":[");
-                for (byte_index, byte) in key.copy_secret().expose_bytes().iter().enumerate() {
+                for (byte_index, byte) in key.expose_secret().iter().enumerate() {
                     if byte_index > 0 {
                         document.push(',');
                     }
@@ -159,18 +159,19 @@ impl<K: CredentialKind> CredentialHandoff<K> {
     }
 
     /// An upper bound on this handoff's serialized length: every structural
-    /// byte plus, per credential, its id, expiry, and at most 4 characters
-    /// per secret byte. Reserving this much means the document string never
-    /// re-allocates while secrets are being written into it.
-    fn serialized_len_upper_bound(&self) -> usize {
-        let mut length = 96 + K::HANDOFF_SCHEMA.len() + self.epoch.len() + 20;
+    /// byte plus, for each embedded string, its exact escaped JSON length,
+    /// and at most 4 characters per secret byte. Reserving this much means
+    /// the document string never re-allocates while secrets are being
+    /// written into it — escaping cannot exceed the reserve.
+    pub(crate) fn serialized_len_upper_bound(&self) -> usize {
+        let mut length = 96 + escaped_len(K::HANDOFF_SCHEMA) + escaped_len(&self.epoch) + 20;
         for (kind, keys) in &self.credentials {
-            length += 32 + kind.as_str().len();
+            length += 32 + escaped_len(kind.as_str());
             for key in keys {
                 length += 96
-                    + key.credential_id().len()
+                    + escaped_len(key.credential_id())
                     + key.expires_at_epoch_seconds().map_or(4, decimal_digits)
-                    + key.copy_secret().expose_bytes().len() * 4;
+                    + key.expose_secret().len() * 4;
             }
         }
         length
@@ -368,6 +369,21 @@ fn push_decimal(buffer: &mut String, value: u8) {
     buffer.push((b'0' + value % 10) as char);
 }
 
+/// The exact byte length [`push_json_string`] emits for `value`, including
+/// the surrounding quotes. Sizing with escaped lengths — not raw lengths —
+/// keeps the document buffer's no-growth invariant true for
+/// control-character and multi-byte names.
+fn escaped_len(value: &str) -> usize {
+    2 + value
+        .chars()
+        .map(|character| match character {
+            '"' | '\\' | '\n' | '\r' | '\t' => 2,
+            character if character < ' ' => 6,
+            character => character.len_utf8(),
+        })
+        .sum::<usize>()
+}
+
 /// Append `value` as a JSON string literal with the escaping the contract
 /// requires — control characters, quotes, and backslashes are the only
 /// escapes a conforming producer needs.
@@ -381,7 +397,12 @@ fn push_json_string(buffer: &mut String, value: &str) {
             '\r' => buffer.push_str("\\r"),
             '\t' => buffer.push_str("\\t"),
             character if character < ' ' => {
-                buffer.push_str(&format!("\\u{:04x}", character as u32));
+                buffer.push_str("\\u00");
+                buffer.push((b'0' + (character as u8 >> 4)) as char);
+                buffer.push(match character as u8 & 0x0f {
+                    digit @ 0..=9 => (b'0' + digit) as char,
+                    digit => (b'a' + digit - 10) as char,
+                });
             }
             character => buffer.push(character),
         }

@@ -72,6 +72,12 @@ impl LeasedCredential {
     pub fn copy_secret(&self) -> SecretBytes {
         self.secret.copy_for_persistent_read()
     }
+
+    /// Borrow the secret bytes in place — no copy is produced. Used by the
+    /// serializer, which only needs to read the bytes while emitting them.
+    pub(crate) fn expose_secret(&self) -> &[u8] {
+        self.secret.expose_bytes()
+    }
 }
 
 impl fmt::Debug for LeasedCredential {
