@@ -1,5 +1,5 @@
 use super::*;
-use crate::handoff::CredentialHandoff;
+use crate::handoff::{CredentialHandoff, MAX_HANDOFF_DOC_BYTES};
 use anyhow::Result;
 use licoup_foundation::core::secret_bytes::SecretBytes;
 use std::collections::BTreeMap;
@@ -141,7 +141,6 @@ fn lease_fails_closed_after_epoch_revocation() {
         "synthetic-key-12345"
     );
     *source.0.lock().unwrap() = None;
-    lease.reset_epoch_check();
     assert_eq!(
         lease.resolve(TestKind::Beta).unwrap_err().to_string(),
         "credential_lease_revoked"
@@ -228,9 +227,9 @@ fn handoff_round_trip_preserves_credentials_duration_and_epoch() {
     )
     .unwrap();
     let payload = lease.handoff_projection().unwrap().to_json().unwrap();
-    assert!(String::from_utf8_lossy(&payload).contains(TestKind::HANDOFF_SCHEMA));
+    assert!(String::from_utf8_lossy(payload.expose_bytes()).contains(TestKind::HANDOFF_SCHEMA));
 
-    let parsed = CredentialHandoff::<TestKind>::from_json(&payload).unwrap();
+    let parsed = CredentialHandoff::<TestKind>::from_json(payload.expose_bytes()).unwrap();
     assert_eq!(parsed.lease_duration(), Duration::from_secs(7200));
     assert_eq!(parsed.epoch(), epoch.as_str());
     assert_eq!(parsed.kinds().count(), 2);
@@ -316,6 +315,31 @@ fn handoff_rejects_malformed_documents() {
 }
 
 #[test]
+fn handoff_rejects_duplicate_member_names_and_oversized_documents() {
+    // Duplicate member names reject the whole document at every level —
+    // the closed contract has no last-wins semantics.
+    let mut top_level_dup = br#"{"schemaVersion":""#.to_vec();
+    top_level_dup.extend_from_slice(TestKind::HANDOFF_SCHEMA.as_bytes());
+    top_level_dup.extend_from_slice(
+        br#"","schemaVersion":"x","leaseDurationSeconds":1,"epoch":"11111111-1111-4111-8111-111111111111","credentials":[]}"#,
+    );
+    assert_handoff_invalid(&top_level_dup);
+    let dup_inside_keys = handoff_document(serde_json::json!([
+        {"kind": "alpha", "keys": [handoff_key(serde_json::json!([1, 2, 3]))]}
+    ]));
+    let text = String::from_utf8(dup_inside_keys).unwrap();
+    let dup = text.replacen(
+        "\"kind\":\"alpha\"",
+        "\"kind\":\"alpha\",\"kind\":\"beta\"",
+        1,
+    );
+    assert_handoff_invalid(dup.as_bytes());
+    // Inputs above the documented byte bound are refused before parsing.
+    let oversized = vec![b' '; MAX_HANDOFF_DOC_BYTES + 1];
+    assert_handoff_invalid(&oversized);
+}
+
+#[test]
 fn handoff_never_crosses_kind_families() {
     let epoch = uuid::Uuid::new_v4().to_string();
     let source = Arc::new(TestEpochSource(StdMutex::new(Some(epoch.clone()))));
@@ -331,7 +355,7 @@ fn handoff_never_crosses_kind_families() {
     // A document minted under the TestKind schema must not parse as
     // OtherKind — the schema pin is what keeps families apart.
     assert_eq!(
-        CredentialHandoff::<OtherKind>::from_json(&payload)
+        CredentialHandoff::<OtherKind>::from_json(payload.expose_bytes())
             .unwrap_err()
             .to_string(),
         "credential_lease_handoff_invalid"

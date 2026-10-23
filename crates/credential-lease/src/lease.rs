@@ -2,9 +2,9 @@
 //!
 //! A lease never survives process exit. Its duration is an upper bound for
 //! one running process, not a persisted bypass of host authorization. Two
-//! independent liveness checks apply: the lease's own `Instant` expiry, and
-//! the custody epoch, rechecked lazily at most once per validation interval
-//! so an owner-initiated revocation lands on the next use.
+//! independent liveness checks apply on every use: the lease's own `Instant`
+//! expiry, and the custody epoch, consulted on every resolution so an
+//! owner-initiated revocation lands on the very next use.
 
 use crate::credential::LeasedCredential;
 use crate::epoch::LeaseEpochSource;
@@ -17,13 +17,6 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const LEASE_VALIDATION_INTERVAL: Duration = Duration::from_secs(1);
-
-struct LeaseValidationState {
-    checked_at: Option<Instant>,
-    valid: bool,
-}
-
 /// A process-local snapshot of custody-held credentials for one kind family.
 pub struct CredentialLease<K: CredentialKind> {
     credentials: BTreeMap<K, Vec<LeasedCredential>>,
@@ -31,7 +24,6 @@ pub struct CredentialLease<K: CredentialKind> {
     expires_at: Instant,
     epoch: String,
     epoch_source: Arc<dyn LeaseEpochSource>,
-    validation: Mutex<LeaseValidationState>,
 }
 
 impl<K: CredentialKind> CredentialLease<K> {
@@ -46,10 +38,6 @@ impl<K: CredentialKind> CredentialLease<K> {
             expires_at: Instant::now(),
             epoch: String::new(),
             epoch_source: Arc::new(DisconnectedEpochSource),
-            validation: Mutex::new(LeaseValidationState {
-                checked_at: None,
-                valid: false,
-            }),
         }
     }
 
@@ -79,10 +67,6 @@ impl<K: CredentialKind> CredentialLease<K> {
             expires_at,
             epoch,
             epoch_source,
-            validation: Mutex::new(LeaseValidationState {
-                checked_at: None,
-                valid: false,
-            }),
         })
     }
 
@@ -124,19 +108,11 @@ impl<K: CredentialKind> CredentialLease<K> {
             .is_some_and(|values| !values.is_empty())
     }
 
-    /// Resolve one currently valid secret for `kind`.
-    pub fn resolve(&self, kind: K) -> Result<SecretBytes> {
-        self.resolve_candidates(kind)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("credential_lease_unavailable"))
-    }
-
-    /// Every currently valid credential for `kind`, in declaration order.
-    ///
-    /// Fails closed when the lease is expired or revoked, and credentials
-    /// past their own storage expiry never resolve.
-    pub fn resolve_candidates(&self, kind: K) -> Result<Vec<SecretBytes>> {
+    /// The credentials currently valid for `kind`: lease expiry, custody
+    /// epoch, and each credential's own storage expiry all enforced. The
+    /// iterator borrows the lease so callers copy only the secrets they
+    /// actually select.
+    fn valid_candidates(&self, kind: K) -> Result<impl Iterator<Item = &LeasedCredential> + '_> {
         let kind_credentials = self
             .credentials
             .get(&kind)
@@ -147,36 +123,43 @@ impl<K: CredentialKind> CredentialLease<K> {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| anyhow!("credential_lease_clock_invalid"))?
             .as_secs();
-        let credentials = kind_credentials
+        Ok(kind_credentials
             .iter()
-            .filter(|credential| !credential.is_expired(now))
+            .filter(move |credential| !credential.is_expired(now)))
+    }
+
+    /// Resolve one currently valid secret for `kind`, copying only the
+    /// selected credential.
+    pub fn resolve(&self, kind: K) -> Result<SecretBytes> {
+        self.valid_candidates(kind)?
+            .next()
+            .map(LeasedCredential::copy_secret)
+            .ok_or_else(|| anyhow!("credential_lease_unavailable"))
+    }
+
+    /// Every currently valid credential for `kind`, in declaration order.
+    ///
+    /// Fails closed when the lease is expired or revoked, and credentials
+    /// past their own storage expiry never resolve.
+    pub fn resolve_candidates(&self, kind: K) -> Result<Vec<SecretBytes>> {
+        let credentials = self
+            .valid_candidates(kind)?
             .map(LeasedCredential::copy_secret)
             .collect::<Vec<_>>();
         ensure!(!credentials.is_empty(), "credential_lease_unavailable");
         Ok(credentials)
     }
 
-    #[cfg(test)]
-    pub(crate) fn reset_epoch_check(&self) {
-        self.validation.lock().unwrap().checked_at = None;
-    }
-
+    /// The custody epoch is consulted on every use so an owner-initiated
+    /// revocation lands on the very next resolution — there is no cached
+    /// authorization window. Hosts supply the epoch source and choose how
+    /// cheap that consultation is.
     fn ensure_active(&self) -> Result<()> {
         ensure!(Instant::now() < self.expires_at, "credential_lease_expired");
-        let mut state = self
-            .validation
-            .lock()
-            .map_err(|_| anyhow!("credential_lease_validation_unavailable"))?;
-        if state
-            .checked_at
-            .is_some_and(|checked| checked.elapsed() < LEASE_VALIDATION_INTERVAL)
-        {
-            ensure!(state.valid, "credential_lease_revoked");
-            return Ok(());
-        }
-        state.valid = self.epoch_source.active_epoch()?.as_deref() == Some(self.epoch.as_str());
-        state.checked_at = Some(Instant::now());
-        ensure!(state.valid, "credential_lease_revoked");
+        ensure!(
+            self.epoch_source.active_epoch()?.as_deref() == Some(self.epoch.as_str()),
+            "credential_lease_revoked"
+        );
         Ok(())
     }
 }
@@ -230,11 +213,30 @@ impl<K: CredentialKind> CredentialSlot<K> {
             .unwrap_or(false)
     }
 
+    /// Resolve one currently valid secret for `kind`, rotating the
+    /// selection across candidates and copying only the chosen secret.
     pub fn resolve(&self, kind: K) -> Result<SecretBytes> {
-        self.resolve_candidates(kind)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("credential_lease_unavailable"))
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow!("credential_lease_validation_unavailable"))?;
+        let count = guard.valid_candidates(kind)?.count();
+        ensure!(count > 0, "credential_lease_unavailable");
+        let start = {
+            let mut cursors = self
+                .selection_cursors
+                .lock()
+                .map_err(|_| anyhow!("credential_lease_validation_unavailable"))?;
+            let cursor = cursors.entry(kind).or_insert(0);
+            let start = *cursor % count;
+            *cursor = cursor.wrapping_add(1);
+            start
+        };
+        let selected = guard
+            .valid_candidates(kind)?
+            .nth(start)
+            .map(LeasedCredential::copy_secret);
+        selected.ok_or_else(|| anyhow!("credential_lease_unavailable"))
     }
 
     /// Returns every currently valid credential in rotating order.

@@ -9,13 +9,22 @@
 //! The document schema is pinned by the credential kind family, so a handoff
 //! minted for one family cannot parse as another.
 
-use crate::credential::{LeasedCredential, MAX_LEASED_CREDENTIALS, MAX_LEASE_DURATION_SECONDS};
+use crate::credential::{
+    LeasedCredential, MAX_CREDENTIAL_BYTES, MAX_LEASED_CREDENTIALS, MAX_LEASE_DURATION_SECONDS,
+};
 use crate::kind::CredentialKind;
 use anyhow::{anyhow, ensure, Result};
 use licoup_foundation::core::secret_bytes::SecretBytes;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::Duration;
+
+/// Upper bound on a serialized handoff document, derived from the
+/// credential inventory bounds: every credential serializes to an id, an
+/// expiry, and a byte array of at most ~4 characters per secret byte.
+/// Inputs above the bound are refused before any parsing work begins.
+pub const MAX_HANDOFF_DOC_BYTES: usize =
+    MAX_LEASED_CREDENTIALS * (MAX_CREDENTIAL_BYTES * 4 + 160) + 1024;
 
 /// A portable projection of unlocked credentials for one kind family.
 pub struct CredentialHandoff<K: CredentialKind> {
@@ -79,43 +88,68 @@ impl<K: CredentialKind> CredentialHandoff<K> {
         })
     }
 
-    /// Serialize the handoff as a closed JSON document. Secret bytes appear
-    /// only as arrays of byte numbers; no serde derive touches
-    /// secret-bearing types.
-    pub fn to_json(&self) -> Result<Vec<u8>> {
-        let credentials: Vec<serde_json::Value> = self
-            .credentials
-            .iter()
-            .map(|(kind, keys)| {
-                serde_json::json!({
-                    "kind": kind.as_str(),
-                    "keys": keys
-                        .iter()
-                        .map(|key| serde_json::json!({
-                            "credentialId": key.credential_id(),
-                            "expiresAtEpochSeconds": key.expires_at_epoch_seconds(),
-                            "secret": key.copy_secret().expose_bytes().to_vec(),
-                        }))
-                        .collect::<Vec<serde_json::Value>>(),
-                })
-            })
-            .collect();
-        let document = serde_json::json!({
-            "schemaVersion": K::HANDOFF_SCHEMA,
-            "leaseDurationSeconds": self.lease_duration.as_secs(),
-            "epoch": self.epoch,
-            "credentials": credentials,
-        });
-        Ok(serde_json::to_vec(&document)?)
+    /// Serialize the handoff as a closed JSON document. The output is a
+    /// [`SecretBytes`] so the serialized secret material zeroizes on drop.
+    /// Serialization writes secrets straight from their slices — no
+    /// intermediate `Value` or `Vec<u8>` plaintext copies are produced.
+    pub fn to_json(&self) -> Result<SecretBytes> {
+        let mut document = String::with_capacity(MAX_HANDOFF_DOC_BYTES.min(1 << 20));
+        document.push_str("{\"schemaVersion\":");
+        push_json_string(&mut document, K::HANDOFF_SCHEMA);
+        document.push_str(",\"leaseDurationSeconds\":");
+        document.push_str(&self.lease_duration.as_secs().to_string());
+        document.push_str(",\"epoch\":");
+        push_json_string(&mut document, &self.epoch);
+        document.push_str(",\"credentials\":[");
+        for (index, (kind, keys)) in self.credentials.iter().enumerate() {
+            if index > 0 {
+                document.push(',');
+            }
+            document.push_str("{\"kind\":");
+            push_json_string(&mut document, kind.as_str());
+            document.push_str(",\"keys\":[");
+            for (key_index, key) in keys.iter().enumerate() {
+                if key_index > 0 {
+                    document.push(',');
+                }
+                document.push_str("{\"credentialId\":");
+                push_json_string(&mut document, key.credential_id());
+                document.push_str(",\"expiresAtEpochSeconds\":");
+                match key.expires_at_epoch_seconds() {
+                    Some(expires_at) => document.push_str(&expires_at.to_string()),
+                    None => document.push_str("null"),
+                }
+                document.push_str(",\"secret\":[");
+                for (byte_index, byte) in key.copy_secret().expose_bytes().iter().enumerate() {
+                    if byte_index > 0 {
+                        document.push(',');
+                    }
+                    document.push_str(&byte.to_string());
+                }
+                document.push_str("]}");
+            }
+            document.push_str("]}");
+        }
+        document.push_str("]}");
+        SecretBytes::try_from_bytes(document.into_bytes())
+            .map_err(|_| anyhow!("credential_lease_handoff_serialize_failed"))
     }
 
     /// Parse and fully validate a handoff document for this kind family.
     /// Every malformed shape fails closed with the same
     /// `credential_lease_handoff_invalid` code, and a document minted under a
-    /// different family's schema can never cross over.
+    /// different family's schema can never cross over. Inputs beyond
+    /// [`MAX_HANDOFF_DOC_BYTES`] are refused before parsing, and duplicate
+    /// object member names are refused — a closed contract has no
+    /// last-wins semantics for a strict parser to guess at.
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
         let invalid = || anyhow!("credential_lease_handoff_invalid");
-        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+        ensure!(
+            bytes.len() <= MAX_HANDOFF_DOC_BYTES,
+            "credential_lease_handoff_invalid"
+        );
+        let StrictValue(value): StrictValue =
+            serde_json::from_slice(bytes).map_err(|_| invalid())?;
         let object = value.as_object().ok_or_else(invalid)?;
         for key in object.keys() {
             ensure!(
@@ -269,4 +303,114 @@ pub(crate) fn validate_credentials<K: CredentialKind>(
         );
     }
     Ok(())
+}
+
+/// Append `value` as a JSON string literal with the escaping the contract
+/// requires — control characters, quotes, and backslashes are the only
+/// escapes a conforming producer needs.
+fn push_json_string(buffer: &mut String, value: &str) {
+    buffer.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => buffer.push_str("\\\""),
+            '\\' => buffer.push_str("\\\\"),
+            '\n' => buffer.push_str("\\n"),
+            '\r' => buffer.push_str("\\r"),
+            '\t' => buffer.push_str("\\t"),
+            character if character < ' ' => {
+                buffer.push_str(&format!("\\u{:04x}", character as u32));
+            }
+            character => buffer.push(character),
+        }
+    }
+    buffer.push('"');
+}
+
+/// A JSON value parsed under the contract's closed-document rules: every
+/// object member name must be unique, so a duplicate name rejects the whole
+/// document instead of silently keeping the last write.
+struct StrictValue(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for StrictValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(StrictVisitor)
+    }
+}
+
+struct StrictVisitor;
+
+impl<'de> serde::de::Visitor<'de> for StrictVisitor {
+    type Value = StrictValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a handoff document")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<StrictValue, E> {
+        Ok(StrictValue(serde_json::Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<StrictValue, E> {
+        Ok(StrictValue(serde_json::Value::from(value)))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<StrictValue, E> {
+        Ok(StrictValue(serde_json::Value::from(value)))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<StrictValue, E> {
+        Ok(StrictValue(
+            serde_json::Number::from_f64(value)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+        ))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<StrictValue, E> {
+        Ok(StrictValue(serde_json::Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<StrictValue, E> {
+        Ok(StrictValue(serde_json::Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<StrictValue, E> {
+        Ok(StrictValue(serde_json::Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<StrictValue, E> {
+        Ok(StrictValue(serde_json::Value::Null))
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<StrictValue, D::Error> {
+        <StrictValue as serde::Deserialize>::deserialize(deserializer)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut access: A,
+    ) -> Result<StrictValue, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = access.next_element::<StrictValue>()? {
+            items.push(item.0);
+        }
+        Ok(StrictValue(serde_json::Value::Array(items)))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut access: A,
+    ) -> Result<StrictValue, A::Error> {
+        let mut map = serde_json::Map::new();
+        while let Some(key) = access.next_key::<String>()? {
+            let value = access.next_value::<StrictValue>()?;
+            if map.insert(key, value.0).is_some() {
+                return Err(serde::de::Error::custom("duplicate member name"));
+            }
+        }
+        Ok(StrictValue(serde_json::Value::Object(map)))
+    }
 }
