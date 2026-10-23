@@ -18,6 +18,7 @@ use licoup_foundation::core::secret_bytes::SecretBytes;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::Duration;
+use zeroize::Zeroize;
 
 /// Upper bound on a kind family's schema name.
 pub const MAX_HANDOFF_SCHEMA_BYTES: usize = 128;
@@ -25,14 +26,42 @@ pub const MAX_HANDOFF_SCHEMA_BYTES: usize = 128;
 /// Upper bound on one kind name inside a handoff document.
 pub const MAX_KIND_NAME_BYTES: usize = 64;
 
-/// Upper bound on a serialized handoff document, derived from the
-/// credential inventory bounds: every credential serializes to an id, an
-/// expiry, and a byte array of at most ~4 characters per secret byte, plus
-/// per-entry, per-key, and document structure overhead. Inputs above the
-/// bound are refused before any parsing work begins, and serialization
-/// refuses to produce a document above it.
+/// Upper bound on a serialized handoff document, covering the worst case
+/// every admitted inventory can produce: each credential serializes to an
+/// id, an expiry, and at most 4 characters per secret byte; each kind entry
+/// adds its structure plus a name that may escape to 6 bytes per name byte;
+/// the document head adds the schema constant (escaping to at most 6 bytes
+/// per schema byte), epoch, and field names. Inputs above the bound are
+/// refused before any parsing work begins, and every inventory the
+/// constructor admits serializes within it.
 pub const MAX_HANDOFF_DOC_BYTES: usize =
-    MAX_LEASED_CREDENTIALS * (MAX_CREDENTIAL_BYTES * 4 + 192) + 8192;
+    MAX_LEASED_CREDENTIALS * (MAX_CREDENTIAL_BYTES * 4 + 576) + 16 * 1024;
+
+/// A serialized handoff document. The document is secret-bearing — it
+/// embeds every credential in the clear — so the buffer zeroizes on drop
+/// like [`SecretBytes`], but it is bounded by [`MAX_HANDOFF_DOC_BYTES`]
+/// rather than the per-secret limit, which a full credential inventory can
+/// legitimately exceed.
+pub struct HandoffDocument(Vec<u8>);
+
+impl HandoffDocument {
+    /// Borrow the serialized document bytes.
+    pub fn expose_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for HandoffDocument {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HandoffDocument([redacted])")
+    }
+}
+
+impl Drop for HandoffDocument {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 /// A portable projection of unlocked credentials for one kind family.
 pub struct CredentialHandoff<K: CredentialKind> {
@@ -97,13 +126,14 @@ impl<K: CredentialKind> CredentialHandoff<K> {
     }
 
     /// Serialize the handoff as a closed JSON document. The output is a
-    /// [`SecretBytes`] so the serialized secret material zeroizes on drop.
+    /// [`HandoffDocument`] so the serialized secret material zeroizes on
+    /// drop.
     ///
     /// The buffer is reserved to a computed upper bound before writing, so
     /// it never grows: exactly one allocation holds secret material, and it
-    /// moves straight into the returned `SecretBytes` — no intermediate
-    /// `Value`, `Vec<u8>`, or freed plaintext remnants are produced.
-    pub fn to_json(&self) -> Result<SecretBytes> {
+    /// moves straight into the returned document — no intermediate `Value`,
+    /// `Vec<u8>`, or freed plaintext remnants are produced.
+    pub fn to_json(&self) -> Result<HandoffDocument> {
         ensure!(
             K::HANDOFF_SCHEMA.len() <= MAX_HANDOFF_SCHEMA_BYTES
                 && self
@@ -154,8 +184,7 @@ impl<K: CredentialKind> CredentialHandoff<K> {
             document.len() <= MAX_HANDOFF_DOC_BYTES,
             "credential_lease_handoff_invalid"
         );
-        SecretBytes::try_from_bytes(document.into_bytes())
-            .map_err(|_| anyhow!("credential_lease_handoff_serialize_failed"))
+        Ok(HandoffDocument(document.into_bytes()))
     }
 
     /// An upper bound on this handoff's serialized length: every structural
@@ -202,11 +231,13 @@ impl<K: CredentialKind> CredentialHandoff<K> {
                 "credential_lease_handoff_invalid"
             );
         }
+        let schema_version = object
+            .get("schemaVersion")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| value.len() <= MAX_HANDOFF_SCHEMA_BYTES)
+            .ok_or_else(invalid)?;
         ensure!(
-            object
-                .get("schemaVersion")
-                .and_then(serde_json::Value::as_str)
-                == Some(K::HANDOFF_SCHEMA),
+            schema_version == K::HANDOFF_SCHEMA,
             "credential_lease_handoff_invalid"
         );
         let lease_seconds = object
