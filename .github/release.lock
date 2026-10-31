@@ -1,0 +1,15 @@
+# Generated release train for Unka-Malloc/Credential-Lease.
+# Regenerate instead of editing: records which engine revision and
+# which source inputs produced the generated files beside it.
+[generator]
+engine = "release-engine"
+version = "0.1.0"
+
+[source]
+templates = "sha256:06393619887472e73b95773b77a1fa86143e32a90b5e9c0818c260d5093379a9"
+declaration = "sha256:f6bf4dae15f76773a3fe724b4c1c3c09e4570d23cad139c74f87da454731294e"
+
+[outputs]
+".github/workflows/verify.yml" = "sha256:f64c0f0758a1d42e1daba6d64ee4c623d3a27f7391e552dde94e72bb7ea26775"
+".github/workflows/publish.yml" = "sha256:658dbcbd84c4c6dd228df44bb1469344cca0ba4b1028fcc44ae173ae6732338c"
+".github/release.py" = "sha256:9d73a3b660dfbefda496c692201c1d488735b3ddfecd7eadc03abf892f11ddf8"
