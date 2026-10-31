@@ -21,6 +21,7 @@ pub mod handoff;
 pub mod kind;
 pub mod lease;
 pub mod port;
+pub mod secret;
 
 pub use credential::{
     LeasedCredential, MAX_CREDENTIAL_BYTES, MAX_LEASED_CREDENTIALS, MAX_LEASE_DURATION_SECONDS,
@@ -30,6 +31,7 @@ pub use handoff::{CredentialHandoff, HandoffDocument};
 pub use kind::CredentialKind;
 pub use lease::{CredentialLease, CredentialSlot};
 pub use port::CustodyPort;
+pub use secret::{SecretBytes, SecretBytesError, MAX_SECRET_BYTES};
 
 #[cfg(test)]
 mod tests;
