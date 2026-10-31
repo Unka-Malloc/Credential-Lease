@@ -4,8 +4,8 @@
 //! storage validity remain enforceable after the receiving process has
 //! started.
 
+use crate::SecretBytes;
 use anyhow::{ensure, Result};
-use licoup_foundation::core::secret_bytes::SecretBytes;
 use std::fmt;
 
 /// Maximum credentials one handoff or lease may carry.

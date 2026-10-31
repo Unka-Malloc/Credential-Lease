@@ -13,8 +13,8 @@ use crate::credential::{
     LeasedCredential, MAX_CREDENTIAL_BYTES, MAX_LEASED_CREDENTIALS, MAX_LEASE_DURATION_SECONDS,
 };
 use crate::kind::CredentialKind;
+use crate::SecretBytes;
 use anyhow::{anyhow, ensure, Result};
-use licoup_foundation::core::secret_bytes::SecretBytes;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::Duration;

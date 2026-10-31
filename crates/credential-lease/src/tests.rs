@@ -1,7 +1,7 @@
 use super::*;
 use crate::handoff::{CredentialHandoff, MAX_HANDOFF_DOC_BYTES};
+use crate::SecretBytes;
 use anyhow::Result;
-use licoup_foundation::core::secret_bytes::SecretBytes;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;

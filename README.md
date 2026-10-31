@@ -3,6 +3,10 @@
 Host-neutral credential lease contract: custody holds root credentials;
 runtimes receive process-bound, revocable, time-limited leases.
 
+The crate owns its SecretBytes boundary type and depends on no product framework.
+Hosts supply credential-kind families, custody authorization and revocation sources;
+the runtime receives only authorized ephemeral lease material.
+
 The model follows the IAM session-credential shape rather than "give the
 application the key":
 
@@ -25,7 +29,7 @@ cross families.
 
 | Crate | Contents |
 | --- | --- |
-| `credential-lease` | `LeasedCredential`, `CredentialHandoff<K>`, `CredentialLease<K>`, `CredentialSlot<K>`, `LeaseEpochSource`, `CustodyPort` registry |
+| `credential-lease` | `SecretBytes`, `LeasedCredential`, `CredentialHandoff<K>`, `CredentialLease<K>`, `CredentialSlot<K>`, `LeaseEpochSource`, `CustodyPort` registry |
 
 ## Language-neutral contract
 
