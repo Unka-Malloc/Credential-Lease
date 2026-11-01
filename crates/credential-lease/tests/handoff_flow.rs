@@ -75,6 +75,35 @@ fn lease_projects_to_handoff_and_receiver_resolves() {
 }
 
 #[test]
+fn handoff_carries_arbitrary_secret_bytes_verbatim() {
+    // given a secret that is not text at all — a NUL, a high byte and a
+    // bare continuation byte — when the handoff crosses the process
+    // boundary, then the rebuilt lease resolves the exact same bytes
+    let mut credentials = BTreeMap::new();
+    credentials.insert(
+        Kind::Api,
+        vec![LeasedCredential::new(
+            "00000000-0000-4000-8000-0000000000ab".to_owned(),
+            SecretBytes::try_from_bytes(vec![0x00, 0xff, 0x80]).unwrap(),
+            None,
+        )
+        .unwrap()],
+    );
+    let custody = CredentialLease::new(
+        credentials,
+        Duration::from_secs(60),
+        epoch(),
+        Arc::new(FixedEpoch(epoch())),
+    )
+    .unwrap();
+    let document = custody.handoff_projection().unwrap().to_json().unwrap();
+    let received = CredentialHandoff::<Kind>::from_json(document.expose_bytes()).unwrap();
+    let runtime = CredentialLease::from_handoff(received, Arc::new(FixedEpoch(epoch()))).unwrap();
+    let resolved = runtime.resolve(Kind::Api).unwrap();
+    assert_eq!(resolved.expose_bytes(), [0x00, 0xff, 0x80]);
+}
+
+#[test]
 fn revoked_epoch_fails_the_next_resolution() {
     // given a lease minted under epoch A, when custody rotates to epoch B,
     // then the receiver's very next resolution fails closed

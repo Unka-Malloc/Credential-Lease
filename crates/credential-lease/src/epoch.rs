@@ -16,5 +16,7 @@ use anyhow::Result;
 /// `Ok(None)` means no epoch is active — nothing is unlocked, so every lease
 /// fails closed as revoked.
 pub trait LeaseEpochSource: Send + Sync {
+    /// The epoch the custody owner currently recognizes, or `Ok(None)`
+    /// when nothing is unlocked and every lease must fail closed.
     fn active_epoch(&self) -> Result<Option<String>>;
 }

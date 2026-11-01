@@ -86,14 +86,18 @@ impl<K: CredentialKind> CredentialHandoff<K> {
             .retain(|_, credentials| !credentials.is_empty());
     }
 
+    /// Whether the handoff carries no credentials at all.
     pub fn is_empty(&self) -> bool {
         self.credentials.is_empty()
     }
 
+    /// The lease duration the receiving runtime mints its lease with.
     pub fn lease_duration(&self) -> Duration {
         self.lease_duration
     }
 
+    /// The custody epoch the handoff was minted under — the receiving
+    /// lease dies the moment this no longer matches the active epoch.
     pub fn epoch(&self) -> &str {
         &self.epoch
     }

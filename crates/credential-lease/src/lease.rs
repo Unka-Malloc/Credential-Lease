@@ -70,6 +70,8 @@ impl<K: CredentialKind> CredentialLease<K> {
         })
     }
 
+    /// The duration the lease was minted with — the upper bound this
+    /// process may use it for, never a persisted grant.
     pub fn lease_duration(&self) -> Duration {
         self.lease_duration
     }
@@ -102,6 +104,9 @@ impl<K: CredentialKind> CredentialLease<K> {
         Self::new(credentials, lease_duration, epoch, epoch_source)
     }
 
+    /// Whether the lease currently carries at least one credential for
+    /// `kind` — presence only, not validity: expiry and revocation are
+    /// checked on resolution.
     pub fn contains_kind(&self, kind: K) -> bool {
         self.credentials
             .get(&kind)
@@ -195,6 +200,7 @@ pub struct CredentialSlot<K: CredentialKind> {
 }
 
 impl<K: CredentialKind> CredentialSlot<K> {
+    /// Install `lease` as the slot's current lease.
     pub fn new(lease: CredentialLease<K>) -> Self {
         Self {
             inner: Mutex::new(lease),
@@ -202,10 +208,14 @@ impl<K: CredentialKind> CredentialSlot<K> {
         }
     }
 
+    /// A slot holding a disconnected lease: it starts unauthorized and
+    /// every resolution fails closed until a handoff is installed.
     pub fn disconnected() -> Self {
         Self::new(CredentialLease::disconnected())
     }
 
+    /// Whether the installed lease carries `kind`; a poisoned lock reads
+    /// as absent rather than answering from unverifiable state.
     pub fn contains_kind(&self, kind: K) -> bool {
         self.inner
             .lock()
@@ -258,6 +268,8 @@ impl<K: CredentialKind> CredentialSlot<K> {
         Ok(candidates)
     }
 
+    /// Atomically swap the installed lease — hot apply without restarting
+    /// the process.
     pub fn replace(&self, lease: CredentialLease<K>) -> Result<()> {
         let mut guard = self
             .inner
@@ -267,6 +279,8 @@ impl<K: CredentialKind> CredentialSlot<K> {
         Ok(())
     }
 
+    /// Disconnect the slot: the lease is replaced by a disconnected one and
+    /// every subsequent resolution fails closed.
     pub fn clear(&self) -> Result<()> {
         self.replace(CredentialLease::disconnected())
     }
@@ -281,6 +295,8 @@ impl<K: CredentialKind> CredentialSlot<K> {
         self.replace(CredentialLease::from_handoff(handoff, epoch_source)?)
     }
 
+    /// Whether the slot holds a live, non-empty lease. A poisoned lock or
+    /// an expired lease reads as disconnected.
     pub fn connected(&self) -> bool {
         self.inner
             .lock()
