@@ -59,6 +59,7 @@ where
     })?
 }
 
+/// Whether a custody port is currently installed for kind family `K`.
 pub fn installed<K: CredentialKind>() -> bool {
     PORTS
         .read()
@@ -88,6 +89,8 @@ where
         .ok_or_else(|| anyhow!("custody_port_unavailable"))
 }
 
+/// Remove every installed port — test-only teardown so registry state
+/// never leaks between cases in one process.
 #[cfg(test)]
 pub fn clear() {
     if let Ok(mut guard) = PORTS.write() {

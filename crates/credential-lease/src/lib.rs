@@ -15,6 +15,8 @@
 //! family pins its own handoff schema, so a document for one family can
 //! never parse as another.
 
+#![warn(missing_docs)]
+
 pub mod credential;
 pub mod epoch;
 pub mod handoff;

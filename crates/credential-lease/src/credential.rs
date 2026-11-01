@@ -54,14 +54,18 @@ impl LeasedCredential {
         })
     }
 
+    /// The credential's id: the canonical UUID it was constructed with.
     pub fn credential_id(&self) -> &str {
         &self.credential_id
     }
 
+    /// The storage expiry the custody owner stamped, when one was set.
     pub fn expires_at_epoch_seconds(&self) -> Option<u64> {
         self.expires_at_epoch_seconds
     }
 
+    /// Whether the storage expiry has passed at `now_epoch_seconds`. A
+    /// credential with no expiry never expires.
     pub fn is_expired(&self, now_epoch_seconds: u64) -> bool {
         self.expires_at_epoch_seconds
             .is_some_and(|expires_at| now_epoch_seconds >= expires_at)
