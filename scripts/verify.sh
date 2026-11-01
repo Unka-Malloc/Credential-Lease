@@ -9,4 +9,4 @@ cargo test --workspace
 cargo doc --workspace --no-deps
 
 # The generated release-rewriter must pass the same helper tests CI runs.
-python3 .github/test_release.py
+PYTHONDONTWRITEBYTECODE=1 python3 .github/test_release.py
