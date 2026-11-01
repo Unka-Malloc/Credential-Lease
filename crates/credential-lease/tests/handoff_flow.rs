@@ -100,7 +100,7 @@ fn handoff_carries_arbitrary_secret_bytes_verbatim() {
     let received = CredentialHandoff::<Kind>::from_json(document.expose_bytes()).unwrap();
     let runtime = CredentialLease::from_handoff(received, Arc::new(FixedEpoch(epoch()))).unwrap();
     let resolved = runtime.resolve(Kind::Api).unwrap();
-    assert_eq!(resolved.expose_bytes(), [0x00, 0xff, 0x80]);
+    assert_eq!(resolved.expose_bytes(), &[0x00, 0xff, 0x80]);
 }
 
 #[test]
