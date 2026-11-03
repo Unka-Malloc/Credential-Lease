@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/credential-lease"]
+members = ["crates/credential-lease", "crates/credential-lease-keychain"]
 
 [workspace.package]
 edition = "2021"
@@ -10,6 +10,7 @@ repository = "https://github.com/Unka-Malloc/Credential-Lease"
 
 [workspace.dependencies]
 anyhow = "1.0.98"
+credential-lease = { path = "crates/credential-lease", version = "0.3.0" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 uuid = { version = "1.16", features = ["v4"] }

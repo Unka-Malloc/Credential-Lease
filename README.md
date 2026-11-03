@@ -30,6 +30,7 @@ cross families.
 | Crate | Contents |
 | --- | --- |
 | `credential-lease` | `SecretBytes`, `LeasedCredential`, `CredentialHandoff<K>`, `CredentialLease<K>`, `CredentialSlot<K>`, `LeaseEpochSource`, `CustodyPort` registry |
+| `credential-lease-keychain` | OS-keychain custody backend: protected SecItem operations on macOS (`Keychain`, `KeychainItemQuery`, `KeychainAuthContext`), fail-closed `None` elsewhere |
 
 ## Language-neutral contract
 
