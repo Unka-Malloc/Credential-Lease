@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
 description = "Host-neutral credential lease contract: custody holds root credentials; runtimes receive process-bound, revocable, time-limited leases."
 
 [dependencies]

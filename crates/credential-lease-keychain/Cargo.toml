@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
 description = "OS keychain custody backend for the Credential-Lease surface: protected generic-password items on the macOS Keychain, fail-closed elsewhere."
 
 [dependencies]
