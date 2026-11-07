@@ -27,9 +27,9 @@ mod macos;
 
 pub use context::KeychainAuthContext;
 pub use error::{KeychainError, KeychainErrorKind};
-#[cfg(target_os = "macos")]
-pub use item::KeychainItem;
 pub use item::{AddItemOutcome, KeychainItemQuery};
+#[cfg(target_os = "macos")]
+pub use item::{KeychainItem, KeychainItemProvenance};
 
 /// Which concrete store a [`Keychain`] dispatches to.
 ///

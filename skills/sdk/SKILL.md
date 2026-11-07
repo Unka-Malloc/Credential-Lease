@@ -5,9 +5,10 @@ description: Embed credential-lease in a Rust host — handoff documents, proces
 
 # credential-lease SDK mode
 
-Embed `credential-lease`; the host owns custody and authorization, while the
-crate owns handoff documents, lease lifetime and revocation checks. There is
-no daemon to install.
+Embed `credential-lease`; it owns handoff documents, lease lifetime and
+revocation checks. Custody of persisted secrets goes through the workspace's
+`credential-lease-keychain` backend, and owner authorization stays with the
+host. There is no daemon to install.
 
 ## When to use
 
@@ -38,5 +39,11 @@ can install their `CustodyPort` through `port::install` and access it through
   or configuration document.
 - Every resolution checks lease lifetime and the host's current custody epoch.
   Revocation is a refusal; obtaining another lease requires host authorization.
-- The framework neither implements a keyring nor chooses an authorization
-  policy. Its host ports must preserve the host's actual custody boundary.
+- The `credential-lease` contract crate performs no custody. The workspace
+  ships the keyring backend as `credential-lease-keychain`: protected macOS
+  Keychain items, fail-closed (`Keychain::selected()` is `None`) elsewhere.
+  Read item values only through `SecretBytes` and check provenance through
+  `KeychainItem::provenance()`.
+- Owner authorization stays host-side: the host runs prompts, sessions and
+  revocation and hands the backend an already-authorized
+  `KeychainAuthContext`. Host ports must preserve that custody boundary.

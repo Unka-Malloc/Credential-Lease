@@ -5,9 +5,6 @@
 //! item contract requires. The query is validated once at construction;
 //! the platform calls never guess at an item.
 
-#[cfg(target_os = "macos")]
-use core_foundation::dictionary::CFDictionary;
-
 use crate::error::{KeychainError, KeychainErrorKind};
 
 #[cfg(target_os = "macos")]
@@ -95,16 +92,74 @@ impl<'a> KeychainItemQuery<'a> {
     }
 }
 
+/// The provenance attributes of one copied item: what the platform reports
+/// about where and how the item is stored.
+///
+/// A typed projection, never the raw platform dictionary: it carries no
+/// value data, so secret bytes stay reachable only through
+/// [`KeychainItem::secret`]. Validating provenance — which service,
+/// account, access group, and protection the item must carry — is the
+/// host's contract, expressed over these fields. A field the platform did
+/// not return, or returned with an unexpected type, is `None` (or `false`),
+/// never a guess.
+///
+/// macOS only — no platform store exists elsewhere.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeychainItemProvenance {
+    pub(crate) service: Option<String>,
+    pub(crate) account: Option<String>,
+    pub(crate) access_group: Option<String>,
+    pub(crate) accessible: Option<String>,
+    pub(crate) synchronizable: Option<bool>,
+    pub(crate) backend_access_control: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl KeychainItemProvenance {
+    /// The item's `kSecAttrService`.
+    pub fn service(&self) -> Option<&str> {
+        self.service.as_deref()
+    }
+
+    /// The item's `kSecAttrAccount`.
+    pub fn account(&self) -> Option<&str> {
+        self.account.as_deref()
+    }
+
+    /// The item's `kSecAttrAccessGroup`.
+    pub fn access_group(&self) -> Option<&str> {
+        self.access_group.as_deref()
+    }
+
+    /// The item's `kSecAttrAccessible` class, spelled as the platform's
+    /// constant value (for example the value of
+    /// `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`).
+    pub fn accessible(&self) -> Option<&str> {
+        self.accessible.as_deref()
+    }
+
+    /// The item's `kSecAttrSynchronizable` flag.
+    pub fn synchronizable(&self) -> Option<bool> {
+        self.synchronizable
+    }
+
+    /// Whether the item carries exactly the `SecAccessControl` this backend
+    /// writes: user presence, accessible when unlocked, this device only.
+    pub fn has_backend_access_control(&self) -> bool {
+        self.backend_access_control
+    }
+}
+
 /// One item copied out of the store: its secret bytes, persistent
-/// reference, and the raw attribute dictionary the host's provenance checks
-/// consume.
+/// reference, and the provenance attributes the host's checks consume.
 ///
 /// macOS only — no platform store exists elsewhere.
 #[cfg(target_os = "macos")]
 pub struct KeychainItem {
     secret: SecretBytes,
     persistent_reference: Option<Vec<u8>>,
-    attributes: CFDictionary,
+    provenance: KeychainItemProvenance,
 }
 
 #[cfg(target_os = "macos")]
@@ -112,16 +167,17 @@ impl KeychainItem {
     pub(crate) fn new(
         secret: SecretBytes,
         persistent_reference: Option<Vec<u8>>,
-        attributes: CFDictionary,
+        provenance: KeychainItemProvenance,
     ) -> Self {
         Self {
             secret,
             persistent_reference,
-            attributes,
+            provenance,
         }
     }
 
-    /// The item's value bytes, in the boundary's zeroizing container.
+    /// The item's value bytes, in the boundary's zeroizing container — the
+    /// only way this type exposes them.
     pub fn secret(&self) -> &SecretBytes {
         &self.secret
     }
@@ -132,11 +188,9 @@ impl KeychainItem {
         self.persistent_reference.as_deref()
     }
 
-    /// The raw returned attribute dictionary. Validation of provenance —
-    /// which service, account, access group, and protection the item must
-    /// carry — is the host's contract, expressed over these attributes.
-    pub fn attributes(&self) -> &CFDictionary {
-        &self.attributes
+    /// The item's provenance attributes, without any value data.
+    pub fn provenance(&self) -> &KeychainItemProvenance {
+        &self.provenance
     }
 }
 
