@@ -10,8 +10,9 @@ the runtime receives only authorized ephemeral lease material.
 The model follows the IAM session-credential shape rather than "give the
 application the key":
 
-- **Custody** (system keyring, persistence, owner authorization) belongs to
-  the host and never enters this crate.
+- **Custody** (system keyring, persistence) lives in the
+  `credential-lease-keychain` backend, never in the contract crate; **owner
+  authorization** (prompts, sessions, revocation) stays with the host.
 - A **`CredentialHandoff`** — a closed JSON document — carries credential
   material from the unlocking process to one runtime over a process-local
   channel.
@@ -30,7 +31,7 @@ cross families.
 | Crate | Contents |
 | --- | --- |
 | `credential-lease` | `SecretBytes`, `LeasedCredential`, `CredentialHandoff<K>`, `CredentialLease<K>`, `CredentialSlot<K>`, `LeaseEpochSource`, `CustodyPort` registry |
-| `credential-lease-keychain` | OS-keychain custody backend: protected SecItem operations on macOS (`Keychain`, `KeychainItemQuery`, `KeychainAuthContext`), fail-closed `None` elsewhere |
+| `credential-lease-keychain` | OS-keychain custody backend: protected SecItem operations on macOS (`Keychain`, `KeychainItemQuery`, `KeychainAuthContext`, `KeychainItem` with its typed `KeychainItemProvenance`), fail-closed `None` elsewhere |
 
 ## Language-neutral contract
 

@@ -5,7 +5,24 @@
 //! policy, and the silent backend-selection probe. Owner authorization
 //! arrives as a [`KeychainAuthContext`] and becomes
 //! `kSecUseAuthenticationContext`; this module never evaluates a policy.
+//!
+//! # Plaintext copies
+//!
+//! Value bytes cross into Core Foundation only inside a `CFData` whose
+//! backing store comes from this module's zeroizing allocator, so the buffer
+//! is overwritten before it is freed — whenever Core Foundation releases its
+//! last reference. Read results are copied once into [`SecretBytes`] and the
+//! raw result dictionary never leaves this module.
+//!
+//! What remains outside this crate's control: the copies Security.framework
+//! and `securityd` make while serializing a request or a result, and the
+//! immutable `CFData` a read returns, which the framework allocates and
+//! frees without zeroing. Writing into that buffer would violate its
+//! immutability contract, so the module only bounds its lifetime: it is
+//! released as soon as the bytes are copied out.
 
+use std::alloc::{alloc, dealloc, Layout};
+use std::ffi::c_void;
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
@@ -14,8 +31,11 @@ use core_foundation::boolean::CFBoolean;
 use core_foundation::data::CFData;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::string::CFString;
-use core_foundation_sys::base::{CFGetTypeID, CFRelease, CFTypeRef};
-use core_foundation_sys::data::CFDataRef;
+use core_foundation_sys::base::{
+    CFAllocatorAllocate, CFAllocatorContext, CFAllocatorCreate, CFAllocatorDeallocate,
+    CFAllocatorRef, CFEqual, CFGetTypeID, CFIndex, CFOptionFlags, CFRelease, CFTypeRef,
+};
+use core_foundation_sys::data::{CFDataCreateWithBytesNoCopy, CFDataRef};
 use core_foundation_sys::dictionary::CFDictionaryGetValueIfPresent;
 use core_foundation_sys::string::CFStringRef;
 use credential_lease::SecretBytes;
@@ -37,10 +57,11 @@ use security_framework_sys::keychain_item::{
     SecItemAdd, SecItemCopyMatching, SecItemDelete, SecItemUpdate,
 };
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::context::KeychainAuthContext;
 use crate::error::{KeychainError, KeychainErrorKind};
-use crate::item::{AddItemOutcome, KeychainItem, KeychainItemQuery};
+use crate::item::{AddItemOutcome, KeychainItem, KeychainItemProvenance, KeychainItemQuery};
 use crate::{Keychain, KeychainBackend};
 
 macro_rules! security_framework_static {
@@ -55,6 +76,7 @@ const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
 #[link(name = "Security", kind = "framework")]
 extern "C" {
     static kSecValuePersistentRef: CFStringRef;
+    static kSecAttrAccessible: CFStringRef;
 }
 
 // The classic Keychain has a process-wide UI switch, independent of the
@@ -323,8 +345,8 @@ impl Keychain {
         })
     }
 
-    /// Copy one item with its full attribute dictionary, its value bytes,
-    /// and its persistent reference.
+    /// Copy one item with its value bytes, its persistent reference, and
+    /// its provenance attributes.
     pub fn copy_item(
         &self,
         context: &KeychainAuthContext,
@@ -522,7 +544,22 @@ fn classic_migration_pairs(
 /// The write payload: a `SecAccessControl` requiring user presence plus
 /// the value bytes.
 fn protected_secret_pairs(secret: &[u8]) -> Result<Vec<(CFString, CFType)>, KeychainError> {
-    let access_control = SecAccessControl::create_with_protection(
+    Ok(vec![
+        (
+            security_framework_static!(kSecAttrAccessControl, sec_key),
+            backend_access_control()?.into_CFType(),
+        ),
+        (
+            security_framework_static!(kSecValueData, sec_key),
+            zeroizing_cf_data(secret)?.into_CFType(),
+        ),
+    ])
+}
+
+/// The access control every protected write carries — and the one
+/// [`KeychainItemProvenance::has_backend_access_control`] compares against.
+fn backend_access_control() -> Result<SecAccessControl, KeychainError> {
+    SecAccessControl::create_with_protection(
         Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
         kSecAccessControlUserPresence,
     )
@@ -532,17 +569,138 @@ fn protected_secret_pairs(secret: &[u8]) -> Result<Vec<(CFString, CFType)>, Keyc
             KeychainErrorKind::Failed,
             None,
         )
-    })?;
-    Ok(vec![
-        (
-            security_framework_static!(kSecAttrAccessControl, sec_key),
-            access_control.into_CFType(),
-        ),
-        (
-            security_framework_static!(kSecValueData, sec_key),
-            CFData::from_buffer(secret).into_CFType(),
-        ),
-    ])
+    })
+}
+
+/// Every zeroizing buffer is preceded by a header holding the allocation's
+/// total size, because a Core Foundation deallocator receives only the
+/// pointer. The header width keeps the payload 16-byte aligned.
+const ZEROIZING_HEADER: usize = 16;
+
+fn zeroizing_layout(total: usize) -> Option<Layout> {
+    Layout::from_size_align(total, ZEROIZING_HEADER).ok()
+}
+
+extern "C" fn zeroizing_allocate(
+    size: CFIndex,
+    _hint: CFOptionFlags,
+    _info: *mut c_void,
+) -> *mut c_void {
+    let Some(total) = usize::try_from(size)
+        .ok()
+        .and_then(|size| size.checked_add(ZEROIZING_HEADER))
+    else {
+        return ptr::null_mut();
+    };
+    let Some(layout) = zeroizing_layout(total) else {
+        return ptr::null_mut();
+    };
+    // SAFETY: the layout is valid and non-zero-sized (it includes the header).
+    let base = unsafe { alloc(layout) };
+    if base.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: base is a fresh, suitably aligned allocation of `total` bytes,
+    // so the header write and the payload offset stay in bounds.
+    unsafe {
+        base.cast::<usize>().write(total);
+        base.add(ZEROIZING_HEADER).cast()
+    }
+}
+
+/// Overwrite one zeroizing allocation, header included, and return its base
+/// and layout for release.
+///
+/// # Safety
+///
+/// `payload` must come from [`zeroizing_allocate`] and not yet be freed.
+unsafe fn scrub_zeroizing_buffer(payload: *mut c_void) -> (*mut u8, Layout) {
+    // SAFETY: the caller guarantees payload sits ZEROIZING_HEADER bytes past
+    // a live allocation whose first word records its total size.
+    unsafe {
+        let base = payload.cast::<u8>().sub(ZEROIZING_HEADER);
+        let total = base.cast::<usize>().read();
+        std::slice::from_raw_parts_mut(base, total).zeroize();
+        let layout = Layout::from_size_align_unchecked(total, ZEROIZING_HEADER);
+        (base, layout)
+    }
+}
+
+extern "C" fn zeroizing_deallocate(payload: *mut c_void, _info: *mut c_void) {
+    if payload.is_null() {
+        return;
+    }
+    // SAFETY: Core Foundation hands back only pointers this allocator
+    // produced, exactly once.
+    unsafe {
+        let (base, layout) = scrub_zeroizing_buffer(payload);
+        dealloc(base, layout);
+    }
+    #[cfg(test)]
+    tests::SCRUBBED_RELEASES.with(|count| count.set(count.get() + 1));
+}
+
+struct ZeroizingAllocator(CFAllocatorRef);
+
+// SAFETY: a CFAllocator is an immutable, thread-safe Core Foundation object;
+// the wrapped reference is created once and never released.
+unsafe impl Send for ZeroizingAllocator {}
+// SAFETY: as above — shared use only passes the reference to CF calls.
+unsafe impl Sync for ZeroizingAllocator {}
+
+static ZEROIZING_ALLOCATOR: OnceLock<ZeroizingAllocator> = OnceLock::new();
+
+fn zeroizing_allocator() -> Option<CFAllocatorRef> {
+    let allocator = ZEROIZING_ALLOCATOR.get_or_init(|| {
+        let mut context = CFAllocatorContext {
+            version: 0,
+            info: ptr::null_mut(),
+            retain: None,
+            release: None,
+            copyDescription: None,
+            allocate: Some(zeroizing_allocate),
+            reallocate: None,
+            deallocate: Some(zeroizing_deallocate),
+            preferredSize: None,
+        };
+        // SAFETY: the context is fully initialized; CFAllocatorCreate copies
+        // it, and the allocator object itself uses the default allocator.
+        ZeroizingAllocator(unsafe { CFAllocatorCreate(ptr::null(), &mut context) })
+    });
+    (!allocator.0.is_null()).then_some(allocator.0)
+}
+
+fn secret_buffer_unavailable() -> KeychainError {
+    KeychainError::new(
+        "credential_lease_keychain_secret_buffer_unavailable",
+        KeychainErrorKind::Failed,
+        None,
+    )
+}
+
+/// A `CFData` over a copy of `secret` whose backing store is overwritten
+/// before Core Foundation frees it, however long the framework retains it.
+fn zeroizing_cf_data(secret: &[u8]) -> Result<CFData, KeychainError> {
+    let allocator = zeroizing_allocator().ok_or_else(secret_buffer_unavailable)?;
+    let length = CFIndex::try_from(secret.len()).map_err(|_| secret_buffer_unavailable())?;
+    // SAFETY: the allocator is live for the process lifetime.
+    let buffer = unsafe { CFAllocatorAllocate(allocator, length, 0) }.cast::<u8>();
+    if buffer.is_null() {
+        return Err(secret_buffer_unavailable());
+    }
+    // SAFETY: buffer holds `secret.len()` writable bytes that do not overlap
+    // the borrowed secret.
+    unsafe { ptr::copy_nonoverlapping(secret.as_ptr(), buffer, secret.len()) };
+    // SAFETY: on success the CFData owns buffer and releases it through the
+    // same allocator; the default allocator creates the CFData object.
+    let data = unsafe { CFDataCreateWithBytesNoCopy(ptr::null(), buffer, length, allocator) };
+    if data.is_null() {
+        // SAFETY: creation failed, so buffer is still exclusively ours.
+        unsafe { CFAllocatorDeallocate(allocator, buffer.cast()) };
+        return Err(secret_buffer_unavailable());
+    }
+    // SAFETY: CFDataCreateWithBytesNoCopy returned a +1 reference.
+    Ok(unsafe { CFData::wrap_under_create_rule(data) })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -589,13 +747,20 @@ fn copy_secret_from_query_effect(
         return Ok(None);
     };
     let data = value.downcast::<CFData>().ok_or_else(data_invalid)?;
-    SecretBytes::try_from_bytes(data.bytes().to_vec())
-        .map(Some)
-        .map_err(|_| data_invalid())
+    secret_from_cf_data(&data).map(Some)
 }
 
-/// Full-dictionary copy — attributes, value bytes, and persistent
-/// reference, so the host's provenance checks see exactly what was stored.
+/// Copy a returned value into its zeroizing container. The single
+/// exact-capacity copy moves into [`SecretBytes`] before any check, so a
+/// refused buffer is scrubbed too; the platform's immutable `CFData` is
+/// released by the caller right after.
+fn secret_from_cf_data(data: &CFData) -> Result<SecretBytes, KeychainError> {
+    SecretBytes::try_from_bytes(data.bytes().to_vec()).map_err(|_| data_invalid())
+}
+
+/// Full copy — value bytes, persistent reference, and the typed provenance
+/// projection the host's checks consume. The raw result dictionary, which
+/// holds the value data, is released here and never handed out.
 fn copy_item_from_query_effect(
     pairs: &[(CFString, CFType)],
     backend: KeychainBackend,
@@ -619,18 +784,53 @@ fn copy_item_from_query_effect(
         return Ok(None);
     };
     let attributes = value.downcast::<CFDictionary>().ok_or_else(data_invalid)?;
-    let data = dictionary_data(&attributes, unsafe { kSecValueData }).ok_or_else(data_invalid)?;
-    let persistent_reference = dictionary_data(&attributes, unsafe { kSecValuePersistentRef });
-    let secret = SecretBytes::try_from_bytes(data).map_err(|_| data_invalid())?;
+    let secret = dictionary_data(&attributes, unsafe { kSecValueData })
+        .ok_or_else(data_invalid)
+        .and_then(|data| secret_from_cf_data(&data))?;
+    let persistent_reference = dictionary_data(&attributes, unsafe { kSecValuePersistentRef })
+        .map(|reference| reference.bytes().to_vec());
+    let provenance = item_provenance(&attributes)?;
     Ok(Some(KeychainItem::new(
         secret,
         persistent_reference,
-        attributes,
+        provenance,
     )))
 }
 
-fn dictionary_data(dictionary: &CFDictionary, key: CFStringRef) -> Option<Vec<u8>> {
-    let mut value: *const core::ffi::c_void = ptr::null();
+/// The provenance projection: only the named storage attributes, never the
+/// value data.
+fn item_provenance(attributes: &CFDictionary) -> Result<KeychainItemProvenance, KeychainError> {
+    let expected_access_control = backend_access_control()?;
+    // SAFETY: the keys are SDK-exported static CFStrings.
+    let (service, account, access_group, accessible, synchronizable, access_control) = unsafe {
+        (
+            kSecAttrService,
+            kSecAttrAccount,
+            kSecAttrAccessGroup,
+            kSecAttrAccessible,
+            kSecAttrSynchronizable,
+            kSecAttrAccessControl,
+        )
+    };
+    Ok(KeychainItemProvenance {
+        service: dictionary_string(attributes, service),
+        account: dictionary_string(attributes, account),
+        access_group: dictionary_string(attributes, access_group),
+        accessible: dictionary_string(attributes, accessible),
+        synchronizable: dictionary_value(attributes, synchronizable)
+            .and_then(|value| value.downcast::<CFBoolean>())
+            .map(bool::from),
+        backend_access_control: dictionary_value(attributes, access_control).is_some_and(
+            // SAFETY: both references are live CF objects for the call.
+            |value| unsafe {
+                CFEqual(value.as_CFTypeRef(), expected_access_control.as_CFTypeRef()) != 0
+            },
+        ),
+    })
+}
+
+fn dictionary_value(dictionary: &CFDictionary, key: CFStringRef) -> Option<CFType> {
+    let mut value: *const c_void = ptr::null();
     // SAFETY: dictionary is a live CFDictionary and value an initialized
     // out-pointer; the key is an SDK-exported CFString.
     let found = unsafe {
@@ -639,13 +839,19 @@ fn dictionary_data(dictionary: &CFDictionary, key: CFStringRef) -> Option<Vec<u8
     if found == 0 || value.is_null() {
         return None;
     }
-    // SAFETY: value is a live CF object owned by the dictionary.
-    if unsafe { CFGetTypeID(value.cast()) } != CFData::type_id() {
-        return None;
-    }
-    // SAFETY: type identity is CFData and get-rule wrapping retains.
-    let data = unsafe { CFData::wrap_under_get_rule(value.cast()) };
-    Some(data.bytes().to_vec())
+    // SAFETY: value is a live CF object owned by the dictionary; get-rule
+    // wrapping retains it.
+    Some(unsafe { CFType::wrap_under_get_rule(value.cast()) })
+}
+
+fn dictionary_data(dictionary: &CFDictionary, key: CFStringRef) -> Option<CFData> {
+    dictionary_value(dictionary, key).and_then(|value| value.downcast::<CFData>())
+}
+
+fn dictionary_string(dictionary: &CFDictionary, key: CFStringRef) -> Option<String> {
+    dictionary_value(dictionary, key)
+        .and_then(|value| value.downcast::<CFString>())
+        .map(|value| value.to_string())
 }
 
 fn keychain_roundtrip_probe(backend: KeychainBackend) -> bool {
@@ -753,8 +959,14 @@ fn sec_string_value(value: CFStringRef) -> CFType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use security_framework_sys::access_control::kSecAttrAccessibleWhenUnlockedThisDeviceOnly;
     use std::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    thread_local! {
+        /// Zeroizing releases observed on the current thread.
+        pub(super) static SCRUBBED_RELEASES: Cell<usize> = const { Cell::new(0) };
+    }
 
     struct SyntheticInteraction {
         allowed: Cell<bool>,
@@ -1089,6 +1301,106 @@ mod tests {
             pairs[1].0,
             security_framework_static!(kSecValueData, sec_key)
         );
+    }
+
+    #[test]
+    fn provenance_projects_storage_attributes_without_value_data() {
+        let secret = b"synthetic-provenance-secret";
+        let attributes = |access_control: CFType| {
+            CFDictionary::from_CFType_pairs(&[
+                (
+                    security_framework_static!(kSecAttrService, sec_key),
+                    CFString::from("synthetic-service").into_CFType(),
+                ),
+                (
+                    security_framework_static!(kSecAttrAccount, sec_key),
+                    CFString::from("synthetic-account").into_CFType(),
+                ),
+                (
+                    security_framework_static!(kSecAttrAccessGroup, sec_key),
+                    CFString::from("synthetic-access-group").into_CFType(),
+                ),
+                (
+                    security_framework_static!(kSecAttrAccessible, sec_key),
+                    security_framework_static!(
+                        kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+                        sec_string_value
+                    ),
+                ),
+                (
+                    security_framework_static!(kSecAttrSynchronizable, sec_key),
+                    CFBoolean::false_value().into_CFType(),
+                ),
+                (
+                    security_framework_static!(kSecAttrAccessControl, sec_key),
+                    access_control,
+                ),
+                (
+                    security_framework_static!(kSecValueData, sec_key),
+                    CFData::from_buffer(secret).into_CFType(),
+                ),
+            ])
+            .to_untyped()
+        };
+
+        let backend =
+            item_provenance(&attributes(backend_access_control().unwrap().into_CFType())).unwrap();
+        assert_eq!(backend.service(), Some("synthetic-service"));
+        assert_eq!(backend.account(), Some("synthetic-account"));
+        assert_eq!(backend.access_group(), Some("synthetic-access-group"));
+        assert_eq!(
+            backend.accessible(),
+            Some(
+                security_framework_static!(kSecAttrAccessibleWhenUnlockedThisDeviceOnly, sec_key)
+                    .to_string()
+                    .as_str()
+            )
+        );
+        assert_eq!(backend.synchronizable(), Some(false));
+        assert!(backend.has_backend_access_control());
+        let projection = format!("{backend:?}");
+        assert!(!projection.contains("synthetic-provenance-secret"));
+
+        let weaker = SecAccessControl::create_with_protection(
+            Some(ProtectionMode::AccessibleWhenUnlocked),
+            0,
+        )
+        .unwrap();
+        let foreign = item_provenance(&attributes(weaker.into_CFType())).unwrap();
+        assert!(!foreign.has_backend_access_control());
+
+        // Absent or mistyped attributes are reported as absent, never guessed.
+        let sparse = CFDictionary::from_CFType_pairs(&[(
+            security_framework_static!(kSecAttrService, sec_key),
+            CFBoolean::true_value().into_CFType(),
+        )])
+        .to_untyped();
+        let sparse = item_provenance(&sparse).unwrap();
+        assert_eq!(sparse.service(), None);
+        assert_eq!(sparse.account(), None);
+        assert_eq!(sparse.synchronizable(), None);
+        assert!(!sparse.has_backend_access_control());
+    }
+
+    #[test]
+    fn write_side_value_data_is_scrubbed_before_release() {
+        let secret = b"synthetic-write-secret";
+        let data = zeroizing_cf_data(secret).unwrap();
+        assert_eq!(data.bytes(), secret);
+        let released = SCRUBBED_RELEASES.with(Cell::get);
+        drop(data);
+        assert_eq!(SCRUBBED_RELEASES.with(Cell::get), released + 1);
+
+        let payload = zeroizing_allocate(secret.len() as CFIndex, 0, ptr::null_mut());
+        assert!(!payload.is_null());
+        // SAFETY: payload holds secret.len() writable bytes from the allocator.
+        unsafe {
+            ptr::copy_nonoverlapping(secret.as_ptr(), payload.cast::<u8>(), secret.len());
+            let (base, layout) = scrub_zeroizing_buffer(payload);
+            let scrubbed = std::slice::from_raw_parts(base, layout.size());
+            assert!(scrubbed.iter().all(|byte| *byte == 0));
+            dealloc(base, layout);
+        }
     }
 
     #[test]
