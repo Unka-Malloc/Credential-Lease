@@ -29,3 +29,21 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: cargo package --locked -p "${TAG%-v*}"
+
+  # The custody backend's SecItem path compiles only on macOS; build and test
+  # it there so a publication never ships an unexercised Keychain backend.
+  keychain-macos:
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      # dtolnay/rust-toolchain @stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: stable
+      - name: Test the macOS Keychain backend
+        run: cargo test -p credential-lease-keychain --locked
