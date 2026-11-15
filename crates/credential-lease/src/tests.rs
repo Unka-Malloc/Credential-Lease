@@ -5,7 +5,7 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum TestKind {
@@ -130,6 +130,14 @@ impl LeaseEpochSource for TestEpochSource {
     }
 }
 
+struct FailingEpochSource;
+
+impl LeaseEpochSource for FailingEpochSource {
+    fn active_epoch(&self) -> Result<Option<String>> {
+        Err(anyhow::anyhow!("credential_lease_epoch_unavailable"))
+    }
+}
+
 fn test_credential(secret: &str) -> LeasedCredential {
     LeasedCredential::new(
         uuid::Uuid::new_v4().to_string(),
@@ -209,11 +217,189 @@ fn lease_fails_closed_after_epoch_revocation() {
             .unwrap(),
         "synthetic-key-12345"
     );
+    // A rotated epoch kills the lease on its very next use, not only a full
+    // lock (`None`) does.
+    *source.0.lock().unwrap() = Some(uuid::Uuid::new_v4().to_string());
+    assert_eq!(
+        lease.resolve(TestKind::Beta).unwrap_err().to_string(),
+        "credential_lease_revoked"
+    );
+    assert_eq!(
+        lease
+            .resolve_candidates(TestKind::Beta)
+            .unwrap_err()
+            .to_string(),
+        "credential_lease_revoked"
+    );
+    assert_eq!(
+        lease.handoff_projection().unwrap_err().to_string(),
+        "credential_lease_revoked"
+    );
     *source.0.lock().unwrap() = None;
     assert_eq!(
         lease.resolve(TestKind::Beta).unwrap_err().to_string(),
         "credential_lease_revoked"
     );
+}
+
+#[test]
+fn epoch_source_failure_fails_closed_without_resolving() {
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let mut credentials = BTreeMap::new();
+    credentials.insert(
+        TestKind::Beta,
+        vec![test_credential("synthetic-epoch-error")],
+    );
+    let lease = CredentialLease::new(
+        credentials,
+        Duration::from_secs(3600),
+        epoch,
+        Arc::new(FailingEpochSource),
+    )
+    .unwrap();
+    assert_eq!(
+        lease.resolve(TestKind::Beta).unwrap_err().to_string(),
+        "credential_lease_epoch_unavailable"
+    );
+    assert_eq!(
+        lease
+            .resolve_candidates(TestKind::Beta)
+            .unwrap_err()
+            .to_string(),
+        "credential_lease_epoch_unavailable"
+    );
+    assert_eq!(
+        lease.handoff_projection().unwrap_err().to_string(),
+        "credential_lease_epoch_unavailable"
+    );
+}
+
+#[test]
+fn lease_bound_to_another_process_fails_closed_on_every_secret_use() {
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let source = Arc::new(TestEpochSource(StdMutex::new(Some(epoch.clone()))));
+    let mut credentials = BTreeMap::new();
+    credentials.insert(
+        TestKind::Beta,
+        vec![test_credential("synthetic-cross-pid-key")],
+    );
+    let foreign_process = std::process::id().wrapping_add(1);
+    assert_ne!(foreign_process, std::process::id());
+    let lease = CredentialLease::new_with_binding_for_test(
+        credentials,
+        Duration::from_secs(3600),
+        epoch,
+        source,
+        foreign_process,
+        Instant::now() + Duration::from_secs(3600),
+    )
+    .unwrap();
+
+    // The secret is live and within TTL under a valid epoch, but the lease
+    // is bound to another process: every path that could expose or copy it
+    // fails closed.
+    assert_eq!(
+        lease.resolve(TestKind::Beta).unwrap_err().to_string(),
+        "credential_lease_process_mismatch"
+    );
+    assert_eq!(
+        lease
+            .resolve_candidates(TestKind::Beta)
+            .unwrap_err()
+            .to_string(),
+        "credential_lease_process_mismatch"
+    );
+    assert_eq!(
+        lease.handoff_projection().unwrap_err().to_string(),
+        "credential_lease_process_mismatch"
+    );
+
+    let slot = CredentialSlot::new(lease);
+    assert!(!slot.connected());
+    assert_eq!(
+        slot.resolve(TestKind::Beta).unwrap_err().to_string(),
+        "credential_lease_process_mismatch"
+    );
+    assert_eq!(
+        slot.resolve_candidates(TestKind::Beta)
+            .unwrap_err()
+            .to_string(),
+        "credential_lease_process_mismatch"
+    );
+}
+
+#[test]
+fn expired_lease_fails_closed_before_touching_the_epoch() {
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let mut credentials = BTreeMap::new();
+    credentials.insert(
+        TestKind::Beta,
+        vec![test_credential("synthetic-expired-key")],
+    );
+    let lease = CredentialLease::new_with_binding_for_test(
+        credentials,
+        Duration::from_secs(3600),
+        epoch,
+        // This source would fail if consulted: an expired lease must refuse
+        // before any epoch answer is requested.
+        Arc::new(FailingEpochSource),
+        std::process::id(),
+        Instant::now() - Duration::from_secs(1),
+    )
+    .unwrap();
+
+    assert_eq!(
+        lease.resolve(TestKind::Beta).unwrap_err().to_string(),
+        "credential_lease_expired"
+    );
+    assert_eq!(
+        lease
+            .resolve_candidates(TestKind::Beta)
+            .unwrap_err()
+            .to_string(),
+        "credential_lease_expired"
+    );
+    // Projection is a credential use too: an expired lease cannot restart
+    // its lifetime by re-minting a fresh handoff.
+    assert_eq!(
+        lease.handoff_projection().unwrap_err().to_string(),
+        "credential_lease_expired"
+    );
+    let slot = CredentialSlot::new(lease);
+    assert!(!slot.connected());
+    assert_eq!(
+        slot.resolve(TestKind::Beta).unwrap_err().to_string(),
+        "credential_lease_expired"
+    );
+}
+
+#[test]
+fn secret_bytes_zeroize_scrubs_the_buffer_and_clears_its_length() {
+    let mut secret = SecretBytes::try_from_bytes(vec![0xAA; 64]).unwrap();
+    let copy = secret.copy_for_persistent_read();
+    assert!(secret.zeroize_and_inspect());
+    assert!(secret.expose_bytes().is_empty());
+    // An independently owned copy keeps its own bytes: zeroizing the lease's
+    // buffer never reaches a value another owner already holds.
+    assert_eq!(copy.expose_bytes(), &[0xAA; 64]);
+}
+
+#[test]
+fn handoff_document_zeroize_scrubs_serialized_secret_material() {
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let source = Arc::new(TestEpochSource(StdMutex::new(Some(epoch.clone()))));
+    let lease = CredentialLease::new(
+        handoff_test_credentials(),
+        Duration::from_secs(3600),
+        epoch,
+        source,
+    )
+    .unwrap();
+    let mut document = lease.handoff_projection().unwrap().to_json().unwrap();
+    // The first alpha secret starts with `s` (115) and is decimal-encoded.
+    assert!(String::from_utf8_lossy(document.expose_bytes()).contains("\"secret\":[115,"));
+    assert!(document.zeroize_and_inspect());
+    assert!(document.expose_bytes().is_empty());
 }
 
 #[test]

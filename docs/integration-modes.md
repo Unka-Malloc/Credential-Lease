@@ -36,8 +36,10 @@ Boundary rules the consumer relies on:
   document travels only through a process-local channel, never disks, logs or
   configuration. Inventories, debug projections and error output contain no
   secret material.
-- **Process-bound** — a lease is bound to the granting process and epoch;
-  revocation is a signal the host reads, not a callback it must trust.
+- **Process-bound** — a lease is bound to the process that minted it, its
+  own lifetime, and the custody epoch. A fork inheriting the lease fails
+  closed (`credential_lease_process_mismatch`); revocation is a signal the
+  host reads, not a callback it must trust.
 
 ## Skills
 

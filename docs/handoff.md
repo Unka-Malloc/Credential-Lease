@@ -82,11 +82,16 @@ during parsing:
 ## Lease semantics (runtime side)
 
 A lease rebuilt from a handoff is process-bound and never survives process
-exit. Two independent liveness checks apply on every use:
+exit. Three independent checks apply on every credential use:
 
-1. The lease's own duration — an `Instant`-relative upper bound minted at
+1. Process identity — the lease records the OS process id that minted it
+   and compares it with the current process on every resolution and
+   handoff projection. A child forked with the lease in its inherited
+   address space fails closed instead of replaying the parent's
+   credentials.
+2. The lease's own duration — an `Instant`-relative upper bound minted at
    rebuild time.
-2. The custody epoch — the runtime's epoch source is consulted on every
+3. The custody epoch — the runtime's epoch source is consulted on every
    resolution and must still report the handoff's epoch. An
    owner-initiated revocation rotates the epoch and kills every
    outstanding lease on its very next use; there is no cached
@@ -95,15 +100,36 @@ exit. Two independent liveness checks apply on every use:
 Credentials past their own `expiresAtEpochSeconds` never resolve. Resolving
 yields copies of secret material; the lease retains its own bytes.
 
+Projection back into a handoff is a credential use as well: it re-checks
+all three conditions, so an expired or revoked lease cannot be re-minted
+into a fresh handoff that restarts its lifetime.
+
+The contract's runtime refusals are stable codes:
+
+| Refusal | Meaning |
+| --- | --- |
+| `credential_lease_unavailable` | No credential of the requested kind is currently resolvable. |
+| `credential_lease_expired` | The lease's own duration has elapsed. |
+| `credential_lease_revoked` | The active epoch is absent or no longer matches the lease's epoch. |
+| `credential_lease_process_mismatch` | The lease object is being used from a process other than the one that minted it. |
+
+The process check governs this lease object. A fork still inherits the
+address space, so secret buffers already copied into the child are outside
+the lease's control; the check keeps the inherited lease itself from
+resolving or projecting them.
+
 ## Portability notes
 
 - Memory zeroization of secret material is a Rust implementation property
-  (`SecretBytes` zeroizes on drop), not a contract term. Non-Rust
-  implementations cannot portably guarantee erasure; the contract requires
-  only that secrets never appear in inventories, configuration documents,
-  debug projections, or command results.
+  (`SecretBytes` and `HandoffDocument` zeroize on drop), not a contract
+  term. Non-Rust implementations cannot portably guarantee erasure; the
+  contract requires only that secrets never appear in inventories,
+  configuration documents, debug projections, or command results.
 - `Instant`-relative expiry is a process-local monotonic concept; non-Rust
   implementations use their runtime's monotonic clock.
+- Process identity is the operating system's process id (or an equivalent
+  unforgeable per-process identity). Implementations that cannot observe a
+  process identity must fail closed rather than skip the check.
 
 ## Family schemas
 

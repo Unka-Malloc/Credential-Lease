@@ -1384,13 +1384,16 @@ mod tests {
 
     #[test]
     fn write_side_value_data_is_scrubbed_before_release() {
-        let secret = b"writ-x";
-        let data = zeroizing_cf_data(secret).unwrap();
-        assert_eq!(data.bytes(), secret);
-        let released = SCRUBBED_RELEASES.with(Cell::get);
-        drop(data);
-        assert_eq!(SCRUBBED_RELEASES.with(Cell::get), released + 1);
+        for length in [1usize, 15, 16, 17, 64] {
+            let secret = vec![0xAA; length];
+            let data = zeroizing_cf_data(&secret).unwrap();
+            assert_eq!(data.bytes(), secret);
+            let released = SCRUBBED_RELEASES.with(Cell::get);
+            drop(data);
+            assert_eq!(SCRUBBED_RELEASES.with(Cell::get), released + 1);
+        }
 
+        let secret = b"writ-x";
         let payload = zeroizing_allocate(secret.len() as CFIndex, 0, ptr::null_mut());
         assert!(!payload.is_null());
         // SAFETY: payload holds secret.len() writable bytes from the allocator.
@@ -1400,6 +1403,30 @@ mod tests {
             let scrubbed = std::slice::from_raw_parts(base, layout.size());
             assert!(scrubbed.iter().all(|byte| *byte == 0));
             dealloc(base, layout);
+        }
+    }
+
+    #[test]
+    fn read_side_copy_is_zeroized_and_refuses_invalid_lengths() {
+        let data = CFData::from_buffer(b"synthetic-read-secret");
+        let mut secret = secret_from_cf_data(&data).unwrap();
+        assert_eq!(secret.expose_bytes(), b"synthetic-read-secret");
+        secret.zeroize();
+        assert!(secret.expose_bytes().is_empty());
+
+        // Empty and oversize values are refused with a value-free code; the
+        // copied buffer is zeroized before the refusal drops it.
+        for payload in [
+            Vec::new(),
+            vec![0xAA; credential_lease::MAX_SECRET_BYTES + 1],
+        ] {
+            let data = CFData::from_buffer(&payload);
+            let error = secret_from_cf_data(&data).unwrap_err();
+            assert_eq!(error.code(), "credential_lease_keychain_data_invalid");
+            assert_eq!(
+                format!("{error:?}"),
+                "credential_lease_keychain_data_invalid"
+            );
         }
     }
 

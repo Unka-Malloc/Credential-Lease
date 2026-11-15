@@ -39,15 +39,35 @@ pub const MAX_HANDOFF_DOC_BYTES: usize =
 
 /// A serialized handoff document. The document is secret-bearing — it
 /// embeds every credential in the clear — so the buffer zeroizes on drop
-/// like [`SecretBytes`], but it is bounded by [`MAX_HANDOFF_DOC_BYTES`]
-/// rather than the per-secret limit, which a full credential inventory can
-/// legitimately exceed.
+/// like [`SecretBytes`], and [`Zeroize`] is implemented for explicit early
+/// erasure. It is bounded by [`MAX_HANDOFF_DOC_BYTES`] rather than the
+/// per-secret limit, which a full credential inventory can legitimately
+/// exceed.
 pub struct HandoffDocument(Vec<u8>);
 
 impl HandoffDocument {
     /// Borrow the serialized document bytes.
     pub fn expose_bytes(&self) -> &[u8] {
         &self.0
+    }
+
+    /// Test-only: explicitly zeroize and report whether every previously
+    /// initialized byte is zero and the logical buffer is empty.
+    #[cfg(test)]
+    pub(crate) fn zeroize_and_inspect(&mut self) -> bool {
+        let length = self.0.len();
+        self.zeroize();
+        // SAFETY: `Vec::zeroize` overwrites the initialized bytes before it
+        // clears the length and does not release or shrink the allocation,
+        // so `length` readable bytes remain at the same backing pointer.
+        let scrubbed = unsafe { std::slice::from_raw_parts(self.0.as_ptr(), length) };
+        self.0.is_empty() && scrubbed.iter().all(|byte| *byte == 0)
+    }
+}
+
+impl Zeroize for HandoffDocument {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
     }
 }
 

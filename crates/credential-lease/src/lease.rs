@@ -1,10 +1,21 @@
 //! The process-bound lease.
 //!
 //! A lease never survives process exit. Its duration is an upper bound for
-//! one running process, not a persisted bypass of host authorization. Two
-//! independent liveness checks apply on every use: the lease's own `Instant`
-//! expiry, and the custody epoch, consulted on every resolution so an
-//! owner-initiated revocation lands on the very next use.
+//! one running process, not a persisted bypass of host authorization. Three
+//! independent checks apply on every credential use:
+//!
+//! 1. Process identity — the OS process id that minted the lease is recorded
+//!    and compared with the current process. A child forked with the lease
+//!    in its inherited address space therefore fails closed instead of
+//!    replaying the parent's credentials.
+//! 2. The lease's own `Instant` expiry.
+//! 3. The custody epoch, consulted on every resolution so an owner-initiated
+//!    revocation lands on the very next use.
+//!
+//! The process check governs use of *this lease object*. A fork still
+//! inherits the address space, so secret buffers already copied into the
+//! child are outside this type's control; the check keeps the inherited
+//! lease itself from resolving or projecting them.
 
 use crate::credential::LeasedCredential;
 use crate::epoch::LeaseEpochSource;
@@ -24,6 +35,7 @@ pub struct CredentialLease<K: CredentialKind> {
     expires_at: Instant,
     epoch: String,
     epoch_source: Arc<dyn LeaseEpochSource>,
+    process_id: u32,
 }
 
 impl<K: CredentialKind> CredentialLease<K> {
@@ -38,16 +50,34 @@ impl<K: CredentialKind> CredentialLease<K> {
             expires_at: Instant::now(),
             epoch: String::new(),
             epoch_source: Arc::new(DisconnectedEpochSource),
+            process_id: std::process::id(),
         }
     }
 
     /// Mint a lease. The epoch must be a canonical UUID and the duration a
-    /// positive bound within the contract's maximum.
+    /// positive bound within the contract's maximum. The current process id
+    /// is recorded as the lease's process binding.
     pub fn new(
         credentials: BTreeMap<K, Vec<LeasedCredential>>,
         lease_duration: Duration,
         epoch: String,
         epoch_source: Arc<dyn LeaseEpochSource>,
+    ) -> Result<Self> {
+        Self::new_bound(
+            credentials,
+            lease_duration,
+            epoch,
+            epoch_source,
+            std::process::id(),
+        )
+    }
+
+    fn new_bound(
+        credentials: BTreeMap<K, Vec<LeasedCredential>>,
+        lease_duration: Duration,
+        epoch: String,
+        epoch_source: Arc<dyn LeaseEpochSource>,
+        process_id: u32,
     ) -> Result<Self> {
         ensure!(
             uuid::Uuid::parse_str(&epoch).is_ok_and(|value| value.to_string() == epoch),
@@ -67,7 +97,41 @@ impl<K: CredentialKind> CredentialLease<K> {
             expires_at,
             epoch,
             epoch_source,
+            process_id,
         })
+    }
+
+    /// Test-only construction with an explicit process binding and expiry so
+    /// cross-PID replay and timeout paths are exercised deterministically
+    /// instead of by sleeping.
+    #[cfg(test)]
+    pub(crate) fn new_with_binding_for_test(
+        credentials: BTreeMap<K, Vec<LeasedCredential>>,
+        lease_duration: Duration,
+        epoch: String,
+        epoch_source: Arc<dyn LeaseEpochSource>,
+        process_id: u32,
+        expires_at: Instant,
+    ) -> Result<Self> {
+        let mut lease =
+            Self::new_bound(credentials, lease_duration, epoch, epoch_source, process_id)?;
+        lease.expires_at = expires_at;
+        Ok(lease)
+    }
+
+    /// Whether this lease object belongs to the process currently running.
+    fn is_current_process(&self) -> bool {
+        std::process::id() == self.process_id
+    }
+
+    /// Fail closed when a lease crossed a process boundary, for example by
+    /// being inherited across `fork`.
+    fn ensure_current_process(&self) -> Result<()> {
+        ensure!(
+            self.is_current_process(),
+            "credential_lease_process_mismatch"
+        );
+        Ok(())
     }
 
     /// The duration the lease was minted with — the upper bound this
@@ -77,8 +141,13 @@ impl<K: CredentialKind> CredentialLease<K> {
     }
 
     /// Project the lease into a portable handoff, copying every secret so
-    /// the lease itself keeps its own zeroizing bytes.
+    /// the lease itself keeps its own zeroizing bytes. Projection is a
+    /// credential use: the lease must still be live, so an expired or
+    /// revoked lease cannot be re-minted into a fresh handoff that restarts
+    /// its lifetime. A lease inherited across a process boundary refuses to
+    /// project; only the process that minted it may reproduce its secrets.
     pub fn handoff_projection(&self) -> Result<CredentialHandoff<K>> {
+        self.ensure_active()?;
         let mut credentials = BTreeMap::new();
         for (kind, keys) in &self.credentials {
             let mut copied = Vec::with_capacity(keys.len());
@@ -160,6 +229,7 @@ impl<K: CredentialKind> CredentialLease<K> {
     /// authorization window. Hosts supply the epoch source and choose how
     /// cheap that consultation is.
     fn ensure_active(&self) -> Result<()> {
+        self.ensure_current_process()?;
         ensure!(Instant::now() < self.expires_at, "credential_lease_expired");
         ensure!(
             self.epoch_source.active_epoch()?.as_deref() == Some(self.epoch.as_str()),
@@ -295,12 +365,17 @@ impl<K: CredentialKind> CredentialSlot<K> {
         self.replace(CredentialLease::from_handoff(handoff, epoch_source)?)
     }
 
-    /// Whether the slot holds a live, non-empty lease. A poisoned lock or
-    /// an expired lease reads as disconnected.
+    /// Whether the slot holds a live, non-empty lease in the current
+    /// process. A poisoned lock, an expired lease, or a lease inherited
+    /// across a process boundary reads as disconnected.
     pub fn connected(&self) -> bool {
         self.inner
             .lock()
-            .map(|lease| !lease.credentials.is_empty() && Instant::now() < lease.expires_at)
+            .map(|lease| {
+                lease.is_current_process()
+                    && !lease.credentials.is_empty()
+                    && Instant::now() < lease.expires_at
+            })
             .unwrap_or(false)
     }
 }

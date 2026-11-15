@@ -115,6 +115,21 @@ impl SecretBytes {
             bytes: Zeroizing::new(self.bytes.to_vec()),
         }
     }
+
+    /// Test-only: explicitly zeroize and report whether every previously
+    /// initialized byte is zero and the logical buffer is empty. The
+    /// allocation stays live after `zeroize`, so the bytes are still
+    /// readable for the assertion.
+    #[cfg(test)]
+    pub(crate) fn zeroize_and_inspect(&mut self) -> bool {
+        let length = self.bytes.len();
+        self.zeroize();
+        // SAFETY: `Vec::zeroize` overwrites the initialized bytes before it
+        // clears the length and does not release or shrink the allocation,
+        // so `length` readable bytes remain at the same backing pointer.
+        let scrubbed = unsafe { std::slice::from_raw_parts(self.bytes.as_ptr(), length) };
+        self.bytes.is_empty() && scrubbed.iter().all(|byte| *byte == 0)
+    }
 }
 
 impl fmt::Debug for SecretBytes {

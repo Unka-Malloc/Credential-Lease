@@ -37,8 +37,10 @@ can install their `CustodyPort` through `port::install` and access it through
 - The only secret-bearing serialized form is `HandoffDocument`, carried over
   an explicitly authorized process-local channel, never a file, log, inventory
   or configuration document.
-- Every resolution checks lease lifetime and the host's current custody epoch.
-  Revocation is a refusal; obtaining another lease requires host authorization.
+- Every resolution checks the lease's process identity, its own lifetime,
+  and the host's current custody epoch. A lease inherited across a fork and
+  a revoked or expired lease are all refusals; obtaining another lease
+  requires host authorization.
 - The `credential-lease` contract crate performs no custody. The workspace
   ships the keyring backend as `credential-lease-keychain`: protected macOS
   Keychain items, fail-closed (`Keychain::selected()` is `None`) elsewhere.
