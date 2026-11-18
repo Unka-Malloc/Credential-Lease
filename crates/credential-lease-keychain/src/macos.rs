@@ -1272,7 +1272,7 @@ mod tests {
     fn query_targets_selected_store_and_retains_one_authorization_context() {
         let context = synthetic_context();
         for backend in [KeychainBackend::Classic, KeychainBackend::DataProtection] {
-            for account in ["synthetic-key-one", "synthetic-key-two"] {
+            for account in ["synthetic-account-one", "synthetic-account-two"] {
                 let query = KeychainItemQuery::new("synthetic-service", account).unwrap();
                 let pairs = base_pairs(&query, &context, backend);
                 let dict = CFDictionary::from_CFType_pairs(&pairs);
@@ -1408,7 +1408,7 @@ mod tests {
 
     #[test]
     fn existing_item_updates_include_user_presence_access_control() {
-        let pairs = protected_secret_pairs(b"synthetic-secret").unwrap();
+        let pairs = protected_secret_pairs(&[0xA5u8; 24]).unwrap();
         assert_eq!(pairs.len(), 2);
         assert_eq!(
             pairs[0].0,
@@ -1422,7 +1422,7 @@ mod tests {
 
     #[test]
     fn provenance_projects_storage_attributes_without_value_data() {
-        let secret = b"prov-x";
+        let secret = [0x5Au8; 24];
         let attributes = |access_control: CFType| {
             CFDictionary::from_CFType_pairs(&[
                 (
@@ -1454,7 +1454,7 @@ mod tests {
                 ),
                 (
                     security_framework_static!(kSecValueData, sec_key),
-                    CFData::from_buffer(secret).into_CFType(),
+                    CFData::from_buffer(&secret).into_CFType(),
                 ),
             ])
             .to_untyped()
@@ -1476,7 +1476,7 @@ mod tests {
         assert_eq!(backend.synchronizable(), Some(false));
         assert!(backend.has_backend_access_control());
         let projection = format!("{backend:?}");
-        assert!(!projection.contains("synthetic-provenance-secret"));
+        assert!(!projection.contains(&format!("{secret:?}")));
 
         let weaker = SecAccessControl::create_with_protection(
             Some(ProtectionMode::AccessibleWhenUnlocked),
@@ -1510,7 +1510,7 @@ mod tests {
             assert_eq!(SCRUBBED_RELEASES.with(Cell::get), released + 1);
         }
 
-        let secret = b"writ-x";
+        let secret = [0xA5u8; 24];
         let payload = zeroizing_allocate(secret.len() as CFIndex, 0, ptr::null_mut());
         assert!(!payload.is_null());
         // SAFETY: payload holds secret.len() writable bytes from the allocator.
@@ -1525,9 +1525,9 @@ mod tests {
 
     #[test]
     fn read_side_copy_is_zeroized_and_refuses_invalid_lengths() {
-        let data = CFData::from_buffer(b"synthetic-read-secret");
+        let data = CFData::from_buffer(&[0x3Cu8; 24]);
         let mut secret = secret_from_cf_data(&data).unwrap();
-        assert_eq!(secret.expose_bytes(), b"synthetic-read-secret");
+        assert_eq!(secret.expose_bytes(), &[0x3Cu8; 24]);
         secret.zeroize();
         assert!(secret.expose_bytes().is_empty());
 

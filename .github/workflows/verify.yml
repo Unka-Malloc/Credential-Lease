@@ -30,6 +30,24 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: cargo package --locked -p "${TAG%-v*}"
 
+  # Build and test on the declared rust-version so a dependency MSRV bump can
+  # never outrun the toolchain the crates advertise to consumers.
+  msrv:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      # dtolnay/rust-toolchain @stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: "1.89"
+      - name: Test on the declared minimum toolchain
+        run: cargo test --workspace --locked
+
   # The custody backend's SecItem path compiles only on macOS; build and test
   # it there so a publication never ships an unexercised Keychain backend.
   keychain-macos:

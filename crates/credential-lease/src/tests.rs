@@ -138,10 +138,10 @@ impl LeaseEpochSource for FailingEpochSource {
     }
 }
 
-fn test_credential(secret: &str) -> LeasedCredential {
+fn test_credential(material: u8) -> LeasedCredential {
     LeasedCredential::new(
         uuid::Uuid::new_v4().to_string(),
-        SecretBytes::try_from_string(secret.to_owned()).unwrap(),
+        SecretBytes::try_from_bytes(vec![material; 16]).unwrap(),
         None,
     )
     .unwrap()
@@ -151,15 +151,9 @@ fn handoff_test_credentials() -> BTreeMap<TestKind, Vec<LeasedCredential>> {
     let mut credentials = BTreeMap::new();
     credentials.insert(
         TestKind::Alpha,
-        vec![
-            test_credential("synthetic-alpha-key-1"),
-            test_credential("synthetic-alpha-key-2"),
-        ],
+        vec![test_credential(0xA1), test_credential(0xA2)],
     );
-    credentials.insert(
-        TestKind::Beta,
-        vec![test_credential("synthetic-beta-key-1")],
-    );
+    credentials.insert(TestKind::Beta, vec![test_credential(0xB1)]);
     credentials
 }
 
@@ -179,7 +173,7 @@ fn credential_slot_hot_applies_handoff_without_replacing_the_arc() {
     let slot = CredentialSlot::<TestKind>::disconnected();
     assert!(!slot.connected());
     let mut credentials = BTreeMap::new();
-    credentials.insert(TestKind::Beta, vec![test_credential("fixture-key-123456")]);
+    credentials.insert(TestKind::Beta, vec![test_credential(0xC1)]);
     let epoch = uuid::Uuid::new_v4().to_string();
     let handoff = CredentialHandoff::new(
         credentials,
@@ -206,7 +200,7 @@ fn lease_fails_closed_after_epoch_revocation() {
     let epoch = uuid::Uuid::new_v4().to_string();
     let source = Arc::new(TestEpochSource(StdMutex::new(Some(epoch.clone()))));
     let mut credentials = BTreeMap::new();
-    credentials.insert(TestKind::Beta, vec![test_credential("synthetic-key-12345")]);
+    credentials.insert(TestKind::Beta, vec![test_credential(0xC2)]);
     let lease = CredentialLease::new(
         credentials,
         Duration::from_secs(3600),
@@ -216,12 +210,8 @@ fn lease_fails_closed_after_epoch_revocation() {
     )
     .unwrap();
     assert_eq!(
-        lease
-            .resolve(TestKind::Beta)
-            .unwrap()
-            .expose_utf8()
-            .unwrap(),
-        "synthetic-key-12345"
+        lease.resolve(TestKind::Beta).unwrap().expose_bytes(),
+        &[0xC2u8; 16]
     );
     // A rotated epoch kills the lease on its very next use, not only a full
     // lock (`None`) does.
@@ -252,10 +242,7 @@ fn lease_fails_closed_after_epoch_revocation() {
 fn epoch_source_failure_fails_closed_without_resolving() {
     let epoch = uuid::Uuid::new_v4().to_string();
     let mut credentials = BTreeMap::new();
-    credentials.insert(
-        TestKind::Beta,
-        vec![test_credential("synthetic-epoch-error")],
-    );
+    credentials.insert(TestKind::Beta, vec![test_credential(0xC3)]);
     let lease = CredentialLease::new(
         credentials,
         Duration::from_secs(3600),
@@ -286,10 +273,7 @@ fn lease_bound_to_another_process_fails_closed_on_every_secret_use() {
     let epoch = uuid::Uuid::new_v4().to_string();
     let source = Arc::new(TestEpochSource(StdMutex::new(Some(epoch.clone()))));
     let mut credentials = BTreeMap::new();
-    credentials.insert(
-        TestKind::Beta,
-        vec![test_credential("synthetic-cross-pid-key")],
-    );
+    credentials.insert(TestKind::Beta, vec![test_credential(0xC4)]);
     let foreign_process = std::process::id().wrapping_add(1);
     assert_ne!(foreign_process, std::process::id());
     let lease = CredentialLease::new_with_binding_for_test(
@@ -346,10 +330,7 @@ fn lease_bound_to_another_process_fails_closed_on_every_secret_use() {
 fn expired_lease_fails_closed_before_touching_the_epoch() {
     let epoch = uuid::Uuid::new_v4().to_string();
     let mut credentials = BTreeMap::new();
-    credentials.insert(
-        TestKind::Beta,
-        vec![test_credential("synthetic-expired-key")],
-    );
+    credentials.insert(TestKind::Beta, vec![test_credential(0xE1)]);
     let lease = CredentialLease::new_with_binding_for_test(
         credentials,
         Duration::from_secs(3600),
@@ -423,10 +404,10 @@ fn handoff_document_zeroize_scrubs_serialized_secret_material() {
     )
     .unwrap();
     let mut document = lease.handoff_projection().unwrap().to_json().unwrap();
-    // The first alpha secret starts with `s` (115) and is decimal-encoded;
+    // The first alpha secret starts with 0xA1 (161) and is decimal-encoded;
     // the declared egress scope serializes into the same secret-bearing
     // document and is scrubbed with it.
-    assert!(String::from_utf8_lossy(document.expose_bytes()).contains("\"secret\":[115,"));
+    assert!(String::from_utf8_lossy(document.expose_bytes()).contains("\"secret\":[161,"));
     assert!(String::from_utf8_lossy(document.expose_bytes()).contains("\"allowRedirects\":true"));
     assert!(document.zeroize_and_inspect());
     assert!(document.expose_bytes().is_empty());
@@ -445,19 +426,19 @@ fn lease_filters_expired_credentials_and_rotates_valid_candidates() {
         vec![
             LeasedCredential::new(
                 uuid::Uuid::new_v4().to_string(),
-                SecretBytes::try_from_string("expired-key-12345".to_owned()).unwrap(),
+                SecretBytes::try_from_bytes(vec![0xE1; 16]).unwrap(),
                 Some(now),
             )
             .unwrap(),
             LeasedCredential::new(
                 uuid::Uuid::new_v4().to_string(),
-                SecretBytes::try_from_string("active-key-one-12345".to_owned()).unwrap(),
+                SecretBytes::try_from_bytes(vec![0xA3; 16]).unwrap(),
                 Some(now + 60),
             )
             .unwrap(),
             LeasedCredential::new(
                 uuid::Uuid::new_v4().to_string(),
-                SecretBytes::try_from_string("active-key-two-12345".to_owned()).unwrap(),
+                SecretBytes::try_from_bytes(vec![0xA4; 16]).unwrap(),
                 None,
             )
             .unwrap(),
@@ -481,7 +462,7 @@ fn lease_filters_expired_credentials_and_rotates_valid_candidates() {
     assert_ne!(first[0].expose_bytes(), second[0].expose_bytes());
     assert!(first
         .iter()
-        .all(|credential| credential.expose_bytes() != b"expired-key-12345"));
+        .all(|credential| credential.expose_bytes() != [0xE1u8; 16]));
 }
 
 fn handoff_document(credentials: serde_json::Value) -> Vec<u8> {
@@ -544,11 +525,11 @@ fn handoff_round_trip_preserves_credentials_duration_and_epoch() {
     .unwrap();
     assert_eq!(
         rebuilt.resolve(TestKind::Alpha).unwrap().expose_bytes(),
-        b"synthetic-alpha-key-1"
+        &[0xA1u8; 16]
     );
     assert_eq!(
         rebuilt.resolve(TestKind::Beta).unwrap().expose_bytes(),
-        b"synthetic-beta-key-1"
+        &[0xB1u8; 16]
     );
 }
 
@@ -677,10 +658,7 @@ fn handoff_size_estimate_covers_escaped_names() {
     // emitted document, or the buffer would grow after secrets were written.
     let epoch = uuid::Uuid::new_v4().to_string();
     let mut credentials = BTreeMap::new();
-    credentials.insert(
-        EscapedKind::Control,
-        vec![test_credential("synthetic-esc-key")],
-    );
+    credentials.insert(EscapedKind::Control, vec![test_credential(0xC5)]);
     let handoff = CredentialHandoff::<EscapedKind>::new(
         credentials,
         Duration::from_secs(60),
@@ -890,12 +868,12 @@ fn handoff_and_lease_debug_never_include_secret_material() {
     .unwrap();
     let handoff = lease.handoff_projection().unwrap();
     let debug = format!("{handoff:?}");
-    assert!(!debug.contains("synthetic-alpha-key-1"));
-    assert!(!debug.contains("synthetic-beta-key-1"));
+    assert!(!debug.contains(&format!("{:?}", [0xA1u8; 16])));
+    assert!(!debug.contains(&format!("{:?}", [0xB1u8; 16])));
     let lease_debug = format!("{lease:?}");
-    assert!(!lease_debug.contains("synthetic-alpha-key-1"));
+    assert!(!lease_debug.contains(&format!("{:?}", [0xA1u8; 16])));
     let slot_debug = format!("{:?}", CredentialSlot::new(lease));
-    assert!(!slot_debug.contains("synthetic-alpha-key-1"));
+    assert!(!slot_debug.contains(&format!("{:?}", [0xA1u8; 16])));
 }
 
 struct RebuildingPort;
@@ -961,7 +939,7 @@ fn custody_port_installs_per_kind_family_and_rebuilds_leases() {
         .unwrap();
     assert_eq!(
         lease.resolve(TestKind::Alpha).unwrap().expose_bytes(),
-        b"synthetic-alpha-key-1"
+        &[0xA1u8; 16]
     );
     port::clear();
 }

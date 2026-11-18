@@ -43,13 +43,13 @@ fn epoch() -> String {
     "00000000-0000-4000-8000-000000000001".to_owned()
 }
 
-fn lease_with(secret: &str, expires_at: Option<u64>) -> CredentialLease<Kind> {
+fn lease_with(material: u8, expires_at: Option<u64>) -> CredentialLease<Kind> {
     let mut credentials = BTreeMap::new();
     credentials.insert(
         Kind::Api,
         vec![LeasedCredential::new(
             "00000000-0000-4000-8000-0000000000aa".to_owned(),
-            SecretBytes::try_from_string(secret.to_owned()).unwrap(),
+            SecretBytes::try_from_bytes(vec![material; 24]).unwrap(),
             expires_at,
         )
         .unwrap()],
@@ -68,12 +68,12 @@ fn lease_with(secret: &str, expires_at: Option<u64>) -> CredentialLease<Kind> {
 fn lease_projects_to_handoff_and_receiver_resolves() {
     // given custody mints a lease, when it crosses the process boundary as a
     // handoff document, then the runtime resolves the same secret bytes
-    let custody = lease_with("synthetic-secret-01", None);
+    let custody = lease_with(0xA5, None);
     let document = custody.handoff_projection().unwrap().to_json().unwrap();
     let received = CredentialHandoff::<Kind>::from_json(document.expose_bytes()).unwrap();
     let runtime = CredentialLease::from_handoff(received, Arc::new(FixedEpoch(epoch()))).unwrap();
     let resolved = runtime.resolve(Kind::Api).unwrap();
-    assert_eq!(resolved.expose_bytes(), b"synthetic-secret-01");
+    assert_eq!(resolved.expose_bytes(), &[0xA5u8; 24]);
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn handoff_carries_arbitrary_secret_bytes_verbatim() {
 fn revoked_epoch_fails_the_next_resolution() {
     // given a lease minted under epoch A, when custody rotates to epoch B,
     // then the receiver's very next resolution fails closed
-    let custody = lease_with("synthetic-secret-02", None);
+    let custody = lease_with(0x5A, None);
     let document = custody.handoff_projection().unwrap().to_json().unwrap();
     let received = CredentialHandoff::<Kind>::from_json(document.expose_bytes()).unwrap();
     let stale_epoch = Arc::new(FixedEpoch(
@@ -124,6 +124,6 @@ fn revoked_epoch_fails_the_next_resolution() {
 fn expired_credential_never_resolves() {
     // given a credential past its storage expiry, it stays unavailable even
     // while the lease itself is live
-    let custody = lease_with("synthetic-secret-03", Some(1));
+    let custody = lease_with(0xC3, Some(1));
     assert!(custody.resolve(Kind::Api).is_err());
 }

@@ -46,6 +46,8 @@ validation samples are specified in [docs/fd-handoff.md](docs/fd-handoff.md).
 
 ## Verify
 
+Requires Rust 1.89 or newer (the workspace `rust-version`).
+
 ```sh
 ./scripts/verify.sh
 ```
