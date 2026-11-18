@@ -181,8 +181,13 @@ fn credential_slot_hot_applies_handoff_without_replacing_the_arc() {
     let mut credentials = BTreeMap::new();
     credentials.insert(TestKind::Beta, vec![test_credential("fixture-key-123456")]);
     let epoch = uuid::Uuid::new_v4().to_string();
-    let handoff =
-        CredentialHandoff::new(credentials, Duration::from_secs(3600), epoch.clone()).unwrap();
+    let handoff = CredentialHandoff::new(
+        credentials,
+        Duration::from_secs(3600),
+        epoch.clone(),
+        EgressScope::deny_all(),
+    )
+    .unwrap();
     slot.install_handoff(
         handoff,
         Arc::new(TestEpochSource(StdMutex::new(Some(epoch)))),
@@ -207,6 +212,7 @@ fn lease_fails_closed_after_epoch_revocation() {
         Duration::from_secs(3600),
         epoch,
         source.clone(),
+        EgressScope::deny_all(),
     )
     .unwrap();
     assert_eq!(
@@ -255,6 +261,7 @@ fn epoch_source_failure_fails_closed_without_resolving() {
         Duration::from_secs(3600),
         epoch,
         Arc::new(FailingEpochSource),
+        EgressScope::deny_all(),
     )
     .unwrap();
     assert_eq!(
@@ -290,6 +297,7 @@ fn lease_bound_to_another_process_fails_closed_on_every_secret_use() {
         Duration::from_secs(3600),
         epoch,
         source,
+        EgressScope::deny_all(),
         foreign_process,
         Instant::now() + Duration::from_secs(3600),
     )
@@ -343,6 +351,7 @@ fn expired_lease_fails_closed_before_touching_the_epoch() {
         // This source would fail if consulted: an expired lease must refuse
         // before any epoch answer is requested.
         Arc::new(FailingEpochSource),
+        EgressScope::deny_all(),
         std::process::id(),
         Instant::now() - Duration::from_secs(1),
     )
@@ -393,11 +402,26 @@ fn handoff_document_zeroize_scrubs_serialized_secret_material() {
         Duration::from_secs(3600),
         epoch,
         source,
+        EgressScope::new(
+            vec!["api.example.com".to_owned()],
+            vec![443],
+            vec!["/v1/".to_owned()],
+            vec!["GET".to_owned()],
+            vec![
+                HeaderTemplate::new("Authorization".to_owned(), "Bearer {secret}".to_owned())
+                    .unwrap(),
+            ],
+            true,
+        )
+        .unwrap(),
     )
     .unwrap();
     let mut document = lease.handoff_projection().unwrap().to_json().unwrap();
-    // The first alpha secret starts with `s` (115) and is decimal-encoded.
+    // The first alpha secret starts with `s` (115) and is decimal-encoded;
+    // the declared egress scope serializes into the same secret-bearing
+    // document and is scrubbed with it.
     assert!(String::from_utf8_lossy(document.expose_bytes()).contains("\"secret\":[115,"));
+    assert!(String::from_utf8_lossy(document.expose_bytes()).contains("\"allowRedirects\":true"));
     assert!(document.zeroize_and_inspect());
     assert!(document.expose_bytes().is_empty());
 }
@@ -434,7 +458,14 @@ fn lease_filters_expired_credentials_and_rotates_valid_candidates() {
         ],
     )]);
     let slot = CredentialSlot::new(
-        CredentialLease::new(credentials, Duration::from_secs(3600), epoch, source).unwrap(),
+        CredentialLease::new(
+            credentials,
+            Duration::from_secs(3600),
+            epoch,
+            source,
+            EgressScope::deny_all(),
+        )
+        .unwrap(),
     );
 
     let first = slot.resolve_candidates(TestKind::Alpha).unwrap();
@@ -448,9 +479,15 @@ fn lease_filters_expired_credentials_and_rotates_valid_candidates() {
 }
 
 fn handoff_document(credentials: serde_json::Value) -> Vec<u8> {
+    let deadline = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
     serde_json::to_vec(&serde_json::json!({
         "schemaVersion": TestKind::HANDOFF_SCHEMA,
         "leaseDurationSeconds": 3600,
+        "leaseExpiresAtEpochSeconds": deadline,
         "epoch": "11111111-1111-4111-8111-111111111111",
         "credentials": credentials,
     }))
@@ -479,13 +516,17 @@ fn handoff_round_trip_preserves_credentials_duration_and_epoch() {
         Duration::from_secs(7200),
         epoch.clone(),
         source,
+        EgressScope::deny_all(),
     )
     .unwrap();
     let payload = lease.handoff_projection().unwrap().to_json().unwrap();
     assert!(String::from_utf8_lossy(payload.expose_bytes()).contains(TestKind::HANDOFF_SCHEMA));
 
     let parsed = CredentialHandoff::<TestKind>::from_json(payload.expose_bytes()).unwrap();
-    assert_eq!(parsed.lease_duration(), Duration::from_secs(7200));
+    // A projection carries the grant's remaining duration — at most what
+    // was left of the original 7200 seconds, never a fresh full term.
+    assert!(parsed.lease_duration() <= Duration::from_secs(7200));
+    assert!(parsed.lease_duration() >= Duration::from_secs(7199));
     assert_eq!(parsed.epoch(), epoch.as_str());
     assert_eq!(parsed.kinds().count(), 2);
     // The serialized secret bytes round-trip intact: a lease rebuilt from
@@ -506,6 +547,124 @@ fn handoff_round_trip_preserves_credentials_duration_and_epoch() {
 }
 
 #[test]
+fn projection_and_rebuild_preserve_the_owner_authorized_deadline() {
+    // A chained projection must not extend the grant: the deadline stamped
+    // by the original mint travels verbatim into every later projection,
+    // so a lease rebuilt twice still dies at the first grant's deadline.
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let source = Arc::new(TestEpochSource(StdMutex::new(Some(epoch.clone()))));
+    let lease = CredentialLease::new(
+        handoff_test_credentials(),
+        Duration::from_secs(3600),
+        epoch.clone(),
+        source.clone(),
+        EgressScope::deny_all(),
+    )
+    .unwrap();
+    let first = lease.handoff_projection().unwrap();
+    let deadline = first.lease_expires_at_epoch_seconds();
+    let rebuilt =
+        CredentialLease::from_handoff(first, Arc::new(TestEpochSource(StdMutex::new(Some(epoch)))))
+            .unwrap();
+    let second = rebuilt.handoff_projection().unwrap();
+    assert_eq!(second.lease_expires_at_epoch_seconds(), deadline);
+    // The second projection's duration is bounded by what remained of the
+    // original grant, not a fresh full term.
+    assert!(second.lease_duration() <= Duration::from_secs(3600));
+    let document = second.to_json().unwrap();
+    let reparsed = CredentialHandoff::<TestKind>::from_json(document.expose_bytes()).unwrap();
+    assert_eq!(reparsed.lease_expires_at_epoch_seconds(), deadline);
+}
+
+#[test]
+fn rebuilt_lease_never_outlives_the_documents_deadline() {
+    // A document granting one hour with a deadline two seconds out must
+    // rebuild to a lease that projects at most that sliver — the deadline
+    // caps the monotonic expiry, it does not extend it.
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let deadline = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 2;
+    let document = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": TestKind::HANDOFF_SCHEMA,
+        "leaseDurationSeconds": 3600,
+        "leaseExpiresAtEpochSeconds": deadline,
+        "epoch": epoch,
+        "credentials": [{"kind": "alpha", "keys": [handoff_key(serde_json::json!([1, 2, 3]))]}],
+    }))
+    .unwrap();
+    let handoff = CredentialHandoff::<TestKind>::from_json(&document).unwrap();
+    let rebuilt = CredentialLease::from_handoff(
+        handoff,
+        Arc::new(TestEpochSource(StdMutex::new(Some(epoch)))),
+    )
+    .unwrap();
+    match rebuilt.handoff_projection() {
+        Ok(projected) => {
+            assert_eq!(projected.lease_expires_at_epoch_seconds(), deadline);
+            assert!(projected.lease_duration() <= Duration::from_secs(2));
+        }
+        // A sub-second remainder cannot mint a document at all.
+        Err(error) => assert_eq!(error.to_string(), "credential_lease_duration_invalid"),
+    }
+    // A lapsed deadline yields a dead-on-arrival lease: parsing succeeds
+    // but every use fails closed.
+    let past = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 1;
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let document = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": TestKind::HANDOFF_SCHEMA,
+        "leaseDurationSeconds": 3600,
+        "leaseExpiresAtEpochSeconds": past,
+        "epoch": epoch,
+        "credentials": [{"kind": "alpha", "keys": [handoff_key(serde_json::json!([1, 2, 3]))]}],
+    }))
+    .unwrap();
+    let handoff = CredentialHandoff::<TestKind>::from_json(&document).unwrap();
+    let dead = CredentialLease::from_handoff(
+        handoff,
+        Arc::new(TestEpochSource(StdMutex::new(Some(epoch)))),
+    )
+    .unwrap();
+    assert_eq!(
+        dead.resolve(TestKind::Alpha).unwrap_err().to_string(),
+        "credential_lease_expired"
+    );
+}
+
+#[test]
+fn handoff_rejects_missing_or_malformed_deadline() {
+    let alpha_entry =
+        serde_json::json!({"kind": "alpha", "keys": [handoff_key(serde_json::json!([1, 2, 3]))]});
+    // Missing the required deadline member.
+    let mut missing: serde_json::Value =
+        serde_json::from_slice(&handoff_document(serde_json::json!([alpha_entry]))).unwrap();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("leaseExpiresAtEpochSeconds");
+    assert_handoff_invalid(&serde_json::to_vec(&missing).unwrap());
+    // Zero, null, negative, non-integer, and string deadlines all refuse.
+    for bad in [
+        serde_json::json!(0),
+        serde_json::json!(null),
+        serde_json::json!(-1),
+        serde_json::json!(1.5),
+        serde_json::json!("soon"),
+    ] {
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&handoff_document(serde_json::json!([alpha_entry]))).unwrap();
+        document["leaseExpiresAtEpochSeconds"] = bad;
+        assert_handoff_invalid(&serde_json::to_vec(&document).unwrap());
+    }
+}
+
+#[test]
 fn handoff_size_estimate_covers_escaped_names() {
     // A kind name carrying a control character and quotes escapes to more
     // bytes than its raw length; the serialized reserve must still cover the
@@ -516,9 +675,13 @@ fn handoff_size_estimate_covers_escaped_names() {
         EscapedKind::Control,
         vec![test_credential("synthetic-esc-key")],
     );
-    let handoff =
-        CredentialHandoff::<EscapedKind>::new(credentials, Duration::from_secs(60), epoch.clone())
-            .unwrap();
+    let handoff = CredentialHandoff::<EscapedKind>::new(
+        credentials,
+        Duration::from_secs(60),
+        epoch.clone(),
+        EgressScope::deny_all(),
+    )
+    .unwrap();
     let payload = handoff.to_json().unwrap();
     assert!(payload.expose_bytes().len() <= handoff.serialized_len_upper_bound());
     let reparsed = CredentialHandoff::<EscapedKind>::from_json(payload.expose_bytes()).unwrap();
@@ -532,6 +695,11 @@ fn handoff_rejects_oversize_schema_name() {
     let document = serde_json::json!({
         "schemaVersion": OversizeSchemaKind::HANDOFF_SCHEMA,
         "leaseDurationSeconds": 60,
+        "leaseExpiresAtEpochSeconds": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60,
         "epoch": uuid::Uuid::new_v4().to_string(),
         "credentials": [{"kind": "only", "keys": [handoff_key(serde_json::json!([120]))]}],
     });
@@ -566,6 +734,7 @@ fn maximal_inventory_serializes_within_document_bound() {
         credentials,
         Duration::from_secs(MAX_LEASE_DURATION_SECONDS),
         epoch,
+        EgressScope::deny_all(),
     )
     .unwrap();
     let payload = handoff.to_json().unwrap();
@@ -686,6 +855,7 @@ fn handoff_never_crosses_kind_families() {
         Duration::from_secs(3600),
         epoch,
         source,
+        EgressScope::deny_all(),
     )
     .unwrap();
     let payload = lease.handoff_projection().unwrap().to_json().unwrap();
@@ -709,6 +879,7 @@ fn handoff_and_lease_debug_never_include_secret_material() {
         Duration::from_secs(3600),
         epoch,
         source,
+        EgressScope::deny_all(),
     )
     .unwrap();
     let handoff = lease.handoff_projection().unwrap();
@@ -771,9 +942,13 @@ fn custody_port_installs_per_kind_family_and_rebuilds_leases() {
 
     // The installed port rebuilds a working lease from a handoff.
     let epoch = uuid::Uuid::new_v4().to_string();
-    let handoff =
-        CredentialHandoff::new(handoff_test_credentials(), Duration::from_secs(3600), epoch)
-            .unwrap();
+    let handoff = CredentialHandoff::new(
+        handoff_test_credentials(),
+        Duration::from_secs(3600),
+        epoch,
+        EgressScope::deny_all(),
+    )
+    .unwrap();
     let lease = port::require::<TestKind>()
         .unwrap()
         .lease_from_handoff(handoff)

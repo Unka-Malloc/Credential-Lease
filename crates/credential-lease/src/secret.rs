@@ -74,7 +74,15 @@ impl SecretBytes {
     /// per-credential [`MAX_CREDENTIAL_BYTES`](crate::MAX_CREDENTIAL_BYTES)
     /// is enforced later by `LeasedCredential::new`.
     pub fn try_from_bytes(bytes: Vec<u8>) -> Result<Self, SecretBytesError> {
-        let bytes = Zeroizing::new(bytes);
+        Self::try_from_zeroizing_bytes(Zeroizing::new(bytes))
+    }
+
+    /// Admit a buffer that is already under a wiping owner. Handoff
+    /// parsing fills the zeroizing allocation directly, so the material
+    /// never lives in a non-scrubbed buffer at all.
+    pub(crate) fn try_from_zeroizing_bytes(
+        bytes: Zeroizing<Vec<u8>>,
+    ) -> Result<Self, SecretBytesError> {
         if bytes.is_empty() {
             return Err(SecretBytesError::Empty);
         }

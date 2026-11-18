@@ -13,7 +13,18 @@ or runtimes implement this contract to interoperate.
 {
   "schemaVersion": "<family schema>",
   "leaseDurationSeconds": 3600,
+  "leaseExpiresAtEpochSeconds": 1780003600,
   "epoch": "11111111-1111-4111-8111-111111111111",
+  "egress": {
+    "hosts": ["api.example.com", "*.example.org"],
+    "ports": [443],
+    "pathPrefixes": ["/v1/"],
+    "methods": ["GET"],
+    "headerTemplates": [
+      {"name": "Authorization", "value": "Bearer {secret}"}
+    ],
+    "allowRedirects": false
+  },
   "credentials": [
     {
       "kind": "alpha",
@@ -36,8 +47,10 @@ Closed set — any additional or missing field rejects the document.
 | Field | Type | Rule |
 | --- | --- | --- |
 | `schemaVersion` | string | Must equal the family schema constant pinned by the kind family. A document minted under one family's schema must never parse as another family. |
-| `leaseDurationSeconds` | unsigned integer | `1..=31622400` (366 days). The upper bound of the runtime lease minted from this handoff. |
+| `leaseDurationSeconds` | unsigned integer | `1..=31622400` (366 days). The upper bound of the runtime lease minted from this handoff. For a lease projection this is the grant's remaining time, not the original duration. |
+| `leaseExpiresAtEpochSeconds` | unsigned integer | `> 0`. The owner-authorized deadline the grant ends at. It is preserved verbatim through every projection and rebuild: a rebuilt lease expires at the earlier of `leaseDurationSeconds` and this deadline, so chained projections can never extend the grant — only a fresh owner grant can. |
 | `epoch` | string | Canonical lowercase UUID; identifies the custody epoch this handoff was minted under. |
+| `egress` | object | Optional. The egress scope below; absent declares the deny-all scope — no outbound target is admitted. |
 | `credentials` | array | Entries below; may be empty when a disconnected projection is serialized. |
 
 ### Credentials entry fields
@@ -59,6 +72,33 @@ Closed set — `credentialId`, `expiresAtEpochSeconds`, `secret` only.
 | `expiresAtEpochSeconds` | unsigned integer or null | Required field; `null` means no storage expiry; when present must be `> 0`. |
 | `secret` | array of integers | Each element `0..=255`; total length `1..=8192` bytes. Total key count across the document `<= 64`. |
 
+## Egress scope
+
+The `egress` member is the custody owner's outbound boundary: a runtime
+that forwards traffic — an HTTP proxy injecting leased credentials or a
+TCP dialer gating connect calls — may move the leased material only to
+targets the scope admits. It is fail-closed by construction: an absent
+`egress` member denies every target, and nothing in the descriptor names
+a particular provider or transport.
+
+Closed member set — `hosts`, `ports`, `pathPrefixes`, `methods`,
+`headerTemplates`, `allowRedirects` only. Every member is optional; each
+list is at most 32 entries.
+
+| Member | Type | Rule |
+| --- | --- | --- |
+| `hosts` | array of strings | Exact host names or `*.` suffix wildcards, each at most 253 bytes after lowercasing; labels are alphanumeric or hyphen. An empty or absent list admits no target — hosts are always required. |
+| `ports` | array of unsigned integers | Each `1..=65535`. Empty or absent constrains nothing. |
+| `pathPrefixes` | array of strings | Each nonempty, at most 512 bytes, starting with `/` and control-character free. Empty or absent constrains nothing. A target without a path never satisfies a declared prefix list. |
+| `methods` | array of strings | HTTP method tokens, at most 64 bytes each. Empty or absent constrains nothing. A target without a method (a raw TCP dial) never satisfies a declared method list. Methods compare exactly. |
+| `headerTemplates` | array of objects | `{"name", "value"}` only. `name` is an HTTP token at most 64 bytes; `value` is a template at most 512 bytes, control-character free. The `{secret}` marker is replaced with the resolved secret at injection time. |
+| `allowRedirects` | boolean | `false` unless explicitly `true`: a redirect may never carry the credential to a target the scope did not name. |
+
+Matching is conjunctive: a target is admitted only when its host fits one
+declared pattern, and every other *declared* axis also matches. `*.`
+patterns match subdomains of the suffix — never the apex itself — and
+exact names never widen to subdomains. Host comparison is case-insensitive.
+
 ## Failure semantics
 
 Every malformed shape fails closed with a single indistinguishable
@@ -66,11 +106,13 @@ rejection — no partial credential set may ever be constructed from a
 truncated or tampered document. Three contract rules apply before and
 during parsing:
 
-- **Size.** A serialized document is at most `2150400` bytes
-  (`64 * (8192 * 4 + 576) + 16384`). The bound covers the worst case the
-  inventory rules admit — including kind and schema names that escape to
-  six bytes per name byte — so every well-formed inventory serializes
-  within it. Larger inputs are refused before any parsing work begins.
+- **Size.** A serialized document is at most `2229554` bytes
+  (`64 * (8192 * 4 + 576) + 16384` for the head and credentials, plus
+  `79154` for the largest admissible egress scope). The bound covers the
+  worst case the inventory rules admit — including kind and schema names
+  that escape to six bytes per name byte — so every well-formed inventory
+  serializes within it. Larger inputs are refused before any parsing work
+  begins.
 - **Name bounds.** `schemaVersion` values are at most 128 bytes; `kind`
   names are at most 64 bytes. Larger values reject the document.
 - **Duplicate member names.** Every object member name must be unique;
@@ -90,7 +132,8 @@ exit. Three independent checks apply on every credential use:
    address space fails closed instead of replaying the parent's
    credentials.
 2. The lease's own duration — an `Instant`-relative upper bound minted at
-   rebuild time.
+   rebuild time, capped by the document's `leaseExpiresAtEpochSeconds`
+   deadline so the rebuilt lease cannot outlive the original grant.
 3. The custody epoch — the runtime's epoch source is consulted on every
    resolution and must still report the handoff's epoch. An
    owner-initiated revocation rotates the epoch and kills every

@@ -18,6 +18,7 @@
 //! lease itself from resolving or projecting them.
 
 use crate::credential::LeasedCredential;
+use crate::egress::EgressScope;
 use crate::epoch::LeaseEpochSource;
 use crate::handoff::{validate_credentials, CredentialHandoff};
 use crate::kind::CredentialKind;
@@ -33,9 +34,11 @@ pub struct CredentialLease<K: CredentialKind> {
     credentials: BTreeMap<K, Vec<LeasedCredential>>,
     lease_duration: Duration,
     expires_at: Instant,
+    lease_deadline_epoch_seconds: u64,
     epoch: String,
     epoch_source: Arc<dyn LeaseEpochSource>,
     process_id: u32,
+    egress: EgressScope,
 }
 
 impl<K: CredentialKind> CredentialLease<K> {
@@ -48,27 +51,36 @@ impl<K: CredentialKind> CredentialLease<K> {
             credentials: BTreeMap::new(),
             lease_duration: Duration::ZERO,
             expires_at: Instant::now(),
+            lease_deadline_epoch_seconds: 0,
             epoch: String::new(),
             epoch_source: Arc::new(DisconnectedEpochSource),
             process_id: std::process::id(),
+            egress: EgressScope::deny_all(),
         }
     }
 
     /// Mint a lease. The epoch must be a canonical UUID and the duration a
     /// positive bound within the contract's maximum. The current process id
-    /// is recorded as the lease's process binding.
+    /// is recorded as the lease's process binding. The egress scope is the
+    /// outbound boundary the custody owner declared for this material —
+    /// [`EgressScope::deny_all`] when nothing may leave the runtime.
     pub fn new(
         credentials: BTreeMap<K, Vec<LeasedCredential>>,
         lease_duration: Duration,
         epoch: String,
         epoch_source: Arc<dyn LeaseEpochSource>,
+        egress: EgressScope,
     ) -> Result<Self> {
+        let lease_deadline_epoch_seconds =
+            crate::handoff::lease_deadline_epoch_seconds(lease_duration)?;
         Self::new_bound(
             credentials,
             lease_duration,
             epoch,
             epoch_source,
             std::process::id(),
+            egress,
+            lease_deadline_epoch_seconds,
         )
     }
 
@@ -78,6 +90,8 @@ impl<K: CredentialKind> CredentialLease<K> {
         epoch: String,
         epoch_source: Arc<dyn LeaseEpochSource>,
         process_id: u32,
+        egress: EgressScope,
+        lease_deadline_epoch_seconds: u64,
     ) -> Result<Self> {
         ensure!(
             uuid::Uuid::parse_str(&epoch).is_ok_and(|value| value.to_string() == epoch),
@@ -88,16 +102,30 @@ impl<K: CredentialKind> CredentialLease<K> {
             "credential_lease_duration_invalid"
         );
         validate_credentials(&credentials, "credential_lease_inventory_invalid")?;
+        // The monotonic expiry honors both bounds: the granted duration and
+        // the owner-authorized deadline carried in from the handoff. A
+        // rebuild can therefore never mint a lease that outlives the
+        // original grant, and a lapsed deadline yields a dead-on-arrival
+        // lease that fails closed on every use.
+        let now_epoch_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| anyhow!("credential_lease_clock_invalid"))?
+            .as_secs();
+        let effective_duration = lease_duration.min(Duration::from_secs(
+            lease_deadline_epoch_seconds.saturating_sub(now_epoch_seconds),
+        ));
         let expires_at = Instant::now()
-            .checked_add(lease_duration)
+            .checked_add(effective_duration)
             .ok_or_else(|| anyhow!("credential_lease_expiry_invalid"))?;
         Ok(Self {
             credentials,
             lease_duration,
             expires_at,
+            lease_deadline_epoch_seconds,
             epoch,
             epoch_source,
             process_id,
+            egress,
         })
     }
 
@@ -110,11 +138,19 @@ impl<K: CredentialKind> CredentialLease<K> {
         lease_duration: Duration,
         epoch: String,
         epoch_source: Arc<dyn LeaseEpochSource>,
+        egress: EgressScope,
         process_id: u32,
         expires_at: Instant,
     ) -> Result<Self> {
-        let mut lease =
-            Self::new_bound(credentials, lease_duration, epoch, epoch_source, process_id)?;
+        let mut lease = Self::new_bound(
+            credentials,
+            lease_duration,
+            epoch,
+            epoch_source,
+            process_id,
+            egress,
+            u64::MAX,
+        )?;
         lease.expires_at = expires_at;
         Ok(lease)
     }
@@ -146,8 +182,14 @@ impl<K: CredentialKind> CredentialLease<K> {
     /// revoked lease cannot be re-minted into a fresh handoff that restarts
     /// its lifetime. A lease inherited across a process boundary refuses to
     /// project; only the process that minted it may reproduce its secrets.
+    ///
+    /// The document carries the grant's remaining duration and preserves
+    /// the owner-authorized deadline verbatim, so a lease rebuilt from this
+    /// projection can never outlive the original grant — extension requires
+    /// a fresh owner grant, not another projection.
     pub fn handoff_projection(&self) -> Result<CredentialHandoff<K>> {
         self.ensure_active()?;
+        let remaining = self.expires_at.saturating_duration_since(Instant::now());
         let mut credentials = BTreeMap::new();
         for (kind, keys) in &self.credentials {
             let mut copied = Vec::with_capacity(keys.len());
@@ -160,17 +202,42 @@ impl<K: CredentialKind> CredentialLease<K> {
             }
             credentials.insert(*kind, copied);
         }
-        CredentialHandoff::new(credentials, self.lease_duration, self.epoch.clone())
+        // The egress scope is part of the grant: a projection carries it
+        // forward verbatim so forwarding can never silently widen it.
+        CredentialHandoff::with_deadline(
+            credentials,
+            remaining,
+            self.epoch.clone(),
+            self.egress.clone(),
+            self.lease_deadline_epoch_seconds,
+        )
     }
 
     /// Rebuild a lease from a received handoff under the local epoch source.
-    /// Construction reuses the same closed validations as a custody unlock.
+    /// Construction reuses the same closed validations as a custody unlock,
+    /// and the rebuilt lease expires at the earlier of the document's
+    /// duration and the owner-authorized deadline it carries.
     pub fn from_handoff(
         handoff: CredentialHandoff<K>,
         epoch_source: Arc<dyn LeaseEpochSource>,
     ) -> Result<Self> {
-        let (credentials, lease_duration, epoch) = handoff.into_parts();
-        Self::new(credentials, lease_duration, epoch, epoch_source)
+        let (credentials, lease_duration, epoch, egress, lease_deadline_epoch_seconds) =
+            handoff.into_parts();
+        Self::new_bound(
+            credentials,
+            lease_duration,
+            epoch,
+            epoch_source,
+            std::process::id(),
+            egress,
+            lease_deadline_epoch_seconds,
+        )
+    }
+
+    /// The egress scope this lease's material may leave through — the
+    /// boundary a runtime's outbound proxy enforces on every forward.
+    pub fn egress(&self) -> &EgressScope {
+        &self.egress
     }
 
     /// Whether the lease currently carries at least one credential for
@@ -363,6 +430,15 @@ impl<K: CredentialKind> CredentialSlot<K> {
         epoch_source: Arc<dyn LeaseEpochSource>,
     ) -> Result<()> {
         self.replace(CredentialLease::from_handoff(handoff, epoch_source)?)
+    }
+
+    /// The installed lease's egress scope — the deny-all scope when the
+    /// slot is poisoned or holds a disconnected lease.
+    pub fn egress(&self) -> EgressScope {
+        self.inner
+            .lock()
+            .map(|lease| lease.egress.clone())
+            .unwrap_or_else(|_| EgressScope::deny_all())
     }
 
     /// Whether the slot holds a live, non-empty lease in the current

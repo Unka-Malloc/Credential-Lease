@@ -42,12 +42,12 @@ use credential_lease::SecretBytes;
 use security_framework::access_control::{ProtectionMode, SecAccessControl};
 use security_framework_sys::access_control::kSecAccessControlUserPresence;
 use security_framework_sys::base::{
-    errSecAuthFailed, errSecDuplicateItem, errSecItemNotFound, errSecSuccess,
+    errSecAuthFailed, errSecDuplicateItem, errSecItemNotFound, errSecSuccess, errSecUnimplemented,
 };
 use security_framework_sys::item::{
     kSecAttrAccessControl, kSecAttrAccessGroup, kSecAttrAccount, kSecAttrService,
     kSecAttrSynchronizable, kSecClass, kSecClassGenericPassword, kSecReturnAttributes,
-    kSecReturnData, kSecReturnPersistentRef, kSecUseAuthenticationContext,
+    kSecReturnData, kSecReturnPersistentRef, kSecUseAuthenticationContext, kSecUseAuthenticationUI,
     kSecUseDataProtectionKeychain, kSecValueData,
 };
 use security_framework_sys::keychain::{
@@ -72,11 +72,15 @@ macro_rules! security_framework_static {
 }
 
 const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
+const ERR_SEC_MISSING_ENTITLEMENT: i32 = -34018;
+const ERR_SEC_NO_SUCH_KEYCHAIN: i32 = -25294;
+const ERR_SEC_INVALID_KEYCHAIN: i32 = -25295;
 
 #[link(name = "Security", kind = "framework")]
 extern "C" {
     static kSecValuePersistentRef: CFStringRef;
     static kSecAttrAccessible: CFStringRef;
+    static kSecUseAuthenticationUIFail: CFStringRef;
 }
 
 // The classic Keychain has a process-wide UI switch, independent of the
@@ -234,18 +238,76 @@ fn data_invalid() -> KeychainError {
     )
 }
 
-static SELECTED_KEYCHAIN_BACKEND: OnceLock<Option<KeychainBackend>> = OnceLock::new();
+/// What one store probe concluded — and therefore what the process may
+/// cache.
+enum ProbeVerdict {
+    /// The round trip proved a usable protected store.
+    Supported,
+    /// The store can never serve this process: an entitlement or
+    /// store-level refusal that outlives any later unlock. Only this
+    /// verdict lets selection fall through to the classic backend.
+    Unsupported,
+    /// The probe could not decide: a locked store, denied interaction, or
+    /// any undiagnosed refusal that may clear before the next explicit
+    /// call. It answers `None` for this call and is never cached, so the
+    /// next call re-probes.
+    Unavailable,
+}
+
+/// What the probe's failure means for caching: the platform status when a
+/// SecItem call refused, or an undiagnosable probe outcome (a failed
+/// access-control construction, a malformed result, a failed delete).
+enum ProbeFailure {
+    Status(i32),
+    Undetermined,
+}
+
+/// The selection the process may remember: a proven store, or a proven
+/// "no usable backend". A temporarily-unavailable verdict is deliberately
+/// not representable — it must never be cached.
+enum BackendSelection {
+    Store(KeychainBackend),
+    NoStore,
+}
+
+static SELECTED_KEYCHAIN_BACKEND: OnceLock<BackendSelection> = OnceLock::new();
+
+/// Platform refusals that mean "this store will never serve this process"
+/// — the binary lacks the entitlement the store requires, or the store
+/// itself is absent or invalid. Everything else is treated as transient:
+/// a locked keychain or a denied interaction may clear on the next
+/// explicit call, so it is reported but never cached.
+fn is_permanent_probe_refusal(status: i32) -> bool {
+    status == errSecUnimplemented
+        || status == ERR_SEC_MISSING_ENTITLEMENT
+        || status == ERR_SEC_NO_SUCH_KEYCHAIN
+        || status == ERR_SEC_INVALID_KEYCHAIN
+}
 
 pub(crate) fn selected_backend() -> Option<KeychainBackend> {
-    *SELECTED_KEYCHAIN_BACKEND.get_or_init(|| {
-        if keychain_roundtrip_probe(KeychainBackend::DataProtection) {
-            Some(KeychainBackend::DataProtection)
-        } else if keychain_roundtrip_probe(KeychainBackend::Classic) {
-            Some(KeychainBackend::Classic)
-        } else {
-            None
-        }
-    })
+    if let Some(selection) = SELECTED_KEYCHAIN_BACKEND.get() {
+        return match selection {
+            BackendSelection::Store(backend) => Some(*backend),
+            BackendSelection::NoStore => None,
+        };
+    }
+    let selection = match keychain_probe_verdict(KeychainBackend::DataProtection) {
+        ProbeVerdict::Supported => BackendSelection::Store(KeychainBackend::DataProtection),
+        // The classic fallback is chosen only when Data Protection is
+        // verifiably unsupported — a temporarily locked store answers
+        // `None` uncached and is re-probed on the next explicit call, so
+        // the process is not pinned to a fallback the unlock could undo.
+        ProbeVerdict::Unavailable => return None,
+        ProbeVerdict::Unsupported => match keychain_probe_verdict(KeychainBackend::Classic) {
+            ProbeVerdict::Supported => BackendSelection::Store(KeychainBackend::Classic),
+            ProbeVerdict::Unavailable => return None,
+            ProbeVerdict::Unsupported => BackendSelection::NoStore,
+        },
+    };
+    match SELECTED_KEYCHAIN_BACKEND.get_or_init(|| selection) {
+        BackendSelection::Store(backend) => Some(*backend),
+        BackendSelection::NoStore => None,
+    }
 }
 
 impl Keychain {
@@ -259,13 +321,14 @@ impl Keychain {
         query: &KeychainItemQuery<'_>,
         secret: &SecretBytes,
     ) -> Result<(), KeychainError> {
+        let store = effective_store(query, self.backend);
         let query_dict = CFDictionary::from_CFType_pairs(&base_pairs(query, context, self.backend));
         // Data Protection applies SecAccessControl. The classic Keychain has
         // separate application ACLs; this update cannot convert those ACLs.
         let update =
             CFDictionary::from_CFType_pairs(&protected_secret_pairs(secret.expose_bytes())?);
         // SAFETY: query and update own their CF values for the synchronous call.
-        let update_status = keychain_effect(self.backend, || unsafe {
+        let update_status = keychain_effect(store, || unsafe {
             SecItemUpdate(
                 query_dict.as_concrete_TypeRef(),
                 update.as_concrete_TypeRef(),
@@ -283,7 +346,7 @@ impl Keychain {
         pairs.extend(protected_secret_pairs(secret.expose_bytes())?);
         let add_query = CFDictionary::from_CFType_pairs(&pairs);
         // SAFETY: add_query owns all referenced values for the synchronous call.
-        let add_status = keychain_effect(self.backend, || unsafe {
+        let add_status = keychain_effect(store, || unsafe {
             SecItemAdd(add_query.as_concrete_TypeRef(), ptr::null_mut())
         })?;
         if add_status == errSecSuccess {
@@ -291,7 +354,7 @@ impl Keychain {
         }
         if add_status == errSecDuplicateItem {
             // SAFETY: query and update remain valid for the synchronous retry.
-            let retry_status = keychain_effect(self.backend, || unsafe {
+            let retry_status = keychain_effect(store, || unsafe {
                 SecItemUpdate(
                     query_dict.as_concrete_TypeRef(),
                     update.as_concrete_TypeRef(),
@@ -312,11 +375,12 @@ impl Keychain {
         query: &KeychainItemQuery<'_>,
         secret: &SecretBytes,
     ) -> Result<AddItemOutcome, KeychainError> {
+        let store = effective_store(query, self.backend);
         let mut pairs = base_pairs(query, context, self.backend);
         pairs.extend(protected_secret_pairs(secret.expose_bytes())?);
         let add_query = CFDictionary::from_CFType_pairs(&pairs);
         // SAFETY: add_query owns all referenced values for the synchronous call.
-        let add_status = keychain_effect(self.backend, || unsafe {
+        let add_status = keychain_effect(store, || unsafe {
             SecItemAdd(add_query.as_concrete_TypeRef(), ptr::null_mut())
         })?;
         if add_status == errSecSuccess {
@@ -335,14 +399,13 @@ impl Keychain {
         context: &KeychainAuthContext,
         query: &KeychainItemQuery<'_>,
     ) -> Result<Option<SecretBytes>, KeychainError> {
+        let store = effective_store(query, self.backend);
         let mut pairs = base_pairs(query, context, self.backend);
         pairs.push((
             security_framework_static!(kSecReturnData, sec_key),
             CFBoolean::from(true).into_CFType(),
         ));
-        with_keychain_backend(self.backend, || {
-            copy_secret_from_query_effect(&pairs, self.backend)
-        })
+        with_keychain_backend(store, || copy_secret_from_query_effect(&pairs, store))
     }
 
     /// Copy one item with its value bytes, its persistent reference, and
@@ -352,6 +415,7 @@ impl Keychain {
         context: &KeychainAuthContext,
         query: &KeychainItemQuery<'_>,
     ) -> Result<Option<KeychainItem>, KeychainError> {
+        let store = effective_store(query, self.backend);
         let mut pairs = base_pairs(query, context, self.backend);
         pairs.push((
             security_framework_static!(kSecReturnAttributes, sec_key),
@@ -365,9 +429,7 @@ impl Keychain {
             security_framework_static!(kSecReturnPersistentRef, sec_key),
             CFBoolean::from(true).into_CFType(),
         ));
-        with_keychain_backend(self.backend, || {
-            copy_item_from_query_effect(&pairs, self.backend)
-        })
+        with_keychain_backend(store, || copy_item_from_query_effect(&pairs, store))
     }
 
     /// Delete one item; an absent item is not an error.
@@ -376,9 +438,10 @@ impl Keychain {
         context: &KeychainAuthContext,
         query: &KeychainItemQuery<'_>,
     ) -> Result<(), KeychainError> {
+        let store = effective_store(query, self.backend);
         let query_dict = CFDictionary::from_CFType_pairs(&base_pairs(query, context, self.backend));
         // SAFETY: query owns valid CF values for the synchronous call.
-        let status = keychain_effect(self.backend, || unsafe {
+        let status = keychain_effect(store, || unsafe {
             SecItemDelete(query_dict.as_concrete_TypeRef())
         })?;
         if status == errSecItemNotFound {
@@ -451,6 +514,20 @@ impl Keychain {
     }
 }
 
+/// The store a query actually lands on: the host's explicit routing flag
+/// when set, otherwise this handle's probed backend. Both the routing flag
+/// and the interaction policy are derived from this store, so a
+/// classic-routed query can never escape the backend's classic
+/// interaction suppression — the bypass a forced `use_data_protection =
+/// false` would otherwise open on a Data Protection handle.
+fn effective_store(query: &KeychainItemQuery<'_>, backend: KeychainBackend) -> KeychainBackend {
+    match query.use_data_protection {
+        Some(true) => KeychainBackend::DataProtection,
+        Some(false) => KeychainBackend::Classic,
+        None => backend,
+    }
+}
+
 /// The ordinary item query: class, service, account, the optional storage
 /// attributes the host asked for, and the authorized context. The routing
 /// flag follows `use_data_protection` when set, otherwise the selected
@@ -492,6 +569,19 @@ fn base_pairs(
         security_framework_static!(kSecUseAuthenticationContext, sec_key),
         context.as_cf_type(),
     ));
+    if effective_store(query, backend) == KeychainBackend::DataProtection {
+        // Ordinary operations on the Data Protection store must never raise
+        // authentication UI outside the host's authorization workflow: when
+        // the authorized context does not satisfy the item's access
+        // control, the call fails `errSecInteractionNotAllowed` — which the
+        // caller sees as `AuthorizationRequired` — instead of prompting.
+        // Interactive classic operations exist only on the explicit
+        // migration entry points, which build their own query.
+        pairs.push((
+            security_framework_static!(kSecUseAuthenticationUI, sec_key),
+            security_framework_static!(kSecUseAuthenticationUIFail, sec_string_value),
+        ));
+    }
     match query.use_data_protection {
         Some(use_data_protection) => pairs.push((
             security_framework_static!(kSecUseDataProtectionKeychain, sec_key),
@@ -620,7 +710,11 @@ unsafe fn scrub_zeroizing_buffer(payload: *mut c_void) -> (*mut u8, Layout) {
     unsafe {
         let base = payload.cast::<u8>().sub(ZEROIZING_HEADER);
         let total = base.cast::<usize>().read();
-        std::slice::from_raw_parts_mut(base, total).zeroize();
+        // The tail of the allocation may never have been initialized, so the
+        // wipe goes through `MaybeUninit<u8>` — a `u8` slice over
+        // uninitialized bytes would be undefined behavior regardless of the
+        // values written through it.
+        std::slice::from_raw_parts_mut(base.cast::<std::mem::MaybeUninit<u8>>(), total).zeroize();
         let layout = Layout::from_size_align_unchecked(total, ZEROIZING_HEADER);
         (base, layout)
     }
@@ -854,11 +948,22 @@ fn dictionary_string(dictionary: &CFDictionary, key: CFStringRef) -> Option<Stri
         .map(|value| value.to_string())
 }
 
-fn keychain_roundtrip_probe(backend: KeychainBackend) -> bool {
-    with_keychain_backend(backend, || Ok(silent_keychain_roundtrip_probe(backend))).unwrap_or(false)
+fn keychain_probe_verdict(backend: KeychainBackend) -> ProbeVerdict {
+    match keychain_roundtrip_probe(backend) {
+        Ok(()) => ProbeVerdict::Supported,
+        Err(ProbeFailure::Status(status)) if is_permanent_probe_refusal(status) => {
+            ProbeVerdict::Unsupported
+        }
+        Err(_) => ProbeVerdict::Unavailable,
+    }
 }
 
-fn silent_keychain_roundtrip_probe(backend: KeychainBackend) -> bool {
+fn keychain_roundtrip_probe(backend: KeychainBackend) -> Result<(), ProbeFailure> {
+    with_keychain_backend(backend, || Ok(silent_keychain_roundtrip_probe(backend)))
+        .map_err(|_| ProbeFailure::Undetermined)?
+}
+
+fn silent_keychain_roundtrip_probe(backend: KeychainBackend) -> Result<(), ProbeFailure> {
     const PROBE_SERVICE: &str = "dev.credential-lease.keychain-probe";
     const PROBE_MATERIAL: &[u8] = b"credential-lease-keychain-probe";
     let account = format!("probe-{}", Uuid::new_v4());
@@ -889,7 +994,7 @@ fn silent_keychain_roundtrip_probe(backend: KeychainBackend) -> bool {
     let Ok(probe_access) =
         SecAccessControl::create_with_protection(Some(ProtectionMode::AccessibleWhenUnlocked), 0)
     else {
-        return false;
+        return Err(ProbeFailure::Undetermined);
     };
     pairs.push((
         security_framework_static!(kSecAttrAccessControl, sec_key),
@@ -904,7 +1009,7 @@ fn silent_keychain_roundtrip_probe(backend: KeychainBackend) -> bool {
     // SAFETY: add_query owns all referenced values for the synchronous call.
     let add_status = unsafe { SecItemAdd(add_query.as_concrete_TypeRef(), ptr::null_mut()) };
     if add_status != errSecSuccess {
-        return false;
+        return Err(ProbeFailure::Status(add_status));
     }
 
     let mut query_pairs = pairs
@@ -920,20 +1025,26 @@ fn silent_keychain_roundtrip_probe(backend: KeychainBackend) -> bool {
     let mut copied: CFTypeRef = ptr::null();
     // SAFETY: read_query is valid and copied is an initialized out-pointer.
     let read_status = unsafe { SecItemCopyMatching(read_query.as_concrete_TypeRef(), &mut copied) };
-    let read_ok = if read_status == errSecSuccess && !copied.is_null() {
+    let read_result = if read_status != errSecSuccess {
+        Err(ProbeFailure::Status(read_status))
+    } else if copied.is_null() {
+        Err(ProbeFailure::Undetermined)
+    } else {
         // SAFETY: copied is a live CF object returned at +1 ownership.
         let type_id = unsafe { CFGetTypeID(copied) };
         if type_id == CFData::type_id() {
             // SAFETY: type identity is CFData and +1 ownership transfers to the wrapper.
             let data = unsafe { CFData::wrap_under_create_rule(copied as CFDataRef) };
-            data.bytes() == PROBE_MATERIAL
+            if data.bytes() == PROBE_MATERIAL {
+                Ok(())
+            } else {
+                Err(ProbeFailure::Undetermined)
+            }
         } else {
             // SAFETY: copied has not yet been released.
             unsafe { CFRelease(copied) };
-            false
+            Err(ProbeFailure::Undetermined)
         }
-    } else {
-        false
     };
 
     let delete_pairs = pairs
@@ -942,9 +1053,15 @@ fn silent_keychain_roundtrip_probe(backend: KeychainBackend) -> bool {
         .cloned()
         .collect::<Vec<(CFString, CFType)>>();
     let delete_query = CFDictionary::from_CFType_pairs(&delete_pairs);
+    // The created probe item is cleaned up on every outcome — success,
+    // read refusal, and undiagnosed result alike.
     // SAFETY: delete_query owns valid CF values for the synchronous call.
     let delete_status = unsafe { SecItemDelete(delete_query.as_concrete_TypeRef()) };
-    read_ok && delete_status == errSecSuccess
+    read_result?;
+    if delete_status != errSecSuccess {
+        return Err(ProbeFailure::Status(delete_status));
+    }
+    Ok(())
 }
 
 fn sec_key(value: CFStringRef) -> CFString {
@@ -1435,6 +1552,78 @@ mod tests {
         for (service, account) in [("", "a"), ("s", ""), ("  ", "a"), ("s", "  ")] {
             let error = KeychainItemQuery::new(service, account).unwrap_err();
             assert_eq!(error.code(), "credential_lease_keychain_item_invalid");
+        }
+    }
+
+    #[test]
+    fn effective_store_follows_explicit_routing_over_the_selected_backend() {
+        let query = KeychainItemQuery::new("synthetic-service", "synthetic-account").unwrap();
+        for backend in [KeychainBackend::Classic, KeychainBackend::DataProtection] {
+            assert_eq!(effective_store(&query, backend), backend);
+            assert_eq!(
+                effective_store(&query.clone().with_data_protection(true), backend),
+                KeychainBackend::DataProtection
+            );
+            assert_eq!(
+                effective_store(&query.clone().with_data_protection(false), backend),
+                KeychainBackend::Classic
+            );
+        }
+    }
+
+    #[test]
+    fn data_protection_queries_forbid_authentication_ui() {
+        let context = synthetic_context();
+        let query = KeychainItemQuery::new("synthetic-service", "synthetic-account").unwrap();
+        // The effective Data Protection store carries the fail-on-UI policy.
+        let dict = CFDictionary::from_CFType_pairs(&base_pairs(
+            &query,
+            &context,
+            KeychainBackend::DataProtection,
+        ));
+        assert_eq!(
+            dict_value(&dict, unsafe { kSecUseAuthenticationUI }).map(|value| value.as_CFTypeRef()),
+            Some(
+                security_framework_static!(kSecUseAuthenticationUIFail, sec_string_value)
+                    .as_CFTypeRef()
+            )
+        );
+        // A classic-routed query carries none — its interaction policy is
+        // the classic process-wide switch, applied by the operation itself.
+        for query in [query.clone(), query.clone().with_data_protection(false)] {
+            let dict = CFDictionary::from_CFType_pairs(&base_pairs(
+                &query,
+                &context,
+                KeychainBackend::Classic,
+            ));
+            assert!(dict_value(&dict, unsafe { kSecUseAuthenticationUI }).is_none());
+        }
+        let forced = query.with_data_protection(false);
+        let dict = CFDictionary::from_CFType_pairs(&base_pairs(
+            &forced,
+            &context,
+            KeychainBackend::DataProtection,
+        ));
+        assert!(dict_value(&dict, unsafe { kSecUseAuthenticationUI }).is_none());
+    }
+
+    #[test]
+    fn probe_refusal_classification_separates_permanent_from_transient() {
+        for status in [
+            errSecUnimplemented,
+            ERR_SEC_MISSING_ENTITLEMENT,
+            ERR_SEC_NO_SUCH_KEYCHAIN,
+            ERR_SEC_INVALID_KEYCHAIN,
+        ] {
+            assert!(is_permanent_probe_refusal(status));
+        }
+        for status in [
+            errSecAuthFailed,
+            ERR_SEC_INTERACTION_NOT_ALLOWED,
+            errSecItemNotFound,
+            errSecDuplicateItem,
+        ] {
+            assert!(!is_permanent_probe_refusal(status));
         }
     }
 }

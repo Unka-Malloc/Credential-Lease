@@ -50,7 +50,7 @@ pub enum KeychainBackend {
     Classic,
 }
 
-/// The platform store the process probes once and then reuses.
+/// The platform store the process probes and then reuses.
 ///
 /// Construction is only through [`Keychain::selected`]; a value exists only
 /// when the silent round-trip probe proved a protected item can be added,
@@ -63,8 +63,12 @@ pub struct Keychain {
 
 impl Keychain {
     /// The store this process may use, or `None` when no usable platform
-    /// backend exists. The probe runs once per process; its answer is
-    /// cached, so repeated calls are free.
+    /// backend exists right now. Selection is cached only once the probe
+    /// reaches a definite answer — a proven store, or a store verifiably
+    /// unsupported. A temporarily unavailable store (for example a locked
+    /// Data Protection Keychain) reports `None` for that call without
+    /// falling back, so the next explicit call re-probes after the owner
+    /// unlocks it.
     pub fn selected() -> Option<Self> {
         #[cfg(target_os = "macos")]
         {
@@ -77,8 +81,9 @@ impl Keychain {
     }
 
     /// Bounded runtime evidence that protected custody is usable: one
-    /// silent synthetic add/read/delete round trip, cached for the process
-    /// lifetime.
+    /// silent synthetic add/read/delete round trip. A definite answer is
+    /// cached for the process lifetime; an undecidable probe is re-asked
+    /// on the next call.
     pub fn probe_available() -> bool {
         Self::selected().is_some()
     }
