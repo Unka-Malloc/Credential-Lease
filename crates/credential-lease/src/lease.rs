@@ -25,9 +25,10 @@ use crate::epoch::LeaseEpochSource;
 use crate::handoff::{validate_credentials, CredentialHandoff};
 use crate::kind::CredentialKind;
 use crate::SecretBytes;
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -71,6 +72,7 @@ pub struct CredentialLease<K: CredentialKind> {
     expires_at: Instant,
     lease_deadline_epoch_seconds: u64,
     lease_monotonic_deadline_seconds: Option<u64>,
+    deadline_expired: AtomicBool,
     epoch: String,
     epoch_source: Arc<dyn LeaseEpochSource>,
     clock_source: Arc<dyn LeaseClockSource>,
@@ -90,6 +92,7 @@ impl<K: CredentialKind> CredentialLease<K> {
             expires_at: Instant::now(),
             lease_deadline_epoch_seconds: 0,
             lease_monotonic_deadline_seconds: None,
+            deadline_expired: AtomicBool::new(false),
             epoch: String::new(),
             epoch_source: Arc::new(DisconnectedEpochSource),
             clock_source: Arc::new(SystemLeaseClocks),
@@ -196,6 +199,7 @@ impl<K: CredentialKind> CredentialLease<K> {
             expires_at,
             lease_deadline_epoch_seconds,
             lease_monotonic_deadline_seconds,
+            deadline_expired: AtomicBool::new(false),
             epoch,
             epoch_source,
             clock_source,
@@ -538,16 +542,30 @@ impl<K: CredentialKind> CredentialLease<K> {
     /// cannot be read back refuses closed under its own refusal code, not
     /// as an elapsed grant.
     ///
+    /// An expiry once observed is terminal: the lease records it, so a
+    /// backward wall-clock correction — while both monotonic bounds are
+    /// still live — can never revive a grant already seen elapsed. Clock
+    /// read failures refuse without being recorded: an operational
+    /// failure is not an elapsed grant, and a recovered clock must be
+    /// allowed to answer the still-live bounds again.
+    ///
     /// The wall sample the check just enforced is returned so the
     /// caller's own clock use — per-credential expiry, stamp math — can
     /// run on an already-validated reading instead of an unchecked one.
     fn ensure_unexpired(&self) -> Result<Duration> {
-        ensure!(Instant::now() < self.expires_at, "credential_lease_expired");
-        let wall_now = self.clock_source.wall_now()?;
         ensure!(
-            wall_now < Duration::from_secs(self.lease_deadline_epoch_seconds),
+            !self.deadline_expired.load(Ordering::Acquire),
             "credential_lease_expired"
         );
+        if Instant::now() >= self.expires_at {
+            self.deadline_expired.store(true, Ordering::Release);
+            bail!("credential_lease_expired");
+        }
+        let wall_now = self.clock_source.wall_now()?;
+        if wall_now >= Duration::from_secs(self.lease_deadline_epoch_seconds) {
+            self.deadline_expired.store(true, Ordering::Release);
+            bail!("credential_lease_expired");
+        }
         if let Some(deadline) = self.lease_monotonic_deadline_seconds {
             // An unreadable shared clock — a failed read, or a platform
             // reporting no comparable clock while a deadline rides it —
@@ -559,10 +577,10 @@ impl<K: CredentialKind> CredentialLease<K> {
                 .clock_source
                 .monotonic_now()?
                 .ok_or_else(|| anyhow!("credential_lease_clock_unavailable"))?;
-            ensure!(
-                now < Duration::from_secs(deadline),
-                "credential_lease_expired"
-            );
+            if now >= Duration::from_secs(deadline) {
+                self.deadline_expired.store(true, Ordering::Release);
+                bail!("credential_lease_expired");
+            }
         }
         Ok(wall_now)
     }

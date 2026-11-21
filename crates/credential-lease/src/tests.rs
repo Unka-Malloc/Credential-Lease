@@ -1247,6 +1247,74 @@ fn a_deadline_crossed_after_the_epoch_answer_still_refuses_the_resolution() {
 
 #[test]
 #[cfg(unix)]
+fn an_observed_deadline_expiry_is_terminal_across_a_backward_clock_step() {
+    // The wall clock crosses the owner-authorized deadline and then
+    // steps backward — an NTP correction — while the `Instant` expiry
+    // and the shared monotonic deadline still read live. The crossing
+    // is recorded the moment it is observed, so the lease refuses every
+    // later use instead of resolving again on the rewound readings.
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let source = Arc::new(TestEpochSource(StdMutex::new(Some(epoch.clone()))));
+    let mut credentials = BTreeMap::new();
+    credentials.insert(TestKind::Beta, vec![test_credential(0xE7)]);
+    let wall_now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let monotonic_reading = crate::handoff::monotonic_now().unwrap();
+    // Mint reads inside the deadline; the first post-mint check lands
+    // past it; every reading after that steps back inside — exactly the
+    // revival the recorded expiry must keep refusing.
+    let clock_source = Arc::new(TestClocks::with_wall_sequence(
+        vec![
+            Duration::from_secs(wall_now),
+            Duration::from_secs(wall_now + 120),
+            Duration::from_secs(wall_now),
+        ],
+        monotonic_reading.map(|now| now + Duration::from_secs(3600)),
+    ));
+    let lease = CredentialLease::new_with_binding_for_test(
+        credentials,
+        Duration::from_secs(3600),
+        epoch,
+        source,
+        EgressScope::deny_all(),
+        std::process::id(),
+        Instant::now() + Duration::from_secs(3600),
+        wall_now + 60,
+        monotonic_reading.map(|now| now.as_secs() + 7200),
+        clock_source,
+    )
+    .unwrap();
+    assert_eq!(
+        lease.resolve(TestKind::Beta).unwrap_err().to_string(),
+        "credential_lease_expired"
+    );
+    // The wall script has stepped back inside the deadline and stays
+    // there; the grant still refuses on every subsequent use.
+    for _ in 0..2 {
+        assert_eq!(
+            lease.resolve(TestKind::Beta).unwrap_err().to_string(),
+            "credential_lease_expired"
+        );
+        assert_eq!(
+            lease
+                .resolve_candidates(TestKind::Beta)
+                .unwrap_err()
+                .to_string(),
+            "credential_lease_expired"
+        );
+    }
+    let slot = CredentialSlot::new(lease);
+    assert!(!slot.connected());
+    assert_eq!(
+        slot.resolve(TestKind::Beta).unwrap_err().to_string(),
+        "credential_lease_expired"
+    );
+}
+
+#[test]
+#[cfg(unix)]
 fn a_deadline_crossed_during_projection_refuses_the_secret_bearing_handoff() {
     // Projection samples the wire clocks for its stamps after the
     // post-epoch recheck: a suspend anywhere in between — before those
