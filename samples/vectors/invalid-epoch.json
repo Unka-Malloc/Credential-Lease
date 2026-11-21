@@ -1,0 +1,7 @@
+{
+  "schemaVersion": "test.credential-lease.handoff.v1",
+  "leaseDurationSeconds": 60,
+  "leaseExpiresAtEpochSeconds": 2000000000,
+  "epoch": "not-a-canonical-uuid",
+  "credentials": []
+}

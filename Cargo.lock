@@ -47,6 +47,7 @@ name = "credential-lease"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "libc",
  "serde",
  "serde_json",
  "uuid",

@@ -18,10 +18,19 @@ host. There is no daemon to install.
 ## Canonical calls
 
 ```rust
-let handoff = credential_lease::CredentialHandoff::<Kind>::from_json(document.expose_bytes())?;
+// Spawned runtime: consume the inherited descriptor named by
+// FAIRLINY_HANDOFF_FD (environment carries only the descriptor number).
+let handoff = credential_lease::handoff_fd::receive_handoff_from_env::<Kind>()?
+    .expect("the host granted a handoff descriptor");
 let lease = credential_lease::CredentialLease::from_handoff(handoff, epoch_source)?;
 let secret = lease.resolve(kind)?;
 ```
+
+When the host already resolved the descriptor, call
+`credential_lease::handoff_fd::receive_handoff(descriptor)` directly. The
+receiver bounds the read, parses the closed document, and closes the
+descriptor on every path. See `docs/fd-handoff.md` for the channel contract
+and the shared Rust/Go/TypeScript validation samples.
 
 The host supplies `Kind`, the authorized secret-bearing document, the epoch
 source and the selected kind. Use `SecretBytes` and `LeasedCredential::new`
@@ -36,11 +45,24 @@ can install their `CustodyPort` through `port::install` and access it through
   other custody buffer types at the host boundary, not inside this crate.
 - The only secret-bearing serialized form is `HandoffDocument`, carried over
   an explicitly authorized process-local channel, never a file, log, inventory
-  or configuration document.
+  or configuration document. The environment names the explicitly granted channel
+  (`FAIRLINY_HANDOFF_FD`) by descriptor number only; it never carries the
+  document or a root key.
 - Every resolution checks the lease's process identity, its own lifetime,
   and the host's current custody epoch. A lease inherited across a fork and
   a revoked or expired lease are all refusals; obtaining another lease
   requires host authorization.
+- Map credential refusals with `credential_lease::auth_failure_class`.
+  Unavailable, expired and revoked credentials become the shared
+  `auth_expired` `failureClass` that AwP and Fairliny-Gateway use to renew or
+  switch safely. Process-integrity and epoch-source failures return `None`
+  and must not trigger an automatic renewal.
+- A handoff also carries the owner-declared `EgressScope`: gate every
+  outbound target through `lease.egress().permits(&target)` (or
+  `handoff.egress()` / `slot.egress()`), honor `allow_redirects()` (off
+  unless explicitly enabled), and render header injections through
+  `HeaderTemplate::render` with the `{secret}` marker. An undeclared scope
+  denies every target — it is a boundary, not a hint.
 - The `credential-lease` contract crate performs no custody. The workspace
   ships the keyring backend as `credential-lease-keychain`: protected macOS
   Keychain items, fail-closed (`Keychain::selected()` is `None`) elsewhere.

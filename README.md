@@ -15,7 +15,10 @@ application the key":
   authorization** (prompts, sessions, revocation) stays with the host.
 - A **`CredentialHandoff`** — a closed JSON document — carries credential
   material from the unlocking process to one runtime over a process-local
-  channel.
+  channel, together with the owner-declared **`EgressScope`**: the
+  parameterized host/port/path/method matchers, header injection
+  templates and fail-closed `allow_redirects` flag an outbound proxy
+  enforces per target.
 - The runtime rebuilds a **`CredentialLease`**: process-bound, time-limited,
   and revoked the moment the custody epoch rotates.
 - Secret bytes never appear in inventories, configuration documents, debug
@@ -30,14 +33,16 @@ cross families.
 
 | Crate | Contents |
 | --- | --- |
-| `credential-lease` | `SecretBytes`, `LeasedCredential`, `CredentialHandoff<K>`, `CredentialLease<K>`, `CredentialSlot<K>`, `LeaseEpochSource`, `CustodyPort` registry |
+| `credential-lease` | `SecretBytes`, `LeasedCredential`, `CredentialHandoff<K>`, `EgressScope`/`EgressTarget`/`HeaderTemplate`, `CredentialLease<K>`, `CredentialSlot<K>`, `LeaseEpochSource`, `CustodyPort` registry |
 | `credential-lease-keychain` | OS-keychain custody backend: protected SecItem operations on macOS (`Keychain`, `KeychainItemQuery`, `KeychainAuthContext`, `KeychainItem` with its typed `KeychainItemProvenance`), fail-closed `None` elsewhere |
 
 ## Language-neutral contract
 
 The handoff document is specified in [docs/handoff.md](docs/handoff.md).
 Rust consumers link the crate; Go, TypeScript, and other consumers
-implement the contract against that document.
+implement the contract against that document. The inherited-descriptor
+transport (`FAIRLINY_HANDOFF_FD`) and the shared Rust, Go, and TypeScript
+validation samples are specified in [docs/fd-handoff.md](docs/fd-handoff.md).
 
 ## Verify
 

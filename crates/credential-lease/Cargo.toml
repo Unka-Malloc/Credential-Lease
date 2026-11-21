@@ -14,3 +14,14 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
+
+# The inherited-descriptor intake reads and closes the descriptor itself.
+# `std::fs::File` cannot represent it safely: std aborts on an EBADF owned
+# descriptor instead of letting the receiver fail closed with a stable code.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Descriptor inheritance (pipe creation, close-on-exec, dup2) in the
+# end-to-end handoff test.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

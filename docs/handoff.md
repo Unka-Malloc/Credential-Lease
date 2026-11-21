@@ -7,6 +7,15 @@ never written to disk. This document is the language-neutral specification:
 the Rust crate is the reference implementation, and non-Rust custody owners
 or runtimes implement this contract to interoperate.
 
+## Transport
+
+The document travels over exactly one process-local channel. In the Unix
+model that channel is an inherited, read-only file descriptor named by the
+`FAIRLINY_HANDOFF_FD` environment variable; the environment carries only the
+descriptor number, never the document or any secret. See
+[fd-handoff.md](fd-handoff.md) for the channel rules, the stable refusal
+codes, and the executable Rust, Go, and TypeScript signature samples.
+
 ## Document
 
 ```json
@@ -160,6 +169,19 @@ The process check governs this lease object. A fork still inherits the
 address space, so secret buffers already copied into the child are outside
 the lease's control; the check keeps the inherited lease itself from
 resolving or projecting them.
+
+### Host failure classification
+
+Hosts that route recovery through the A4AA `failureClass` vocabulary — AwP
+and Fairliny-Gateway both do — map the runtime refusals with
+`credential_lease::failure::auth_failure_class` (re-exported at the crate
+root). `credential_lease_unavailable`, `credential_lease_expired`, and
+`credential_lease_revoked` all mean the credential is unusable and map to
+`auth_expired`, so the host stops using it and requests a fresh authorized
+handoff. Local integrity failures (`credential_lease_process_mismatch`) and
+infrastructure failures (an unreadable epoch source, a poisoned slot lock)
+return `None` and stay operational errors: a host must not silently renew
+credentials across a broken boundary.
 
 ## Portability notes
 

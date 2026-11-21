@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "test.credential-lease.handoff.v1",
+  "leaseDurationSeconds": 60,
+  "leaseExpiresAtEpochSeconds": 2000000000,
+  "epoch": "00000000-0000-4000-8000-0000000000fd",
+  "credentials": [
+    {
+      "kind": "api",
+      "keys": [
+        {
+          "credentialId": "00000000-0000-4000-8000-0000000000aa",
+          "expiresAtEpochSeconds": 18446744073709551616,
+          "secret": [102, 100, 45, 104, 97, 110, 100, 111, 102, 102, 45, 115, 101, 99, 114, 101, 116]
+        }
+      ]
+    }
+  ]
+}

@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use credential_lease::credential::LeasedCredential;
+use credential_lease::egress::EgressScope;
 use credential_lease::epoch::LeaseEpochSource;
 use credential_lease::handoff::CredentialHandoff;
 use credential_lease::kind::CredentialKind;
@@ -58,6 +59,7 @@ fn lease_with(secret: &str, expires_at: Option<u64>) -> CredentialLease<Kind> {
         Duration::from_secs(60),
         epoch(),
         Arc::new(FixedEpoch(epoch())),
+        EgressScope::deny_all(),
     )
     .unwrap()
 }
@@ -94,6 +96,7 @@ fn handoff_carries_arbitrary_secret_bytes_verbatim() {
         Duration::from_secs(60),
         epoch(),
         Arc::new(FixedEpoch(epoch())),
+        EgressScope::deny_all(),
     )
     .unwrap();
     let document = custody.handoff_projection().unwrap().to_json().unwrap();

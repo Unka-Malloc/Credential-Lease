@@ -321,6 +321,12 @@ fn lease_bound_to_another_process_fails_closed_on_every_secret_use() {
         lease.handoff_projection().unwrap_err().to_string(),
         "credential_lease_process_mismatch"
     );
+    // A local integrity refusal is not a credential-expiry signal: the host
+    // must surface it instead of renewing across a broken boundary.
+    assert_eq!(
+        auth_failure_class(&lease.resolve(TestKind::Beta).unwrap_err()),
+        None
+    );
 
     let slot = CredentialSlot::new(lease);
     assert!(!slot.connected());

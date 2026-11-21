@@ -35,11 +35,25 @@ Boundary rules the consumer relies on:
 - **Secret bytes serialize only in `HandoffDocument`** — the secret-bearing
   document travels only through a process-local channel, never disks, logs or
   configuration. Inventories, debug projections and error output contain no
-  secret material.
+  secret material. On Unix the channel is an inherited read-only descriptor
+  named by `FAIRLINY_HANDOFF_FD`; `receive_handoff_from_env` consumes it,
+  closes it, and bounds the read. The environment carries only the descriptor
+  number.
 - **Process-bound** — a lease is bound to the process that minted it, its
   own lifetime, and the custody epoch. A fork inheriting the lease fails
   closed (`credential_lease_process_mismatch`); revocation is a signal the
   host reads, not a callback it must trust.
+- **Failure classification** — `credential_lease::auth_failure_class` maps
+  unavailable, expired and revoked credentials to the shared `auth_expired`
+  `failureClass` used by AwP and Fairliny-Gateway for renewal or safe
+  switching. Local integrity and infrastructure failures return `None` and
+  stay operational errors.
+- **Outbound scope rides the handoff** — an `EgressScope` declares the
+  host/port/path-prefix/method matchers, header injection templates and
+  `allow_redirects` flag a runtime's outbound HTTP/TCP proxy enforces per
+  target (`EgressScope::permits`). An undeclared scope fails closed; a
+  lease carries it through projection unchanged so forwarding can never
+  widen the grant.
 
 ## Skills
 
