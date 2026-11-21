@@ -141,7 +141,7 @@ func readDocument(descriptor int) ([]byte, error) {
 func validate(document any) (int, error) {
 	top, err := closedFields(document,
 		[]string{"schemaVersion", "leaseDurationSeconds", "leaseExpiresAtEpochSeconds", "epoch", "credentials"},
-		[]string{"egress"})
+		[]string{"egress", "leaseMonotonicDeadlineSeconds"})
 	if err != nil {
 		return 0, err
 	}
@@ -156,6 +156,15 @@ func validate(document any) (int, error) {
 	deadline, ok := unsigned(top["leaseExpiresAtEpochSeconds"])
 	if !ok || deadline == 0 {
 		return 0, errInvalid
+	}
+	// The same-host monotonic deadline is optional on the wire — absent
+	// where the producing platform had no comparable clock — but when it
+	// is carried it follows the same unsigned-above-zero rule.
+	if rawMonotonic, present := top["leaseMonotonicDeadlineSeconds"]; present {
+		monotonic, ok := unsigned(rawMonotonic)
+		if !ok || monotonic == 0 {
+			return 0, errInvalid
+		}
 	}
 	if rawEgress, present := top["egress"]; present {
 		if err := validateEgress(rawEgress); err != nil {

@@ -35,18 +35,21 @@ pub use item::{KeychainItem, KeychainItemProvenance};
 ///
 /// The Data Protection Keychain is the production target — a signed build
 /// selects it and items land under `kSecUseDataProtectionKeychain`. The
-/// classic file-based Keychain is the local-build fallback: local builds
-/// that cannot hold the required access-group entitlement still get a
-/// protected store, and the explicit classic legacy path is what the
-/// migration reads and deletes through.
+/// classic file-based Keychain is the local-build fallback for reads,
+/// deletes, and the explicit legacy migration path: explicit classic
+/// routing cannot carry the `SecAccessControl` every write requires, so
+/// item writes are refused there rather than stored unprotected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeychainBackend {
     /// `kSecUseDataProtectionKeychain = true`: the iOS-style Keychain with
     /// `SecAccessControl` item protection.
     DataProtection,
-    /// The classic file-based macOS Keychain. Item queries leave the data
-    /// protection flag unset; its separate application ACLs cannot be
-    /// rewritten by `SecAccessControl`.
+    /// The classic file-based macOS Keychain. Item queries pin the data
+    /// protection flag to `false`; explicit classic routing strips the
+    /// `SecAccessControl` a write would carry — the classic store's
+    /// separate application ACLs are outside this backend's protection
+    /// contract — so item writes are refused. Reads, deletes, and the
+    /// legacy migration paths stay supported.
     Classic,
 }
 

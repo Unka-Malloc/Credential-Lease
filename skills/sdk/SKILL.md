@@ -20,15 +20,21 @@ host. There is no daemon to install.
 ```rust
 // Spawned runtime: consume the inherited descriptor named by
 // FAIRLINY_HANDOFF_FD (environment carries only the descriptor number).
-let handoff = credential_lease::handoff_fd::receive_handoff_from_env::<Kind>()?
-    .expect("the host granted a handoff descriptor");
+// SAFETY: the spawn contract grants this process exclusive ownership of
+// the descriptor the variable names — intake is unsafe because the open
+// probe cannot prove ownership.
+let handoff = unsafe {
+    credential_lease::handoff_fd::receive_handoff_from_env::<Kind>()
+}?
+.expect("the host granted a handoff descriptor");
 let lease = credential_lease::CredentialLease::from_handoff(handoff, epoch_source)?;
 let secret = lease.resolve(kind)?;
 ```
 
 When the host already resolved the descriptor, call
-`credential_lease::handoff_fd::receive_handoff(owned_fd)` — it takes an
-`OwnedFd` so ownership transfer is explicit. The receiver bounds the read,
+`credential_lease::handoff_fd::receive_handoff(owned_fd)` — the safe entry
+point — which takes an `OwnedFd` so ownership transfer is explicit. The
+receiver bounds the read,
 parses the closed document, and closes the descriptor on every path. See
 `docs/fd-handoff.md` for the channel contract
 and the shared Rust/Go/TypeScript validation samples.

@@ -35,6 +35,7 @@ pub struct CredentialLease<K: CredentialKind> {
     lease_duration: Duration,
     expires_at: Instant,
     lease_deadline_epoch_seconds: u64,
+    lease_monotonic_deadline_seconds: Option<u64>,
     epoch: String,
     epoch_source: Arc<dyn LeaseEpochSource>,
     process_id: u32,
@@ -52,6 +53,7 @@ impl<K: CredentialKind> CredentialLease<K> {
             lease_duration: Duration::ZERO,
             expires_at: Instant::now(),
             lease_deadline_epoch_seconds: 0,
+            lease_monotonic_deadline_seconds: None,
             epoch: String::new(),
             epoch_source: Arc::new(DisconnectedEpochSource),
             process_id: std::process::id(),
@@ -74,6 +76,8 @@ impl<K: CredentialKind> CredentialLease<K> {
         crate::handoff::ensure_lease_duration_bounds(lease_duration)?;
         let lease_deadline_epoch_seconds =
             crate::handoff::lease_deadline_epoch_seconds(lease_duration)?;
+        let lease_monotonic_deadline_seconds =
+            crate::handoff::monotonic_deadline_seconds(lease_duration);
         Self::new_bound(
             credentials,
             lease_duration,
@@ -82,9 +86,11 @@ impl<K: CredentialKind> CredentialLease<K> {
             std::process::id(),
             egress,
             lease_deadline_epoch_seconds,
+            lease_monotonic_deadline_seconds,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_bound(
         credentials: BTreeMap<K, Vec<LeasedCredential>>,
         lease_duration: Duration,
@@ -93,6 +99,7 @@ impl<K: CredentialKind> CredentialLease<K> {
         process_id: u32,
         egress: EgressScope,
         lease_deadline_epoch_seconds: u64,
+        lease_monotonic_deadline_seconds: Option<u64>,
     ) -> Result<Self> {
         ensure!(
             uuid::Uuid::parse_str(&epoch).is_ok_and(|value| value.to_string() == epoch),
@@ -116,8 +123,28 @@ impl<K: CredentialKind> CredentialLease<K> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| anyhow!("credential_lease_clock_invalid"))?;
-        let effective_duration =
+        let mut effective_duration =
             lease_duration.min(deadline_remaining(lease_deadline_epoch_seconds, now));
+        // The same-host anchor: a monotonic deadline is enforced on the
+        // clock domain it was stamped in, so a backward wall-clock step
+        // between projection and rebuild can never stretch the grant the
+        // wall deadline alone would have allowed. A rebuild that can
+        // compare such a deadline requires it; a rebuild that cannot
+        // compare refuses one that is carried — clock continuity cannot
+        // be established either way, and refusing is the fail-closed
+        // answer.
+        effective_duration = match (
+            lease_monotonic_deadline_seconds,
+            crate::handoff::monotonic_now_seconds(),
+        ) {
+            (Some(deadline), Some(now)) => {
+                effective_duration.min(deadline_remaining(deadline, Duration::from_secs(now)))
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(anyhow!("credential_lease_expiry_invalid"))
+            }
+            (None, None) => effective_duration,
+        };
         let expires_at = minted_at
             .checked_add(effective_duration)
             .ok_or_else(|| anyhow!("credential_lease_expiry_invalid"))?;
@@ -130,6 +157,7 @@ impl<K: CredentialKind> CredentialLease<K> {
             lease_duration: crate::handoff::whole_seconds_ceiling(lease_duration),
             expires_at,
             lease_deadline_epoch_seconds,
+            lease_monotonic_deadline_seconds,
             epoch,
             epoch_source,
             process_id,
@@ -151,6 +179,7 @@ impl<K: CredentialKind> CredentialLease<K> {
         process_id: u32,
         expires_at: Instant,
         lease_deadline_epoch_seconds: u64,
+        lease_monotonic_deadline_seconds: Option<u64>,
     ) -> Result<Self> {
         let mut lease = Self::new_bound(
             credentials,
@@ -160,6 +189,7 @@ impl<K: CredentialKind> CredentialLease<K> {
             process_id,
             egress,
             lease_deadline_epoch_seconds,
+            lease_monotonic_deadline_seconds,
         )?;
         lease.expires_at = expires_at;
         Ok(lease)
@@ -232,6 +262,21 @@ impl<K: CredentialKind> CredentialLease<K> {
         let expires_at_epoch_seconds = self
             .lease_deadline_epoch_seconds
             .min(projected_expiry_epoch_seconds(projected_at, remaining)?);
+        // The same bound in the producing host's monotonic clock domain:
+        // floored from the sampled now plus the instant remainder, so the
+        // stamp sits at or before the lease's true monotonic expiry. A
+        // rebuild compares it against that same clock — a domain a
+        // wall-clock rollback cannot deceive — and where the platform
+        // cannot sample it, the deadline the lease was minted with is
+        // preserved verbatim.
+        let monotonic_deadline_seconds = match crate::handoff::monotonic_now_seconds() {
+            Some(now) => Some(
+                self.lease_monotonic_deadline_seconds
+                    .unwrap_or(u64::MAX)
+                    .min(now.saturating_add(remaining.as_secs())),
+            ),
+            None => self.lease_monotonic_deadline_seconds,
+        };
         // The egress scope is part of the grant: a projection carries it
         // forward verbatim so forwarding can never silently widen it.
         CredentialHandoff::with_deadline(
@@ -240,19 +285,30 @@ impl<K: CredentialKind> CredentialLease<K> {
             self.epoch.clone(),
             self.egress.clone(),
             expires_at_epoch_seconds,
+            monotonic_deadline_seconds,
         )
     }
 
     /// Rebuild a lease from a received handoff under the local epoch source.
     /// Construction reuses the same closed validations as a custody unlock,
     /// and the rebuilt lease expires at the earlier of the document's
-    /// duration and the owner-authorized deadline it carries.
+    /// duration and the owner-authorized deadline it carries. Where the
+    /// document carries the same-host monotonic deadline, the rebuild is
+    /// capped by that clock as well — and where the platform can compare
+    /// one but the document omits it, the rebuild refuses, since clock
+    /// continuity cannot be established.
     pub fn from_handoff(
         handoff: CredentialHandoff<K>,
         epoch_source: Arc<dyn LeaseEpochSource>,
     ) -> Result<Self> {
-        let (credentials, lease_duration, epoch, egress, lease_deadline_epoch_seconds) =
-            handoff.into_parts();
+        let (
+            credentials,
+            lease_duration,
+            epoch,
+            egress,
+            lease_deadline_epoch_seconds,
+            lease_monotonic_deadline_seconds,
+        ) = handoff.into_parts();
         Self::new_bound(
             credentials,
             lease_duration,
@@ -261,6 +317,7 @@ impl<K: CredentialKind> CredentialLease<K> {
             std::process::id(),
             egress,
             lease_deadline_epoch_seconds,
+            lease_monotonic_deadline_seconds,
         )
     }
 
@@ -284,6 +341,11 @@ impl<K: CredentialKind> CredentialLease<K> {
     /// iterator borrows the lease so callers copy only the secrets they
     /// actually select.
     fn valid_candidates(&self, kind: K) -> Result<impl Iterator<Item = &LeasedCredential> + '_> {
+        // Process identity precedes the inventory lookup: an inherited
+        // lease must refuse as a boundary violation — never as a missing
+        // kind, which would read as the ordinary `auth_expired` renewal
+        // signal to a child replaying its parent's lease.
+        self.ensure_current_process()?;
         let kind_credentials = self
             .credentials
             .get(&kind)
@@ -332,6 +394,11 @@ impl<K: CredentialKind> CredentialLease<K> {
             self.epoch_source.active_epoch()?.as_deref() == Some(self.epoch.as_str()),
             "credential_lease_revoked"
         );
+        // The epoch consultation may take arbitrarily long: a lease that
+        // was alive when it started can cross its deadline while waiting,
+        // so expiry is rechecked before credentials answer — a slow
+        // lookup must never release an expired grant.
+        ensure!(Instant::now() < self.expires_at, "credential_lease_expired");
         Ok(())
     }
 }

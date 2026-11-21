@@ -84,7 +84,10 @@ document bytes, or OS error strings in them.
 ```rust
 use credential_lease::handoff_fd::receive_handoff_from_env;
 
-let handoff = receive_handoff_from_env::<Kind>()?.expect("descriptor is granted");
+// SAFETY: the spawn contract grants this process exclusive ownership of
+// the descriptor the variable names.
+let handoff =
+    unsafe { receive_handoff_from_env::<Kind>() }?.expect("descriptor is granted");
 let lease = CredentialLease::from_handoff(handoff, epoch_source)?;
 let secret = lease.resolve(kind)?;
 ```
@@ -99,10 +102,16 @@ reassigned since the first intake closed it. The parsed number is checked
 against an actually open descriptor before it is claimed as owned: a closed
 number is refused as `credential_lease_handoff_fd_unavailable` without ever
 being treated as an owned descriptor.
-`receive_handoff(owned_fd)` is the same intake for a descriptor the host
-already resolved; it takes an `OwnedFd`, not a borrowed `RawFd`, so ownership
-transfer is explicit and the receiver never closes a descriptor the caller
-still owns.
+
+The probe proves the number is open — never who owns it — so
+`receive_handoff_from_env` is `unsafe`: the caller asserts the spawn
+contract, that the named descriptor is exclusively owned by this process
+and may be claimed, read, and closed. A number another component still
+owns is a contract violation the function cannot detect; closing under it
+would corrupt that component's channel. A host that resolved the
+descriptor itself calls `receive_handoff(owned_fd)` — the safe intake —
+which takes an `OwnedFd`, not a borrowed `RawFd`, so ownership transfer is
+explicit and the receiver never closes a descriptor the caller still owns.
 
 The end-to-end parent/child test lives in
 `crates/credential-lease/tests/fd_handoff.rs`: it spawns a real child process
@@ -131,11 +140,13 @@ FAIRLINY_HANDOFF_FD=3 <sample> 3< samples/vectors/valid.json
 ```
 
 `samples/vectors/` holds the shared conformance set. The valid documents are
-the base fixture, an expiry at the `u64` maximum, and a document carrying a
-declared `egress` scope; every one carries the required
-`leaseExpiresAtEpochSeconds` owner deadline. The invalid documents cover an
-unknown field, a foreign schema, a malformed epoch, a zero duration, a
-missing owner deadline, a zero owner deadline, an out-of-range secret byte,
+the base fixture, an expiry at the `u64` maximum, a document carrying a
+declared `egress` scope, and a document carrying the optional
+`leaseMonotonicDeadlineSeconds` same-host anchor; every one carries the
+required `leaseExpiresAtEpochSeconds` owner deadline. The invalid documents
+cover an unknown field, a foreign schema, a malformed epoch, a zero
+duration, a missing owner deadline, a zero owner deadline, a zero
+monotonic deadline, an out-of-range secret byte,
 a missing required field, a duplicate object member, trailing data after
 the document, a decimal and an exponent duration literal (`60.0` / `6e1`),
 a fractional secret byte, an expiry beyond `u64`, an egress member outside

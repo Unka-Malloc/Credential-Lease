@@ -37,7 +37,10 @@ Boundary rules the consumer relies on:
   configuration. Inventories, debug projections and error output contain no
   secret material. On Unix the channel is an inherited read-only descriptor
   named by `FAIRLINY_HANDOFF_FD`; `receive_handoff_from_env` consumes the
-  variable once, closes the descriptor, and bounds the read. The environment
+  variable once, closes the descriptor, and bounds the read — it is `unsafe`
+  because claiming the named descriptor asserts an exclusive-ownership
+  contract the open probe cannot prove; hosts that resolved the descriptor
+  themselves pass an `OwnedFd` to the safe `receive_handoff`. The environment
   carries only the descriptor number. The grant rule applies at every exec:
   a spawned child either receives the matching descriptor with the variable
   set to its number, or starts without the variable — an inherited stale

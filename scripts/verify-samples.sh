@@ -16,10 +16,19 @@ failures=0
 
 # The executable path comes from this build's own artifact report, so a
 # relocated target directory (CARGO_TARGET_DIR, build.target-dir) can
-# never point the runner at a missing or stale binary.
+# never point the runner at a missing or stale binary. The report is
+# decoded as JSON — a text-level extraction would truncate an escaped
+# quote in the path and leave a backslash unexpanded.
+if ! command -v jq >/dev/null 2>&1; then
+  echo "FAIL samples: jq is required to decode Cargo's JSON artifact report" >&2
+  exit 1
+fi
 rust_sample="$(cargo build --quiet --message-format=json \
   -p credential-lease --example validate_handoff \
-  | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)"
+  | jq -r 'select(.reason == "compiler-artifact"
+      and .target.name == "validate_handoff"
+      and (.target.kind | index("example") != null))
+      | .executable // empty' | tail -n 1)"
 if [ ! -x "$rust_sample" ]; then
   echo "FAIL samples: cargo build did not produce a validate_handoff executable" >&2
   exit 1

@@ -318,17 +318,20 @@ impl Keychain {
     ///
     /// A query declaring `synchronizable` is refused before any SecItem
     /// call: the platform cannot attach the device-only access control
-    /// every write carries to a synchronizable item. Reads and deletes
-    /// of existing synchronizable items stay supported — only writes are
-    /// refused.
+    /// every write carries to a synchronizable item. A write routed to the
+    /// classic store is refused the same way: explicit classic routing
+    /// strips that access control — the only protection this backend
+    /// writes — so the item could never carry the required protection.
+    /// Reads and deletes of existing synchronizable or classic items stay
+    /// supported — only writes are refused.
     pub fn set_item(
         &self,
         context: &KeychainAuthContext,
         query: &KeychainItemQuery<'_>,
         secret: &SecretBytes,
     ) -> Result<(), KeychainError> {
-        ensure_write_supported(query)?;
         let store = effective_store(query, self.backend)?;
+        ensure_write_supported(query, store)?;
         let query_dict =
             CFDictionary::from_CFType_pairs(&base_pairs(query, context, self.backend)?);
         // Data Protection applies SecAccessControl. The classic Keychain has
@@ -378,16 +381,17 @@ impl Keychain {
     /// that are append-only resolve `Duplicate` by comparing the existing
     /// record.
     ///
-    /// A query declaring `synchronizable` is refused before any SecItem
-    /// call, for the same reason [`Keychain::set_item`] refuses it.
+    /// A query declaring `synchronizable` or routing to the classic store
+    /// is refused before any SecItem call, for the same reason
+    /// [`Keychain::set_item`] refuses them.
     pub fn add_item(
         &self,
         context: &KeychainAuthContext,
         query: &KeychainItemQuery<'_>,
         secret: &SecretBytes,
     ) -> Result<AddItemOutcome, KeychainError> {
-        ensure_write_supported(query)?;
         let store = effective_store(query, self.backend)?;
+        ensure_write_supported(query, store)?;
         let mut pairs = base_pairs(query, context, self.backend)?;
         pairs.extend(protected_secret_pairs(secret.expose_bytes())?);
         let add_query = CFDictionary::from_CFType_pairs(&pairs);
@@ -421,26 +425,16 @@ impl Keychain {
     }
 
     /// Copy one item with its value bytes, its persistent reference, and
-    /// its provenance attributes.
+    /// its provenance attributes. A synchronizable item answers with its
+    /// persistent reference absent — the platform serves such items only
+    /// as attributes and data, so the read does not request one.
     pub fn copy_item(
         &self,
         context: &KeychainAuthContext,
         query: &KeychainItemQuery<'_>,
     ) -> Result<Option<KeychainItem>, KeychainError> {
         let store = effective_store(query, self.backend)?;
-        let mut pairs = base_pairs(query, context, self.backend)?;
-        pairs.push((
-            security_framework_static!(kSecReturnAttributes, sec_key),
-            CFBoolean::from(true).into_CFType(),
-        ));
-        pairs.push((
-            security_framework_static!(kSecReturnData, sec_key),
-            CFBoolean::from(true).into_CFType(),
-        ));
-        pairs.push((
-            security_framework_static!(kSecReturnPersistentRef, sec_key),
-            CFBoolean::from(true).into_CFType(),
-        ));
+        let pairs = copy_item_pairs(query, context, self.backend)?;
         with_keychain_backend(store, || copy_item_from_query_effect(&pairs, store))
     }
 
@@ -563,7 +557,16 @@ fn effective_store(
 /// on a synchronizable item (`errSecParam`), and dropping the control to
 /// satisfy the write would silently store the item without the
 /// device-only protection this backend exists to enforce.
-fn ensure_write_supported(query: &KeychainItemQuery<'_>) -> Result<(), KeychainError> {
+///
+/// The classic store cannot take the required protection at all: explicit
+/// classic routing strips the `SecAccessControl` the write carries — the
+/// classic store's separate application ACLs are outside this backend's
+/// protection contract — so a classic-routed write is refused before any
+/// SecItem call rather than persisted unprotected.
+fn ensure_write_supported(
+    query: &KeychainItemQuery<'_>,
+    store: KeychainBackend,
+) -> Result<(), KeychainError> {
     if query.synchronizable == Some(true) {
         return Err(KeychainError::new(
             "credential_lease_keychain_synchronizable_write_invalid",
@@ -571,15 +574,34 @@ fn ensure_write_supported(query: &KeychainItemQuery<'_>) -> Result<(), KeychainE
             None,
         ));
     }
+    if store == KeychainBackend::Classic {
+        return Err(KeychainError::new(
+            "credential_lease_keychain_classic_write_unsupported",
+            KeychainErrorKind::Failed,
+            None,
+        ));
+    }
     Ok(())
+}
+
+/// The explicit store routing the probe and every production operation
+/// pin alike. An add that leaves the flag unset while carrying
+/// `kSecAttrAccessControl` is routed to the Data Protection Keychain by
+/// SecItem itself — off the store the operation was built for. The flag
+/// is therefore never omitted: `true` on the Data Protection store,
+/// `false` on the classic store.
+fn data_protection_routing(store: KeychainBackend) -> (CFString, CFType) {
+    (
+        security_framework_static!(kSecUseDataProtectionKeychain, sec_key),
+        CFBoolean::from(store == KeychainBackend::DataProtection).into_CFType(),
+    )
 }
 
 /// The ordinary item query: class, service, account, the optional storage
 /// attributes the host asked for, and the authorized context. The routing
-/// flag follows `use_data_protection` when set, otherwise the effective
-/// store — explicit on Data Protection, absent on Classic so a classic
-/// add does not get routed into a store that would discard the protection
-/// attribute it carries.
+/// flag is always the effective store's explicit pin — the same one the
+/// probe uses — so no operation can drift onto a store it was not built
+/// for.
 fn base_pairs(
     query: &KeychainItemQuery<'_>,
     context: &KeychainAuthContext,
@@ -629,16 +651,34 @@ fn base_pairs(
             security_framework_static!(kSecUseAuthenticationUIFail, sec_string_value),
         ));
     }
-    match query.use_data_protection {
-        Some(use_data_protection) => pairs.push((
-            security_framework_static!(kSecUseDataProtectionKeychain, sec_key),
-            CFBoolean::from(use_data_protection).into_CFType(),
-        )),
-        None if store == KeychainBackend::DataProtection => pairs.push((
-            security_framework_static!(kSecUseDataProtectionKeychain, sec_key),
+    pairs.push(data_protection_routing(store));
+    Ok(pairs)
+}
+
+/// The full-copy query pairs: attributes and value data, plus the
+/// persistent reference — except for a synchronizable item, which the
+/// platform serves only as attributes and data. Requesting a persistent
+/// reference there is not a supported return type, so synchronizable
+/// reads omit it and the copied item's reference stays `None`.
+fn copy_item_pairs(
+    query: &KeychainItemQuery<'_>,
+    context: &KeychainAuthContext,
+    backend: KeychainBackend,
+) -> Result<Vec<(CFString, CFType)>, KeychainError> {
+    let mut pairs = base_pairs(query, context, backend)?;
+    pairs.push((
+        security_framework_static!(kSecReturnAttributes, sec_key),
+        CFBoolean::from(true).into_CFType(),
+    ));
+    pairs.push((
+        security_framework_static!(kSecReturnData, sec_key),
+        CFBoolean::from(true).into_CFType(),
+    ));
+    if query.synchronizable != Some(true) {
+        pairs.push((
+            security_framework_static!(kSecReturnPersistentRef, sec_key),
             CFBoolean::from(true).into_CFType(),
-        )),
-        None => {}
+        ));
     }
     Ok(pairs)
 }
@@ -670,10 +710,7 @@ fn classic_migration_pairs(
                 security_framework_static!(kSecUseAuthenticationContext, sec_key),
                 context.as_cf_type(),
             ),
-            (
-                security_framework_static!(kSecUseDataProtectionKeychain, sec_key),
-                CFBoolean::from(false).into_CFType(),
-            ),
+            data_protection_routing(KeychainBackend::Classic),
         ]
     })
 }
@@ -1029,10 +1066,7 @@ fn silent_keychain_roundtrip_probe(backend: KeychainBackend) -> Result<(), Probe
             CFString::from(account.as_str()).into_CFType(),
         ),
     ];
-    pairs.push((
-        security_framework_static!(kSecUseDataProtectionKeychain, sec_key),
-        CFBoolean::from(backend == KeychainBackend::DataProtection).into_CFType(),
-    ));
+    pairs.push(data_protection_routing(backend));
     // A production write always carries a SecAccessControl; probing without
     // one would pass on ad hoc builds that cannot actually persist a
     // protected item (errSecMissingEntitlement) and misreport the store as
@@ -1351,12 +1385,17 @@ mod tests {
                 );
             }
         }
-        // A classic-routed query leaves the data-protection flag unset, and a
-        // query may pin the flag explicitly in either direction.
+        // The routing flag is always explicit — the same pin the probe
+        // uses — so no operation can drift onto a store it was not built
+        // for. A query may pin the store explicitly in either direction.
         let query = KeychainItemQuery::new("synthetic-service", "synthetic-account").unwrap();
         let classic_pairs = base_pairs(&query, &context, KeychainBackend::Classic).unwrap();
         let classic_dict = CFDictionary::from_CFType_pairs(&classic_pairs);
-        assert!(dict_value(&classic_dict, unsafe { kSecUseDataProtectionKeychain }).is_none());
+        assert_eq!(
+            dict_value(&classic_dict, unsafe { kSecUseDataProtectionKeychain })
+                .map(|value| value.as_CFTypeRef()),
+            Some(CFBoolean::from(false).as_CFTypeRef())
+        );
         for forced in [false, true] {
             let forced_query = query.clone().with_data_protection(forced);
             let forced_pairs =
@@ -1701,8 +1740,90 @@ mod tests {
                     Some(flag) => writable.with_synchronizable(flag),
                     None => writable,
                 };
-                assert!(ensure_write_supported(&writable).is_ok());
+                // An unset or explicit-false flag keeps the write path
+                // open on the store that can take the access control.
+                assert!(ensure_write_supported(&writable, KeychainBackend::DataProtection).is_ok());
             }
+        }
+    }
+
+    #[test]
+    fn classic_writes_refuse_before_any_secitem_call() {
+        // Explicit classic routing strips `kSecAttrAccessControl` — the
+        // only protection this backend writes — so a classic-routed write
+        // is refused before any SecItem call rather than persisted
+        // unprotected. The effective store is what decides, not the
+        // handle: a forced-classic query refuses on a Data Protection
+        // handle too.
+        let context = synthetic_context();
+        let secret = SecretBytes::try_from_bytes(vec![0xA5u8; 24]).unwrap();
+        let query = KeychainItemQuery::new("synthetic-service", "synthetic-account").unwrap();
+        let classic = Keychain {
+            backend: KeychainBackend::Classic,
+        };
+        assert_eq!(
+            classic
+                .add_item(&context, &query, &secret)
+                .unwrap_err()
+                .code(),
+            "credential_lease_keychain_classic_write_unsupported"
+        );
+        assert_eq!(
+            classic
+                .set_item(&context, &query, &secret)
+                .unwrap_err()
+                .code(),
+            "credential_lease_keychain_classic_write_unsupported"
+        );
+        let protection = Keychain {
+            backend: KeychainBackend::DataProtection,
+        };
+        let forced = query.clone().with_data_protection(false);
+        assert_eq!(
+            protection
+                .add_item(&context, &forced, &secret)
+                .unwrap_err()
+                .code(),
+            "credential_lease_keychain_classic_write_unsupported"
+        );
+        assert_eq!(
+            protection
+                .set_item(&context, &forced, &secret)
+                .unwrap_err()
+                .code(),
+            "credential_lease_keychain_classic_write_unsupported"
+        );
+    }
+
+    #[test]
+    fn synchronizable_reads_omit_the_persistent_reference_request() {
+        // Apple documents attributes and data as the supported return
+        // types for synchronizable items: the persistent-reference flag is
+        // left out of the read, and the copied item's reference stays
+        // `None`. Ordinary and explicitly non-synchronizable reads keep
+        // requesting it.
+        let context = synthetic_context();
+        let synchronizable = KeychainItemQuery::new("synthetic-service", "synthetic-account")
+            .unwrap()
+            .with_synchronizable(true);
+        for backend in [KeychainBackend::Classic, KeychainBackend::DataProtection] {
+            let pairs = copy_item_pairs(&synchronizable, &context, backend).unwrap();
+            let dict = CFDictionary::from_CFType_pairs(&pairs);
+            assert!(dict_value(&dict, unsafe { kSecReturnPersistentRef }).is_none());
+        }
+        for synchronizable in [None, Some(false)] {
+            let query = KeychainItemQuery::new("synthetic-service", "synthetic-account").unwrap();
+            let query = match synchronizable {
+                Some(flag) => query.with_synchronizable(flag),
+                None => query,
+            };
+            let pairs = copy_item_pairs(&query, &context, KeychainBackend::DataProtection).unwrap();
+            let dict = CFDictionary::from_CFType_pairs(&pairs);
+            assert_eq!(
+                dict_value(&dict, unsafe { kSecReturnPersistentRef })
+                    .map(|value| value.as_CFTypeRef()),
+                Some(CFBoolean::from(true).as_CFTypeRef())
+            );
         }
     }
 

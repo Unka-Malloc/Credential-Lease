@@ -125,6 +125,40 @@ pub(crate) fn whole_seconds_ceiling(duration: Duration) -> Duration {
     )
 }
 
+/// The platform's process-shared monotonic clock in whole seconds — the
+/// deadline domain a same-host handoff can be rebuilt against. Where the
+/// platform offers no comparable clock there is no same-host anchor:
+/// producers omit the monotonic deadline, and a rebuild refuses a
+/// document whose deadline it cannot compare.
+#[cfg(unix)]
+pub(crate) fn monotonic_now_seconds() -> Option<u64> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `time` is a valid initialized out-pointer for a valid clock
+    // id, and the same clock `Instant` is built on.
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
+    if status != 0 {
+        return None;
+    }
+    u64::try_from(time.tv_sec).ok()
+}
+
+/// Non-Unix platforms expose no process-shared monotonic clock through
+/// this crate: no deadline can be stamped or compared there.
+#[cfg(not(unix))]
+pub(crate) fn monotonic_now_seconds() -> Option<u64> {
+    None
+}
+
+/// The monotonic deadline a fresh grant stamps: the grant's expiry on the
+/// platform's shared monotonic clock, floored to whole seconds like the
+/// wall-clock deadline — `None` where no such clock exists.
+pub(crate) fn monotonic_deadline_seconds(lease_duration: Duration) -> Option<u64> {
+    monotonic_now_seconds().map(|now| now.saturating_add(lease_duration.as_secs()))
+}
+
 /// A portable projection of unlocked credentials for one kind family.
 pub struct CredentialHandoff<K: CredentialKind> {
     credentials: BTreeMap<K, Vec<LeasedCredential>>,
@@ -132,6 +166,7 @@ pub struct CredentialHandoff<K: CredentialKind> {
     epoch: String,
     egress: EgressScope,
     lease_expires_at_epoch_seconds: u64,
+    lease_monotonic_deadline_seconds: Option<u64>,
 }
 
 impl<K: CredentialKind> CredentialHandoff<K> {
@@ -185,6 +220,17 @@ impl<K: CredentialKind> CredentialHandoff<K> {
         self.lease_expires_at_epoch_seconds
     }
 
+    /// The grant's expiry on the producing host's shared monotonic clock,
+    /// in whole seconds — meaningful only between processes that share
+    /// that clock domain, which is exactly the same-host handoff channel.
+    /// `None` when the producer had no comparable monotonic clock to
+    /// stamp; a rebuild that can compare one refuses a document without
+    /// it, since clock continuity cannot be established.
+    pub fn lease_monotonic_deadline_seconds(&self) -> Option<u64> {
+        self.lease_monotonic_deadline_seconds
+    }
+
+    #[allow(clippy::type_complexity)]
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -193,6 +239,7 @@ impl<K: CredentialKind> CredentialHandoff<K> {
         String,
         EgressScope,
         u64,
+        Option<u64>,
     ) {
         (
             self.credentials,
@@ -200,6 +247,7 @@ impl<K: CredentialKind> CredentialHandoff<K> {
             self.epoch,
             self.egress,
             self.lease_expires_at_epoch_seconds,
+            self.lease_monotonic_deadline_seconds,
         )
     }
 
@@ -216,12 +264,14 @@ impl<K: CredentialKind> CredentialHandoff<K> {
     ) -> Result<Self> {
         ensure_lease_duration_bounds(lease_duration)?;
         let lease_expires_at_epoch_seconds = lease_deadline_epoch_seconds(lease_duration)?;
+        let lease_monotonic_deadline_seconds = monotonic_deadline_seconds(lease_duration);
         Self::with_deadline(
             credentials,
             lease_duration,
             epoch,
             egress,
             lease_expires_at_epoch_seconds,
+            lease_monotonic_deadline_seconds,
         )
     }
 
@@ -229,12 +279,15 @@ impl<K: CredentialKind> CredentialHandoff<K> {
     /// a projection's preserved deadline or one parsed from a document.
     /// The deadline is validated like every other field but not re-derived:
     /// it is the value the grant ends at, wherever this handoff is rebuilt.
+    /// The monotonic deadline is the same bound in the producing host's
+    /// shared monotonic clock domain — `None` where no such clock exists.
     pub(crate) fn with_deadline(
         credentials: BTreeMap<K, Vec<LeasedCredential>>,
         lease_duration: Duration,
         epoch: String,
         egress: EgressScope,
         lease_expires_at_epoch_seconds: u64,
+        lease_monotonic_deadline_seconds: Option<u64>,
     ) -> Result<Self> {
         ensure!(
             uuid::Uuid::parse_str(&epoch).is_ok_and(|value| value.to_string() == epoch),
@@ -253,6 +306,10 @@ impl<K: CredentialKind> CredentialHandoff<K> {
             lease_expires_at_epoch_seconds > 0,
             "credential_lease_expiry_invalid"
         );
+        ensure!(
+            lease_monotonic_deadline_seconds.is_none_or(|deadline| deadline > 0),
+            "credential_lease_expiry_invalid"
+        );
         validate_credentials(&credentials, "credential_lease_inventory_invalid")?;
         Ok(Self {
             credentials,
@@ -260,6 +317,7 @@ impl<K: CredentialKind> CredentialHandoff<K> {
             epoch,
             egress,
             lease_expires_at_epoch_seconds,
+            lease_monotonic_deadline_seconds,
         })
     }
 
@@ -287,6 +345,10 @@ impl<K: CredentialKind> CredentialHandoff<K> {
         document.push_str(&self.lease_duration.as_secs().to_string());
         document.push_str(",\"leaseExpiresAtEpochSeconds\":");
         document.push_str(&self.lease_expires_at_epoch_seconds.to_string());
+        if let Some(deadline) = self.lease_monotonic_deadline_seconds {
+            document.push_str(",\"leaseMonotonicDeadlineSeconds\":");
+            document.push_str(&deadline.to_string());
+        }
         document.push_str(",\"epoch\":");
         push_json_string(&mut document, &self.epoch);
         document.push_str(",\"egress\":");
@@ -335,10 +397,13 @@ impl<K: CredentialKind> CredentialHandoff<K> {
     /// the document string never re-allocates while secrets are being
     /// written into it — escaping cannot exceed the reserve.
     pub(crate) fn serialized_len_upper_bound(&self) -> usize {
+        // The 56-byte term covers the optional monotonic deadline member
+        // (`,"leaseMonotonicDeadlineSeconds":` plus a full u64 value).
         let mut length = 144
             + escaped_len(K::HANDOFF_SCHEMA)
             + escaped_len(&self.epoch)
             + 20
+            + 56
             + self.egress.serialized_len_upper_bound();
         for (kind, keys) in &self.credentials {
             length += 32 + escaped_len(kind.as_str());
@@ -380,6 +445,7 @@ impl<K: CredentialKind> CredentialHandoff<K> {
             wire.epoch,
             wire.egress,
             wire.lease_expires_at_epoch_seconds,
+            wire.lease_monotonic_deadline_seconds,
         )
         .map_err(|_| invalid())
     }
@@ -488,6 +554,7 @@ pub(crate) fn push_json_string(buffer: &mut String, value: &str) {
 struct WireDocument<K: CredentialKind> {
     lease_duration_seconds: u64,
     lease_expires_at_epoch_seconds: u64,
+    lease_monotonic_deadline_seconds: Option<u64>,
     epoch: String,
     egress: EgressScope,
     credentials: BTreeMap<K, Vec<LeasedCredential>>,
@@ -531,7 +598,8 @@ fn missing_member<E: DeError>() -> E {
 
 /// The document's closed object shape: exactly `schemaVersion`,
 /// `leaseDurationSeconds`, `leaseExpiresAtEpochSeconds`, `epoch`, and
-/// `credentials`, plus the optional `egress` scope — in any order, each
+/// `credentials`, plus the optional `egress` scope and
+/// `leaseMonotonicDeadlineSeconds` same-host anchor — in any order, each
 /// at most once.
 struct DocumentVisitor<K: CredentialKind> {
     inventory: WireInventory<K>,
@@ -548,6 +616,7 @@ impl<'de, K: CredentialKind> Visitor<'de> for DocumentVisitor<K> {
         let mut schema_version_seen = false;
         let mut lease_duration_seconds: Option<u64> = None;
         let mut lease_expires_at_epoch_seconds: Option<u64> = None;
+        let mut lease_monotonic_deadline_seconds: Option<u64> = None;
         let mut epoch: Option<String> = None;
         let mut egress: Option<EgressScope> = None;
         let mut credentials_seen = false;
@@ -575,6 +644,12 @@ impl<'de, K: CredentialKind> Visitor<'de> for DocumentVisitor<K> {
                         return Err(duplicate_member());
                     }
                     lease_expires_at_epoch_seconds = Some(access.next_value::<u64>()?);
+                }
+                "leaseMonotonicDeadlineSeconds" => {
+                    if lease_monotonic_deadline_seconds.is_some() {
+                        return Err(duplicate_member());
+                    }
+                    lease_monotonic_deadline_seconds = Some(access.next_value::<u64>()?);
                 }
                 "epoch" => {
                     if epoch.is_some() {
@@ -607,6 +682,7 @@ impl<'de, K: CredentialKind> Visitor<'de> for DocumentVisitor<K> {
             lease_duration_seconds: lease_duration_seconds.ok_or_else(missing_member)?,
             lease_expires_at_epoch_seconds: lease_expires_at_epoch_seconds
                 .ok_or_else(missing_member)?,
+            lease_monotonic_deadline_seconds,
             epoch: epoch.ok_or_else(missing_member)?,
             egress: egress.unwrap_or_else(EgressScope::deny_all),
             credentials: inventory.credentials,

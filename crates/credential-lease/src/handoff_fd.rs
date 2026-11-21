@@ -65,9 +65,10 @@ static HANDOFF_CHANNEL_CLAIMED: AtomicBool = AtomicBool::new(false);
 ///
 /// The parsed number stays a plain [`RawFd`] until the platform proves it
 /// names an open descriptor; only then is it claimed as an [`OwnedFd`].
-/// Ownership itself is the spawn contract — the host must grant this
-/// process exclusive ownership of the descriptor the variable names, the
-/// same transfer [`receive_handoff`] requires of a direct caller.
+/// `F_GETFD` proves the number is open — never who owns it — so claiming
+/// it is the caller's contract to assert, which is why intake is `unsafe`:
+/// a host that resolved the descriptor itself transfers an [`OwnedFd`]
+/// through [`receive_handoff`], the safe entry point.
 ///
 /// Intake consumes the channel but never removes the variable, so a
 /// process that took its handoff still carries the now-stale number.
@@ -77,7 +78,17 @@ static HANDOFF_CHANNEL_CLAIMED: AtomicBool = AtomicBool::new(false);
 /// [`HANDOFF_FD_ENV`] from the child's environment rather than letting
 /// the inherited value through, where a fresh latch could read a closed
 /// number or a descriptor the OS reassigned to something unrelated.
-pub fn receive_handoff_from_env<K: CredentialKind>() -> Result<Option<CredentialHandoff<K>>> {
+///
+/// # Safety
+///
+/// The caller asserts the spawn contract: the descriptor number the
+/// variable names is exclusively owned by this process — granted to it by
+/// the spawning host, aliased by no other component — and may be claimed,
+/// read, and closed by this call. A number another component still owns
+/// is a contract violation the `F_GETFD` probe cannot detect: closing
+/// under it a descriptor someone else keeps would corrupt their channel.
+pub unsafe fn receive_handoff_from_env<K: CredentialKind>() -> Result<Option<CredentialHandoff<K>>>
+{
     let Some(value) = std::env::var_os(HANDOFF_FD_ENV) else {
         return Ok(None);
     };

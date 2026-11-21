@@ -420,7 +420,9 @@ fn fd_handoff_child_entry() {
                 -1,
                 "the handoff descriptor must be a one-way read end"
             );
-            let handoff = receive_handoff_from_env::<Kind>()
+            // SAFETY: the parent's spawn granted this process exclusive
+            // ownership of the descriptor the variable names.
+            let handoff = unsafe { receive_handoff_from_env::<Kind>() }
                 .expect("receiving the handoff")
                 .expect("the descriptor is named");
             // SAFETY: fd 3 was owned by `receive_handoff` and must be closed.
@@ -432,8 +434,10 @@ fn fd_handoff_child_entry() {
             // Intake is one-time: the channel was claimed, so a second
             // call sees it as absent and can never re-close a
             // descriptor number the OS may have reassigned.
+            // SAFETY: the first call already claimed the channel; this
+            // call can only observe the latch, never own a descriptor.
             assert!(
-                receive_handoff_from_env::<Kind>()
+                unsafe { receive_handoff_from_env::<Kind>() }
                     .expect("the second intake")
                     .is_none(),
                 "a claimed handoff channel must read as absent"
@@ -452,22 +456,34 @@ fn fd_handoff_child_entry() {
             write_report(&frame);
         }
         "invalid-fd" => {
-            let error = receive_handoff_from_env::<Kind>().expect_err("descriptor refused");
+            // SAFETY: the malformed number is refused by parsing before
+            // any ownership claim, so no contract assertion is needed.
+            let error =
+                unsafe { receive_handoff_from_env::<Kind>() }.expect_err("descriptor refused");
             refuse("credential_lease_handoff_fd_invalid", error);
         }
         "unavailable-fd" => {
-            let error = receive_handoff_from_env::<Kind>().expect_err("descriptor refused");
+            // SAFETY: the closed number is refused by the open probe
+            // before any ownership claim, so no contract assertion is
+            // needed.
+            let error =
+                unsafe { receive_handoff_from_env::<Kind>() }.expect_err("descriptor refused");
             refuse("credential_lease_handoff_fd_unavailable", error);
         }
         "invalid-document" => {
-            let error = receive_handoff_from_env::<Kind>().expect_err("document refused");
+            // SAFETY: the parent's spawn granted this process exclusive
+            // ownership of the descriptor the variable names.
+            let error =
+                unsafe { receive_handoff_from_env::<Kind>() }.expect_err("document refused");
             refuse("credential_lease_handoff_invalid", error);
         }
         "descendant" => {
             // Consume the granted descriptor like the valid path; the
             // variable then stays in this process's environment, carrying
             // the stale number.
-            let handoff = receive_handoff_from_env::<Kind>()
+            // SAFETY: the parent's spawn granted this process exclusive
+            // ownership of the descriptor the variable names.
+            let handoff = unsafe { receive_handoff_from_env::<Kind>() }
                 .expect("receiving the handoff")
                 .expect("the descriptor is named");
             drop(handoff);
@@ -505,7 +521,10 @@ fn fd_handoff_child_entry() {
             // number refuses the channel; a reassigned number reads an
             // unrelated stream and refuses the document. It must never
             // produce a handoff.
-            match receive_handoff_from_env::<Kind>() {
+            // SAFETY: the ownership contract is exactly what this call
+            // exercises — a number never granted to this process. The
+            // probe and the closed schema still fail it closed.
+            match unsafe { receive_handoff_from_env::<Kind>() } {
                 Ok(Some(_)) => println!("INTAKE handoff"),
                 Ok(None) => println!("INTAKE absent"),
                 Err(error) if error.to_string() == "credential_lease_handoff_invalid" => {

@@ -415,7 +415,7 @@ function validate(document: Json): number {
       "epoch",
       "credentials",
     ],
-    ["egress"],
+    ["egress", "leaseMonotonicDeadlineSeconds"],
   );
   const schema = top["schemaVersion"];
   if (
@@ -432,6 +432,15 @@ function validate(document: Json): number {
   const deadline = unsigned(top["leaseExpiresAtEpochSeconds"]);
   if (deadline === undefined || deadline === 0n) {
     throw new Rejected();
+  }
+  // The same-host monotonic deadline is optional on the wire — absent
+  // where the producing platform had no comparable clock — but when it
+  // is carried it follows the same unsigned-above-zero rule.
+  if (top["leaseMonotonicDeadlineSeconds"] !== undefined) {
+    const monotonic = unsigned(top["leaseMonotonicDeadlineSeconds"]);
+    if (monotonic === undefined || monotonic === 0n) {
+      throw new Rejected();
+    }
   }
   if (top["egress"] !== undefined) {
     validateEgress(top["egress"]);

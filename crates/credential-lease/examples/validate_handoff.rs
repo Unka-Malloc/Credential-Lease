@@ -35,7 +35,10 @@ impl CredentialKind for SampleKind {
 
 #[cfg(unix)]
 fn main() -> ExitCode {
-    match receive_handoff_from_env::<SampleKind>() {
+    // SAFETY: the spawn contract grants this process exclusive ownership
+    // of the descriptor the variable names — it is the granted channel,
+    // aliased by no other component.
+    match unsafe { receive_handoff_from_env::<SampleKind>() } {
         Ok(Some(handoff)) => {
             println!("valid kinds={}", handoff.kinds().count());
             ExitCode::SUCCESS

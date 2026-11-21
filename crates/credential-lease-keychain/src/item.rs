@@ -27,11 +27,12 @@ pub enum AddItemOutcome {
 /// Identity and storage attributes of one protected item.
 ///
 /// `use_data_protection` selects which Keychain the query routes to:
-/// `None` follows the [`Keychain`](crate::Keychain)'s probed backend —
-/// explicit `true` on Data Protection, an unset flag on Classic — while
-/// `Some` forces the routing flag outright. Hosts that always target the
-/// Data Protection Keychain pass `Some(true)`; only the legacy migration
-/// path forces `Some(false)`.
+/// `None` follows the [`Keychain`](crate::Keychain)'s probed backend,
+/// while `Some` forces the routing outright. The emitted routing flag is
+/// always explicit — `true` on Data Protection, `false` on Classic — so
+/// no operation can drift onto a store it was not built for. Hosts that
+/// always target the Data Protection Keychain pass `Some(true)`; only
+/// the legacy migration path forces `Some(false)`.
 #[derive(Clone, Debug)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct KeychainItemQuery<'a> {
@@ -190,7 +191,9 @@ impl KeychainItem {
     }
 
     /// The item's persistent reference, when the platform returned one.
-    /// Whether it is required is the host's provenance decision.
+    /// A synchronizable item never carries one — the platform serves it
+    /// only as attributes and data — so it is always `None` there.
+    /// Whether a reference is required is the host's provenance decision.
     pub fn persistent_reference(&self) -> Option<&[u8]> {
         self.persistent_reference.as_deref()
     }

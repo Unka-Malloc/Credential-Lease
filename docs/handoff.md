@@ -23,6 +23,7 @@ codes, and the executable Rust, Go, and TypeScript signature samples.
   "schemaVersion": "<family schema>",
   "leaseDurationSeconds": 3600,
   "leaseExpiresAtEpochSeconds": 1780003600,
+  "leaseMonotonicDeadlineSeconds": 10450,
   "epoch": "11111111-1111-4111-8111-111111111111",
   "egress": {
     "hosts": ["api.example.com", "*.example.org"],
@@ -58,6 +59,7 @@ Closed set — any additional or missing field rejects the document.
 | `schemaVersion` | string | Must equal the family schema constant pinned by the kind family. A document minted under one family's schema must never parse as another family. |
 | `leaseDurationSeconds` | unsigned integer | `1..=31622400` (366 days). The upper bound of the runtime lease minted from this handoff. For a lease projection this is the grant's remaining time, not the original duration. The wire has no fractional seconds: a live remainder maps up to the next whole second, and `leaseExpiresAtEpochSeconds` still caps the rebuild so rounding up cannot extend the grant. |
 | `leaseExpiresAtEpochSeconds` | unsigned integer | `> 0`. The deadline the grant ends at. A fresh owner grant stamps `now + leaseDurationSeconds` floored to whole seconds; a projection stamps the earlier of the deadline it received and its own lease expiry projected onto the wall clock. A rebuilt lease expires at the earlier of `leaseDurationSeconds` and this deadline, so chained projections can never extend the grant — only a fresh owner grant can. |
+| `leaseMonotonicDeadlineSeconds` | unsigned integer | Optional; `> 0` when present. The same deadline expressed on the producing host's process-shared monotonic clock (Unix `CLOCK_MONOTONIC`), comparable only between processes on the same host. A producer stamps it when its platform exposes that clock and omits it where no such clock exists. A rebuild that can compare the clock requires the member and expires at the earliest of the wire duration, the wall deadline, and this deadline — a wall-clock rollback between projection and rebuild therefore cannot inflate the grant. A rebuild that cannot compare the clock refuses a document carrying the member, and a rebuild that can refuses one omitting it: clock continuity cannot be established either way. |
 | `epoch` | string | Canonical lowercase UUID; identifies the custody epoch this handoff was minted under. |
 | `egress` | object | Optional. The egress scope below; absent declares the deny-all scope — no outbound target is admitted. |
 | `credentials` | array | Entries below; may be empty when a disconnected projection is serialized. |
@@ -142,7 +144,15 @@ exit. Three independent checks apply on every credential use:
    credentials.
 2. The lease's own duration — an `Instant`-relative upper bound minted at
    rebuild time, capped by the document's `leaseExpiresAtEpochSeconds`
-   deadline so the rebuilt lease cannot outlive the original grant.
+   deadline so the rebuilt lease cannot outlive the original grant. Where
+   the document carries `leaseMonotonicDeadlineSeconds`, the rebuild is
+   capped by that deadline on the same monotonic clock as well: the wall
+   clock plays no part in the comparison, so a backward wall-clock step
+   between projection and rebuild cannot stretch the grant. A platform
+   that can compare the clock refuses a document that omits the member,
+   and one that cannot refuses a document that carries it — the rebuild
+   fails closed with `credential_lease_expiry_invalid` whenever clock
+   continuity cannot be established.
 3. The custody epoch — the runtime's epoch source is consulted on every
    resolution and must still report the handoff's epoch. An
    owner-initiated revocation rotates the epoch and kills every
@@ -161,7 +171,8 @@ The contract's runtime refusals are stable codes:
 | Refusal | Meaning |
 | --- | --- |
 | `credential_lease_unavailable` | No credential of the requested kind is currently resolvable. |
-| `credential_lease_expired` | The lease's own duration has elapsed. |
+| `credential_lease_expired` | The lease's own duration has elapsed — checked both before and after the epoch consultation, so a slow epoch lookup can never release an expired grant. |
+| `credential_lease_expiry_invalid` | The grant's deadline shape is malformed or its clock continuity cannot be established: a deadline at or before the epoch, a deadline of zero, or a monotonic deadline the rebuild cannot compare or must require but is absent. |
 | `credential_lease_revoked` | The active epoch is absent or no longer matches the lease's epoch. |
 | `credential_lease_process_mismatch` | The lease object is being used from a process other than the one that minted it. |
 

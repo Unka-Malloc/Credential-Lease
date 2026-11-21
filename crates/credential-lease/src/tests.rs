@@ -139,6 +139,21 @@ impl LeaseEpochSource for FailingEpochSource {
     }
 }
 
+/// An epoch source that answers only after a delay — long enough that a
+/// nearly-expired lease crosses its deadline while the lookup is in
+/// flight.
+struct SlowEpochSource {
+    epoch: String,
+    delay: Duration,
+}
+
+impl LeaseEpochSource for SlowEpochSource {
+    fn active_epoch(&self) -> Result<Option<String>> {
+        std::thread::sleep(self.delay);
+        Ok(Some(self.epoch.clone()))
+    }
+}
+
 fn test_credential(material: u8) -> LeasedCredential {
     LeasedCredential::new(
         uuid::Uuid::new_v4().to_string(),
@@ -286,6 +301,7 @@ fn lease_bound_to_another_process_fails_closed_on_every_secret_use() {
         foreign_process,
         Instant::now() + Duration::from_secs(3600),
         u64::MAX,
+        crate::handoff::monotonic_deadline_seconds(Duration::from_secs(3600)),
     )
     .unwrap();
 
@@ -294,6 +310,14 @@ fn lease_bound_to_another_process_fails_closed_on_every_secret_use() {
     // fails closed.
     assert_eq!(
         lease.resolve(TestKind::Beta).unwrap_err().to_string(),
+        "credential_lease_process_mismatch"
+    );
+    // A kind the lease does not carry refuses as a boundary violation
+    // first — the process check precedes the inventory lookup, so a
+    // missing kind can never masquerade as the ordinary `auth_expired`
+    // renewal signal a misdirected retry would trigger.
+    assert_eq!(
+        lease.resolve(TestKind::Alpha).unwrap_err().to_string(),
         "credential_lease_process_mismatch"
     );
     assert_eq!(
@@ -344,6 +368,7 @@ fn expired_lease_fails_closed_before_touching_the_epoch() {
         std::process::id(),
         Instant::now() - Duration::from_secs(1),
         u64::MAX,
+        crate::handoff::monotonic_deadline_seconds(Duration::from_secs(3600)),
     )
     .unwrap();
 
@@ -368,6 +393,41 @@ fn expired_lease_fails_closed_before_touching_the_epoch() {
     assert!(!slot.connected());
     assert_eq!(
         slot.resolve(TestKind::Beta).unwrap_err().to_string(),
+        "credential_lease_expired"
+    );
+}
+
+#[test]
+fn a_slow_epoch_lookup_never_releases_an_expired_credential() {
+    // The lease is still live when the epoch consultation starts, but the
+    // answer arrives after the expiry passes: resolution must refuse as
+    // expired, not release credentials the matching epoch just vouched
+    // for. The expiry check therefore runs again after the epoch answers.
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let mut credentials = BTreeMap::new();
+    credentials.insert(TestKind::Beta, vec![test_credential(0xC6)]);
+    let lease = CredentialLease::new_with_binding_for_test(
+        credentials,
+        Duration::from_secs(3600),
+        epoch.clone(),
+        Arc::new(SlowEpochSource {
+            epoch,
+            delay: Duration::from_millis(150),
+        }),
+        EgressScope::deny_all(),
+        std::process::id(),
+        Instant::now() + Duration::from_millis(30),
+        u64::MAX,
+        crate::handoff::monotonic_deadline_seconds(Duration::from_secs(3600)),
+    )
+    .unwrap();
+    assert_eq!(
+        lease.resolve(TestKind::Beta).unwrap_err().to_string(),
+        "credential_lease_expired"
+    );
+    // The same holds for a projection minted through the same gate.
+    assert_eq!(
+        lease.handoff_projection().unwrap_err().to_string(),
         "credential_lease_expired"
     );
 }
@@ -579,14 +639,19 @@ fn rebuilt_lease_never_outlives_the_documents_deadline() {
         .unwrap()
         .as_secs()
         + 2;
-    let document = serde_json::to_vec(&serde_json::json!({
+    let mut document = serde_json::json!({
         "schemaVersion": TestKind::HANDOFF_SCHEMA,
         "leaseDurationSeconds": 3600,
         "leaseExpiresAtEpochSeconds": deadline,
         "epoch": epoch,
         "credentials": [{"kind": "alpha", "keys": [handoff_key(serde_json::json!([1, 2, 3]))]}],
-    }))
-    .unwrap();
+    });
+    // Where the platform can compare a same-host monotonic deadline, the
+    // document must carry one for a rebuild to be possible at all.
+    if let Some(now) = crate::handoff::monotonic_now_seconds() {
+        document["leaseMonotonicDeadlineSeconds"] = serde_json::json!(now + 2);
+    }
+    let document = serde_json::to_vec(&document).unwrap();
     let handoff = CredentialHandoff::<TestKind>::from_json(&document).unwrap();
     let rebuilt = CredentialLease::from_handoff(
         handoff,
@@ -612,14 +677,17 @@ fn rebuilt_lease_never_outlives_the_documents_deadline() {
         .as_secs()
         - 1;
     let epoch = uuid::Uuid::new_v4().to_string();
-    let document = serde_json::to_vec(&serde_json::json!({
+    let mut document = serde_json::json!({
         "schemaVersion": TestKind::HANDOFF_SCHEMA,
         "leaseDurationSeconds": 3600,
         "leaseExpiresAtEpochSeconds": past,
         "epoch": epoch,
         "credentials": [{"kind": "alpha", "keys": [handoff_key(serde_json::json!([1, 2, 3]))]}],
-    }))
-    .unwrap();
+    });
+    if let Some(now) = crate::handoff::monotonic_now_seconds() {
+        document["leaseMonotonicDeadlineSeconds"] = serde_json::json!(now + 3600);
+    }
+    let document = serde_json::to_vec(&document).unwrap();
     let handoff = CredentialHandoff::<TestKind>::from_json(&document).unwrap();
     let dead = CredentialLease::from_handoff(
         handoff,
@@ -707,6 +775,7 @@ fn live_subsecond_remainder_projects_as_a_whole_second() {
         std::process::id(),
         Instant::now() + Duration::from_millis(500),
         deadline,
+        crate::handoff::monotonic_deadline_seconds(Duration::from_secs(3600)),
     )
     .unwrap();
     let projected = lease.handoff_projection().unwrap();
@@ -733,6 +802,97 @@ fn live_subsecond_remainder_projects_as_a_whole_second() {
         }
         Err(error) => assert_eq!(error.to_string(), "credential_lease_expired"),
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn rebuild_requires_the_same_host_monotonic_deadline() {
+    // A document without the monotonic anchor cannot prove clock
+    // continuity: a backward wall-clock step between projection and
+    // rebuild would inflate the deadline remainder and let the restarted
+    // duration outlive the grant — so a rebuild that can compare the
+    // anchor refuses a document that omits it.
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let wall_deadline = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let mut document = serde_json::json!({
+        "schemaVersion": TestKind::HANDOFF_SCHEMA,
+        "leaseDurationSeconds": 3600,
+        "leaseExpiresAtEpochSeconds": wall_deadline,
+        "epoch": epoch,
+        "credentials": [{"kind": "alpha", "keys": [handoff_key(serde_json::json!([1, 2, 3]))]}],
+    });
+    // The member is optional in the wire shape — a document parses either
+    // way — but the rebuild refuses where clock continuity cannot be
+    // established.
+    let handoff =
+        CredentialHandoff::<TestKind>::from_json(&serde_json::to_vec(&document).unwrap()).unwrap();
+    assert_eq!(
+        CredentialLease::from_handoff(
+            handoff,
+            Arc::new(TestEpochSource(StdMutex::new(Some(epoch.clone())))),
+        )
+        .unwrap_err()
+        .to_string(),
+        "credential_lease_expiry_invalid"
+    );
+    // Carried, the same-host deadline caps the rebuild on its own clock —
+    // a domain wall-clock rollback cannot deceive. Two monotonic seconds
+    // out lets the rebuild live at most that long, however far the wire
+    // duration and the wall deadline stretch.
+    let monotonic_now = crate::handoff::monotonic_now_seconds().unwrap();
+    document["leaseMonotonicDeadlineSeconds"] = serde_json::json!(monotonic_now + 2);
+    let handoff =
+        CredentialHandoff::<TestKind>::from_json(&serde_json::to_vec(&document).unwrap()).unwrap();
+    let rebuilt = CredentialLease::from_handoff(
+        handoff,
+        Arc::new(TestEpochSource(StdMutex::new(Some(epoch)))),
+    )
+    .unwrap();
+    match rebuilt.handoff_projection() {
+        Ok(projected) => {
+            assert!(projected.lease_duration() <= Duration::from_secs(2));
+            assert!(projected.lease_expires_at_epoch_seconds() <= wall_deadline);
+        }
+        Err(error) => assert_eq!(error.to_string(), "credential_lease_expired"),
+    }
+    // A malformed anchor refuses at parse like every other deadline.
+    for bad in [
+        serde_json::json!(0),
+        serde_json::json!(null),
+        serde_json::json!(-1),
+        serde_json::json!(1.5),
+        serde_json::json!("soon"),
+    ] {
+        let mut bad_document = document.clone();
+        bad_document["leaseMonotonicDeadlineSeconds"] = bad;
+        assert_handoff_invalid(&serde_json::to_vec(&bad_document).unwrap());
+    }
+    // And a projected document carries the anchor end to end — stamped,
+    // serialized, parsed, enforced.
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let source = Arc::new(TestEpochSource(StdMutex::new(Some(epoch.clone()))));
+    let lease = CredentialLease::new(
+        handoff_test_credentials(),
+        Duration::from_secs(3600),
+        epoch.clone(),
+        source,
+        EgressScope::deny_all(),
+    )
+    .unwrap();
+    let projected = lease.handoff_projection().unwrap();
+    assert!(projected.lease_monotonic_deadline_seconds().is_some());
+    let document = projected.to_json().unwrap();
+    let reparsed = CredentialHandoff::<TestKind>::from_json(document.expose_bytes()).unwrap();
+    assert!(reparsed.lease_monotonic_deadline_seconds().is_some());
+    CredentialLease::from_handoff(
+        reparsed,
+        Arc::new(TestEpochSource(StdMutex::new(Some(epoch)))),
+    )
+    .unwrap();
 }
 
 #[test]
