@@ -1,5 +1,7 @@
 use super::*;
-use crate::handoff::{CredentialHandoff, MAX_HANDOFF_DOC_BYTES};
+use crate::handoff::{
+    projected_monotonic_deadline_seconds, CredentialHandoff, MAX_HANDOFF_DOC_BYTES,
+};
 use crate::lease::{deadline_remaining, projected_expiry_epoch_seconds};
 use crate::SecretBytes;
 use anyhow::Result;
@@ -648,8 +650,8 @@ fn rebuilt_lease_never_outlives_the_documents_deadline() {
     });
     // Where the platform can compare a same-host monotonic deadline, the
     // document must carry one for a rebuild to be possible at all.
-    if let Some(now) = crate::handoff::monotonic_now_seconds() {
-        document["leaseMonotonicDeadlineSeconds"] = serde_json::json!(now + 2);
+    if let Some(now) = crate::handoff::monotonic_now() {
+        document["leaseMonotonicDeadlineSeconds"] = serde_json::json!(now.as_secs() + 2);
     }
     let document = serde_json::to_vec(&document).unwrap();
     let handoff = CredentialHandoff::<TestKind>::from_json(&document).unwrap();
@@ -684,8 +686,8 @@ fn rebuilt_lease_never_outlives_the_documents_deadline() {
         "epoch": epoch,
         "credentials": [{"kind": "alpha", "keys": [handoff_key(serde_json::json!([1, 2, 3]))]}],
     });
-    if let Some(now) = crate::handoff::monotonic_now_seconds() {
-        document["leaseMonotonicDeadlineSeconds"] = serde_json::json!(now + 3600);
+    if let Some(now) = crate::handoff::monotonic_now() {
+        document["leaseMonotonicDeadlineSeconds"] = serde_json::json!(now.as_secs() + 3600);
     }
     let document = serde_json::to_vec(&document).unwrap();
     let handoff = CredentialHandoff::<TestKind>::from_json(&document).unwrap();
@@ -843,7 +845,7 @@ fn rebuild_requires_the_same_host_monotonic_deadline() {
     // a domain wall-clock rollback cannot deceive. Two monotonic seconds
     // out lets the rebuild live at most that long, however far the wire
     // duration and the wall deadline stretch.
-    let monotonic_now = crate::handoff::monotonic_now_seconds().unwrap();
+    let monotonic_now = crate::handoff::monotonic_now().unwrap().as_secs();
     document["leaseMonotonicDeadlineSeconds"] = serde_json::json!(monotonic_now + 2);
     let handoff =
         CredentialHandoff::<TestKind>::from_json(&serde_json::to_vec(&document).unwrap()).unwrap();
@@ -893,6 +895,183 @@ fn rebuild_requires_the_same_host_monotonic_deadline() {
         Arc::new(TestEpochSource(StdMutex::new(Some(epoch)))),
     )
     .unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn rebuild_keeps_subsecond_precision_against_the_monotonic_deadline() {
+    // The wire deadline is whole seconds but the comparison clock is
+    // not: a rebuild must subtract the monotonic reading at full
+    // precision. Sample a reading deep into a second so the remainder to
+    // the next whole-second deadline is provably under half a second —
+    // a truncated reading would mint nearly a full second instead.
+    let monotonic_deadline = loop {
+        let now = crate::handoff::monotonic_now().unwrap();
+        if now.subsec_nanos() >= 500_000_000 {
+            break now.as_secs() + 1;
+        }
+        std::thread::yield_now();
+    };
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let document = serde_json::json!({
+        "schemaVersion": TestKind::HANDOFF_SCHEMA,
+        "leaseDurationSeconds": 3600,
+        "leaseExpiresAtEpochSeconds": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600,
+        "leaseMonotonicDeadlineSeconds": monotonic_deadline,
+        "epoch": epoch,
+        "credentials": [{"kind": "alpha", "keys": [handoff_key(serde_json::json!([1, 2, 3]))]}],
+    });
+    let handoff =
+        CredentialHandoff::<TestKind>::from_json(&serde_json::to_vec(&document).unwrap()).unwrap();
+    let rebuilt = CredentialLease::from_handoff(
+        handoff,
+        Arc::new(TestEpochSource(StdMutex::new(Some(epoch)))),
+    )
+    .unwrap();
+    // The real remainder — deadline minus the rebuild's clock reading —
+    // is under 500 ms, so the minted expiry must sit inside that sliver;
+    // a floored clock reading would land it almost a second later.
+    let checked_at = Instant::now();
+    let expires_at = rebuilt.expires_at_for_test();
+    assert!(expires_at > checked_at);
+    assert!(expires_at <= checked_at + Duration::from_millis(500));
+}
+
+#[test]
+#[cfg(unix)]
+fn a_lapsed_monotonic_deadline_expires_in_its_own_clock_domain() {
+    // The `Instant` expiry is the mint-time conversion of every limit,
+    // but the shared monotonic deadline is enforced on the clock it was
+    // declared on. Where those clocks diverge — Darwin CLOCK_MONOTONIC
+    // advances across suspend while the uptime clock `Instant` reads
+    // pauses — an `Instant` that has not caught up must never release a
+    // grant whose monotonic deadline already passed. A lapsed monotonic
+    // deadline paired with a long `Instant` lifetime is exactly the
+    // post-wake shape.
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let mut credentials = BTreeMap::new();
+    credentials.insert(TestKind::Beta, vec![test_credential(0xE2)]);
+    let lease = CredentialLease::new_with_binding_for_test(
+        credentials,
+        Duration::from_secs(3600),
+        epoch,
+        // This source would fail if consulted: the domain check precedes
+        // the epoch lookup — and runs again after it — so every use
+        // refuses as expired, never as an epoch error.
+        Arc::new(FailingEpochSource),
+        EgressScope::deny_all(),
+        std::process::id(),
+        Instant::now() + Duration::from_secs(3600),
+        u64::MAX,
+        crate::handoff::monotonic_now().map(|now| now.as_secs()),
+    )
+    .unwrap();
+    assert_eq!(
+        lease.resolve(TestKind::Beta).unwrap_err().to_string(),
+        "credential_lease_expired"
+    );
+    assert_eq!(
+        lease
+            .resolve_candidates(TestKind::Beta)
+            .unwrap_err()
+            .to_string(),
+        "credential_lease_expired"
+    );
+    assert_eq!(
+        lease.handoff_projection().unwrap_err().to_string(),
+        "credential_lease_expired"
+    );
+    let slot = CredentialSlot::new(lease);
+    assert!(!slot.connected());
+    assert_eq!(
+        slot.resolve(TestKind::Beta).unwrap_err().to_string(),
+        "credential_lease_expired"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_projection_never_stamps_beyond_the_leases_monotonic_expiry() {
+    // The shared clock is sampled before the `Instant` remainder, so a
+    // pause while copying credentials can only shrink the stamped
+    // deadline — it can never add a stale remainder to a later reading.
+    // Bound the stamp by the expiry estimated from samples taken before
+    // the call: anything later is time the source lease did not have.
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let source = Arc::new(TestEpochSource(StdMutex::new(Some(epoch.clone()))));
+    let mut credentials = BTreeMap::new();
+    credentials.insert(TestKind::Beta, vec![test_credential(0xD2)]);
+    let monotonic_before = crate::handoff::monotonic_now().unwrap();
+    let instant_before = Instant::now();
+    let expires_at = instant_before + Duration::from_secs(60);
+    // The preserved wire deadline is far looser than the lease's own
+    // expiry: the tighter expiry is the bound the stamp must reflect —
+    // this is exactly the case where a late clock sample could stamp
+    // past the source lease.
+    let lease = CredentialLease::new_with_binding_for_test(
+        credentials,
+        Duration::from_secs(3600),
+        epoch,
+        source,
+        EgressScope::deny_all(),
+        std::process::id(),
+        expires_at,
+        u64::MAX,
+        Some(monotonic_before.as_secs() + 3600),
+    )
+    .unwrap();
+    let stamped = lease
+        .handoff_projection()
+        .unwrap()
+        .lease_monotonic_deadline_seconds()
+        .unwrap();
+    // The stamp is floored from the early shared-clock sample plus the
+    // remainder, so it can sit at most at the estimate of the true
+    // expiry — and strictly under the looser preserved deadline. A
+    // one-second tolerance covers the sampling order between the two
+    // test reads, never the loose bound.
+    let upper = monotonic_before
+        .saturating_add(expires_at - instant_before)
+        .as_secs();
+    assert!(stamped <= upper + 1);
+    assert!(stamped > monotonic_before.as_secs());
+}
+
+#[test]
+fn projected_monotonic_deadline_stays_on_the_early_side_of_a_sample_boundary() {
+    // A shared-clock reading at 200.9s with 100 ms of life left stamps
+    // floor(200.9 + 0.1) = 201: the full-precision pair keeps the
+    // sub-second remainder instead of truncating either side.
+    assert_eq!(
+        projected_monotonic_deadline_seconds(
+            Some(u64::MAX),
+            Some(Duration::new(200, 900_000_000)),
+            Duration::from_millis(100),
+        ),
+        Some(201)
+    );
+    // The preserved wire deadline caps the estimate, and an absent clock
+    // preserves the minted deadline verbatim.
+    assert_eq!(
+        projected_monotonic_deadline_seconds(
+            Some(150),
+            Some(Duration::from_secs(200)),
+            Duration::from_secs(100),
+        ),
+        Some(150)
+    );
+    assert_eq!(
+        projected_monotonic_deadline_seconds(Some(42), None, Duration::from_secs(1)),
+        Some(42)
+    );
+    assert_eq!(
+        projected_monotonic_deadline_seconds(None, None, Duration::from_secs(1)),
+        None
+    );
 }
 
 #[test]

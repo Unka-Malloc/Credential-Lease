@@ -55,10 +55,13 @@ pub enum KeychainBackend {
 
 /// The platform store the process probes and then reuses.
 ///
-/// Construction is only through [`Keychain::selected`]; a value exists only
-/// when the silent round-trip probe proved a protected item can be added,
-/// read back, and deleted. Item operations are macOS-only — see the
-/// `cfg(target_os = "macos")` impl block below.
+/// Construction is only through [`Keychain::selected`]; a value exists
+/// only when the silent round-trip probe proved an item can be added,
+/// read back, and deleted on that store. Item operations are macOS-only —
+/// see the `cfg(target_os = "macos")` impl block below. A handle on the
+/// classic fallback serves reads and deletes only:
+/// [`Self::supports_protected_writes`] reports whether the store can
+/// persist a protected item.
 #[derive(Clone, Copy, Debug)]
 pub struct Keychain {
     backend: KeychainBackend,
@@ -83,12 +86,36 @@ impl Keychain {
         }
     }
 
-    /// Bounded runtime evidence that protected custody is usable: one
-    /// silent synthetic add/read/delete round trip. A definite answer is
-    /// cached for the process lifetime; an undecidable probe is re-asked
-    /// on the next call.
+    /// Bounded runtime evidence that an item store answers this process:
+    /// one silent synthetic add/read/delete round trip. A definite answer
+    /// is cached for the process lifetime; an undecidable probe is
+    /// re-asked on the next call.
+    ///
+    /// The classic fallback counts here — it serves reads, deletes, and
+    /// the legacy migration — but it cannot persist a protected item, so
+    /// a `true` answer is never a claim that writes will succeed. Hosts
+    /// persisting secrets check [`Self::probe_protected_writes`].
     pub fn probe_available() -> bool {
         Self::selected().is_some()
+    }
+
+    /// Whether the selected store can persist a protected item: `true`
+    /// only when the probe selected the Data Protection Keychain — the
+    /// only store that takes the `SecAccessControl` every write carries.
+    /// When the probe fell back to the classic store this reports `false`
+    /// even while [`Self::probe_available`] is `true`: ordinary
+    /// `add_item` and `set_item` calls on a classic-routed store are
+    /// refused before any SecItem call, so reporting the fallback as
+    /// writable would claim a protection the store can never enforce.
+    pub fn probe_protected_writes() -> bool {
+        Self::selected().is_some_and(|keychain| keychain.supports_protected_writes())
+    }
+
+    /// Whether this handle's store can persist a protected item — `true`
+    /// only on the Data Protection Keychain. A classic handle serves
+    /// reads, deletes, and the legacy migration but refuses every write.
+    pub fn supports_protected_writes(&self) -> bool {
+        self.backend == KeychainBackend::DataProtection
     }
 
     /// Which concrete store this `Keychain` dispatches to.

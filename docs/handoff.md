@@ -148,11 +148,17 @@ exit. Three independent checks apply on every credential use:
    the document carries `leaseMonotonicDeadlineSeconds`, the rebuild is
    capped by that deadline on the same monotonic clock as well: the wall
    clock plays no part in the comparison, so a backward wall-clock step
-   between projection and rebuild cannot stretch the grant. A platform
-   that can compare the clock refuses a document that omits the member,
-   and one that cannot refuses a document that carries it — the rebuild
-   fails closed with `credential_lease_expiry_invalid` whenever clock
-   continuity cannot be established.
+   between projection and rebuild cannot stretch the grant. The
+   monotonic deadline is then enforced in its own clock domain on every
+   credential use — before and after the epoch consultation — not only
+   at rebuild time, because the process-local `Instant` and the shared
+   monotonic clock can diverge (on Darwin `CLOCK_MONOTONIC` advances
+   across suspend while the uptime clock `Instant` reads pauses): a
+   lease must still refuse once its shared deadline passed during sleep.
+   A platform that can compare the clock refuses a document that omits
+   the member, and one that cannot refuses a document that carries it —
+   the rebuild fails closed with `credential_lease_expiry_invalid`
+   whenever clock continuity cannot be established.
 3. The custody epoch — the runtime's epoch source is consulted on every
    resolution and must still report the handoff's epoch. An
    owner-initiated revocation rotates the epoch and kills every

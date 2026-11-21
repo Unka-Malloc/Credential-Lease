@@ -125,13 +125,19 @@ pub(crate) fn whole_seconds_ceiling(duration: Duration) -> Duration {
     )
 }
 
-/// The platform's process-shared monotonic clock in whole seconds — the
+/// The platform's process-shared monotonic clock at full precision — the
 /// deadline domain a same-host handoff can be rebuilt against. Where the
 /// platform offers no comparable clock there is no same-host anchor:
 /// producers omit the monotonic deadline, and a rebuild refuses a
 /// document whose deadline it cannot compare.
+///
+/// The nanosecond part is preserved deliberately: a rebuild subtracts
+/// this reading from the whole-second wire deadline, and a truncated
+/// reading would inflate the remainder by up to nearly a full second —
+/// at monotonic time 200.9 a deadline of 201 leaves 100 ms, not the
+/// whole second a floored reading would grant.
 #[cfg(unix)]
-pub(crate) fn monotonic_now_seconds() -> Option<u64> {
+pub(crate) fn monotonic_now() -> Option<Duration> {
     let mut time = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -142,13 +148,16 @@ pub(crate) fn monotonic_now_seconds() -> Option<u64> {
     if status != 0 {
         return None;
     }
-    u64::try_from(time.tv_sec).ok()
+    Some(Duration::new(
+        u64::try_from(time.tv_sec).ok()?,
+        u32::try_from(time.tv_nsec).ok()?,
+    ))
 }
 
 /// Non-Unix platforms expose no process-shared monotonic clock through
 /// this crate: no deadline can be stamped or compared there.
 #[cfg(not(unix))]
-pub(crate) fn monotonic_now_seconds() -> Option<u64> {
+pub(crate) fn monotonic_now() -> Option<Duration> {
     None
 }
 
@@ -156,7 +165,34 @@ pub(crate) fn monotonic_now_seconds() -> Option<u64> {
 /// platform's shared monotonic clock, floored to whole seconds like the
 /// wall-clock deadline — `None` where no such clock exists.
 pub(crate) fn monotonic_deadline_seconds(lease_duration: Duration) -> Option<u64> {
-    monotonic_now_seconds().map(|now| now.saturating_add(lease_duration.as_secs()))
+    monotonic_now().map(|now| now.saturating_add(lease_duration).as_secs())
+}
+
+/// The monotonic deadline a projection stamps: the earlier of the
+/// preserved wire deadline and the lease's own monotonic expiry estimated
+/// from the paired samples, floored to whole seconds.
+///
+/// `monotonic_now` must be sampled no later than the instant `remaining`
+/// was measured against — the same conservative pairing the wall-clock
+/// estimate uses. A pause between the samples can then only shrink the
+/// stamped deadline; sampling the shared clock after measuring the
+/// remainder would add a stale remainder to a later reading and stamp a
+/// deadline past the source lease's true expiry.
+pub(crate) fn projected_monotonic_deadline_seconds(
+    preserved: Option<u64>,
+    monotonic_now: Option<Duration>,
+    remaining: Duration,
+) -> Option<u64> {
+    match monotonic_now {
+        Some(now) => Some(
+            preserved
+                .unwrap_or(u64::MAX)
+                .min(now.saturating_add(remaining).as_secs()),
+        ),
+        // Where the platform cannot sample the shared clock the deadline
+        // the lease was minted with is preserved verbatim.
+        None => preserved,
+    }
 }
 
 /// A portable projection of unlocked credentials for one kind family.

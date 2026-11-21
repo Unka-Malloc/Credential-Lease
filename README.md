@@ -46,7 +46,10 @@ validation samples are specified in [docs/fd-handoff.md](docs/fd-handoff.md).
 
 ## Verify
 
-Requires Rust 1.89 or newer (the workspace `rust-version`).
+Requires Rust 1.89 or newer (the workspace `rust-version`) and `jq`,
+which `scripts/verify-samples.sh` uses to decode Cargo's JSON build
+report when locating the compiled sample executable. Go and Node.js are
+optional — the sample checks skip a language whose toolchain is absent.
 
 ```sh
 ./scripts/verify.sh

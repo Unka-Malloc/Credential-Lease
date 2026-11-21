@@ -1876,4 +1876,35 @@ mod tests {
             assert!(!is_permanent_probe_refusal(status));
         }
     }
+
+    #[test]
+    fn classic_fallback_reports_availability_without_protected_write_readiness() {
+        // When the probe falls back to the classic store the handle is a
+        // real, usable backend — but only for reads, deletes, and the
+        // legacy migration. The availability reports keep that split:
+        // write readiness is `false` exactly on the store whose
+        // `add_item`/`set_item` calls always refuse.
+        let classic = Keychain {
+            backend: KeychainBackend::Classic,
+        };
+        assert!(!classic.supports_protected_writes());
+        let protection = Keychain {
+            backend: KeychainBackend::DataProtection,
+        };
+        assert!(protection.supports_protected_writes());
+        // The public item APIs agree with the report: the same classic
+        // handle refuses both write paths before any SecItem call.
+        let context = synthetic_context();
+        let secret = SecretBytes::try_from_bytes(vec![0xA5u8; 24]).unwrap();
+        let query = KeychainItemQuery::new("synthetic-service", "synthetic-account").unwrap();
+        for result in [
+            classic.add_item(&context, &query, &secret).map(|_| ()),
+            classic.set_item(&context, &query, &secret),
+        ] {
+            assert_eq!(
+                result.unwrap_err().code(),
+                "credential_lease_keychain_classic_write_unsupported"
+            );
+        }
+    }
 }
