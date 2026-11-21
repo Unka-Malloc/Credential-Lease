@@ -14,6 +14,10 @@ credential-lease.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10.1"
 core-foundation-sys = "0.8.7"
+# The swap journal names its recording process unambiguously through
+# proc_pidinfo's reported start instant, so recovery can tell a live
+# writer from an interrupted one across pid reuse.
+libc = "0.2"
 security-framework = { version = "3.7.0", features = ["OSX_10_15"] }
 security-framework-sys = { version = "2.17.0", features = ["OSX_10_15"] }
 uuid.workspace = true
