@@ -44,7 +44,11 @@ Boundary rules the consumer relies on:
   carries only the descriptor number. The grant rule applies at every exec:
   a spawned child either receives the matching descriptor with the variable
   set to its number, or starts without the variable — an inherited stale
-  number must never reach a descendant.
+  number must never reach a descendant. Intake marks the descriptor
+  close-on-exec when it claims it, so a descendant exec'd after the claim
+  can never inherit the read end itself; until that claim the descriptor
+  is still inheritable, so a receiving process runs intake at startup
+  before spawning any child the grant does not cover.
 - **Process-bound** — a lease is bound to the process that minted it, its
   own lifetime, and the custody epoch. A fork inheriting the lease fails
   closed (`credential_lease_process_mismatch`); revocation is a signal the

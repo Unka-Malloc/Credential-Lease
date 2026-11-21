@@ -126,10 +126,13 @@ pub(crate) fn whole_seconds_ceiling(duration: Duration) -> Duration {
 }
 
 /// The platform's process-shared monotonic clock at full precision — the
-/// deadline domain a same-host handoff can be rebuilt against. Where the
-/// platform offers no comparable clock there is no same-host anchor:
-/// producers omit the monotonic deadline, and a rebuild refuses a
-/// document whose deadline it cannot compare.
+/// deadline domain a same-host handoff can be rebuilt against. `Ok(None)`
+/// means the platform offers no comparable clock: there is no same-host
+/// anchor, producers omit the monotonic deadline, and a rebuild refuses
+/// a document whose deadline it cannot compare. `Err` means the
+/// platform has the clock but the read failed — an operational failure
+/// propagated through mint, rebuild, and projection, never silently
+/// treated as an absent clock.
 ///
 /// The nanosecond part is preserved deliberately: a rebuild subtracts
 /// this reading from the whole-second wire deadline, and a truncated
@@ -137,7 +140,7 @@ pub(crate) fn whole_seconds_ceiling(duration: Duration) -> Duration {
 /// at monotonic time 200.9 a deadline of 201 leaves 100 ms, not the
 /// whole second a floored reading would grant.
 #[cfg(unix)]
-pub(crate) fn monotonic_now() -> Option<Duration> {
+pub(crate) fn monotonic_now() -> Result<Option<Duration>> {
     let mut time = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -145,27 +148,25 @@ pub(crate) fn monotonic_now() -> Option<Duration> {
     // SAFETY: `time` is a valid initialized out-pointer for a valid clock
     // id, and the same clock `Instant` is built on.
     let status = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
-    if status != 0 {
-        return None;
-    }
-    Some(Duration::new(
-        u64::try_from(time.tv_sec).ok()?,
-        u32::try_from(time.tv_nsec).ok()?,
-    ))
+    ensure!(status == 0, "credential_lease_clock_unavailable");
+    Ok(Some(Duration::new(
+        u64::try_from(time.tv_sec).map_err(|_| anyhow!("credential_lease_clock_unavailable"))?,
+        u32::try_from(time.tv_nsec).map_err(|_| anyhow!("credential_lease_clock_unavailable"))?,
+    )))
 }
 
 /// Non-Unix platforms expose no process-shared monotonic clock through
 /// this crate: no deadline can be stamped or compared there.
 #[cfg(not(unix))]
-pub(crate) fn monotonic_now() -> Option<Duration> {
-    None
+pub(crate) fn monotonic_now() -> Result<Option<Duration>> {
+    Ok(None)
 }
 
 /// The monotonic deadline a fresh grant stamps: the grant's expiry on the
 /// platform's shared monotonic clock, floored to whole seconds like the
-/// wall-clock deadline — `None` where no such clock exists.
-pub(crate) fn monotonic_deadline_seconds(lease_duration: Duration) -> Option<u64> {
-    monotonic_now().map(|now| now.saturating_add(lease_duration).as_secs())
+/// wall-clock deadline — `Ok(None)` where no such clock exists.
+pub(crate) fn monotonic_deadline_seconds(lease_duration: Duration) -> Result<Option<u64>> {
+    Ok(monotonic_now()?.map(|now| now.saturating_add(lease_duration).as_secs()))
 }
 
 /// The monotonic deadline a projection stamps: the earlier of the
@@ -189,8 +190,11 @@ pub(crate) fn projected_monotonic_deadline_seconds(
                 .unwrap_or(u64::MAX)
                 .min(now.saturating_add(remaining).as_secs()),
         ),
-        // Where the platform cannot sample the shared clock the deadline
-        // the lease was minted with is preserved verbatim.
+        // Where the platform offers no comparable clock there is no
+        // fresher estimate. A lease carrying a shared deadline refuses
+        // the projection before this arm — preserving it unsampled
+        // could stamp a deadline past the source lease's true expiry —
+        // so in production `preserved` is `None` here and stays `None`.
         None => preserved,
     }
 }
@@ -300,7 +304,7 @@ impl<K: CredentialKind> CredentialHandoff<K> {
     ) -> Result<Self> {
         ensure_lease_duration_bounds(lease_duration)?;
         let lease_expires_at_epoch_seconds = lease_deadline_epoch_seconds(lease_duration)?;
-        let lease_monotonic_deadline_seconds = monotonic_deadline_seconds(lease_duration);
+        let lease_monotonic_deadline_seconds = monotonic_deadline_seconds(lease_duration)?;
         Self::with_deadline(
             credentials,
             lease_duration,

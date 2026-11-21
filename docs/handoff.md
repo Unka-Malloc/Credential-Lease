@@ -161,7 +161,11 @@ exit. Three independent checks apply on every credential use:
    shared monotonic clock refuses a document that omits the member, and
    one that cannot refuses a document that carries it — the rebuild
    fails closed with `credential_lease_expiry_invalid` whenever clock
-   continuity cannot be established.
+   continuity cannot be established. A failed read of the clock is a
+   different answer from an absent clock: it refuses with
+   `credential_lease_clock_unavailable` at mint, rebuild, and
+   projection instead of masquerading as the platform truth that
+   legitimately omits the member.
 3. The custody epoch — the runtime's epoch source is consulted on every
    resolution and must still report the handoff's epoch. An
    owner-initiated revocation rotates the epoch and kills every
@@ -173,7 +177,12 @@ yields copies of secret material; the lease retains its own bytes.
 
 Projection back into a handoff is a credential use as well: it re-checks
 all three conditions, so an expired or revoked lease cannot be re-minted
-into a fresh handoff that restarts its lifetime.
+into a fresh handoff that restarts its lifetime. A lease carrying
+`leaseMonotonicDeadlineSeconds` stamps the projected bound from a fresh
+sample of that same clock; when the sample cannot be taken — a failed
+read or no comparable clock — the projection refuses
+`credential_lease_clock_unavailable` rather than carry a deadline
+forward that a wall-clock rollback could stretch past the source grant.
 
 The contract's runtime refusals are stable codes:
 
@@ -183,7 +192,7 @@ The contract's runtime refusals are stable codes:
 | `credential_lease_expired` | The grant's lifetime has elapsed on any of its clock domains — the `Instant` expiry, the wall-clock deadline, or the shared monotonic deadline — checked both before and after the epoch consultation, so a slow epoch lookup can never release an expired grant. |
 | `credential_lease_expiry_invalid` | The grant's deadline shape is malformed or its clock continuity cannot be established: a deadline at or before the epoch, a deadline of zero, or a monotonic deadline the rebuild cannot compare or must require but is absent. |
 | `credential_lease_clock_invalid` | The wall clock cannot produce a usable reading (for example it precedes the Unix epoch). An operational failure, not an elapsed grant. |
-| `credential_lease_clock_unavailable` | The shared monotonic clock could not be read back for the in-domain deadline check on a lease that carries `leaseMonotonicDeadlineSeconds`. An operational failure, not an elapsed grant. |
+| `credential_lease_clock_unavailable` | The shared monotonic clock exists but a read of it failed — at mint, rebuild, projection, or the in-domain deadline check on a lease that carries `leaseMonotonicDeadlineSeconds`. An operational failure, not an elapsed grant, and never silently treated as an absent clock. |
 | `credential_lease_revoked` | The active epoch is absent or no longer matches the lease's epoch. |
 | `credential_lease_process_mismatch` | The lease object is being used from a process other than the one that minted it. |
 

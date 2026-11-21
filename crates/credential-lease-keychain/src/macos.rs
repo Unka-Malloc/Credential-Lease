@@ -468,10 +468,11 @@ impl Keychain {
     /// on any other store the operation refuses
     /// `credential_lease_keychain_migration_target_invalid`, so `Ok(None)`
     /// unambiguously means the source item is absent — a classic handle
-    /// cannot masquerade a same-store copy as a migration. A grouped
-    /// query refuses `credential_lease_keychain_routing_invalid` instead:
-    /// the classic source path strips `kSecAttrAccessGroup`, so the call
-    /// could never honor the declared scope.
+    /// cannot masquerade a same-store copy as a migration. A grouped,
+    /// synchronizable, or Data-Protection-routed query refuses
+    /// `credential_lease_keychain_routing_invalid` instead: the classic
+    /// source path cannot honor any of those selectors, so the call
+    /// could never address the item it declared.
     pub fn copy_legacy_classic_secret(
         &self,
         context: &KeychainAuthContext,
@@ -492,9 +493,10 @@ impl Keychain {
 
     /// Delete one item from the classic Keychain — the legacy migration's
     /// cleanup. Refused outright when this store is not the Data Protection
-    /// Keychain: deleting the only copy is never a migration. A grouped
-    /// query refuses `credential_lease_keychain_routing_invalid` for the
-    /// same reason [`Self::copy_legacy_classic_secret`] does.
+    /// Keychain: deleting the only copy is never a migration. A grouped,
+    /// synchronizable, or Data-Protection-routed query refuses
+    /// `credential_lease_keychain_routing_invalid` for the same reason
+    /// [`Self::copy_legacy_classic_secret`] does.
     pub fn delete_legacy_classic_item(
         &self,
         context: &KeychainAuthContext,
@@ -715,16 +717,23 @@ fn migration_target_invalid() -> KeychainError {
 /// only when the selected destination is the Data Protection Keychain —
 /// copying and deleting inside the classic store itself is not a
 /// migration, so the pairs exist only for a distinct destination. A
-/// grouped query is refused the same way explicit classic routing is:
-/// the source path strips `kSecAttrAccessGroup`, so honoring the call
-/// would silently widen the read or delete to every classic item sharing
-/// the service and account.
+/// query whose declared selectors the classic source cannot honor is
+/// refused the same way explicit classic routing is: an access group,
+/// which the classic path strips outright; a synchronizable item, which
+/// the platform serves only from the Data Protection Keychain (TN3137);
+/// and an explicit Data Protection routing flag. Dropping any of them
+/// would issue a query on service and account alone — silently
+/// re-targeting a different item that shares the identifiers, so the
+/// read or the delete never reaches SecItem.
 fn classic_migration_pairs(
     query: &KeychainItemQuery<'_>,
     context: &KeychainAuthContext,
     destination: KeychainBackend,
 ) -> Result<Vec<(CFString, CFType)>, KeychainError> {
-    if query.access_group.is_some() {
+    if query.access_group.is_some()
+        || query.synchronizable == Some(true)
+        || query.use_data_protection == Some(true)
+    {
         return Err(routing_invalid());
     }
     if destination != KeychainBackend::DataProtection {
@@ -1827,6 +1836,74 @@ mod tests {
             effective_store(&unscoped, KeychainBackend::DataProtection).unwrap(),
             KeychainBackend::Classic
         );
+    }
+
+    #[test]
+    fn synchronizable_queries_refuse_on_the_classic_migration_source() {
+        // A synchronizable item is served only by the Data Protection
+        // Keychain (TN3137): it can never be the classic item a migration
+        // reads or deletes. The shared source helper drops the
+        // `kSecAttrSynchronizable` selector, so honoring the call would
+        // issue a query on service and account alone and could copy or
+        // delete a different classic item with the same identifiers —
+        // the query refuses before either legacy entry point reaches
+        // SecItem, on either handle.
+        let context = synthetic_context();
+        let synchronizable = KeychainItemQuery::new("synthetic-service", "synthetic-account")
+            .unwrap()
+            .with_synchronizable(true);
+        for backend in [KeychainBackend::Classic, KeychainBackend::DataProtection] {
+            assert_eq!(
+                classic_migration_pairs(&synchronizable, &context, backend)
+                    .unwrap_err()
+                    .code(),
+                "credential_lease_keychain_routing_invalid"
+            );
+            let keychain = Keychain { backend };
+            assert_eq!(
+                keychain
+                    .copy_legacy_classic_secret(&context, &synchronizable, false)
+                    .unwrap_err()
+                    .code(),
+                "credential_lease_keychain_routing_invalid"
+            );
+            assert_eq!(
+                keychain
+                    .delete_legacy_classic_item(&context, &synchronizable, false)
+                    .unwrap_err()
+                    .code(),
+                "credential_lease_keychain_routing_invalid"
+            );
+        }
+        // An explicit Data Protection routing flag declares an item the
+        // forced-classic source cannot reach either — refused for the
+        // same reason.
+        let routed = KeychainItemQuery::new("synthetic-service", "synthetic-account")
+            .unwrap()
+            .with_data_protection(true);
+        for backend in [KeychainBackend::Classic, KeychainBackend::DataProtection] {
+            assert_eq!(
+                classic_migration_pairs(&routed, &context, backend)
+                    .unwrap_err()
+                    .code(),
+                "credential_lease_keychain_routing_invalid"
+            );
+            let keychain = Keychain { backend };
+            assert_eq!(
+                keychain
+                    .copy_legacy_classic_secret(&context, &routed, false)
+                    .unwrap_err()
+                    .code(),
+                "credential_lease_keychain_routing_invalid"
+            );
+            assert_eq!(
+                keychain
+                    .delete_legacy_classic_item(&context, &routed, false)
+                    .unwrap_err()
+                    .code(),
+                "credential_lease_keychain_routing_invalid"
+            );
+        }
     }
 
     #[test]

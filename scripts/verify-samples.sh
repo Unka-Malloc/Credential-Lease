@@ -63,6 +63,32 @@ else
   echo "SKIP typescript sample: node not found"
 fi
 
+# A freshly linked locally-built executable sits in Apple System Policy's
+# assessment queue on macOS; while the verdict is pending the kernel
+# answers every exec of that file with SIGKILL (status 137). Under host
+# load the queue can outlast the whole check loop. Run each built binary
+# once until the verdict lands — any exit other than 137 proves exec is
+# allowed and lets the checks below judge conformance themselves.
+warm_sample() {
+  local label="$1" binary="$2" deadline status
+  deadline=$((SECONDS + 300))
+  while :; do
+    if env -u FAIRLINY_HANDOFF_FD "$binary" 200<&- >/dev/null 2>&1; then
+      status=0
+    else
+      status=$?
+    fi
+    [ "$status" -ne 137 ] && return 0
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      echo "FAIL samples: $label sample exec denied by system policy" >&2
+      exit 1
+    fi
+    sleep 2
+  done
+}
+warm_sample rust "$rust_sample"
+[ -n "$go_sample" ] && warm_sample go "$go_sample"
+
 check() {
   # language, vector, expected exit status, expected output, command...
   local language="$1"

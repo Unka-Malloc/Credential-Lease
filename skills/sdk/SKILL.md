@@ -61,7 +61,10 @@ can install their `CustodyPort` through `port::install` and access it through
   receives no handoff. Intake consumes the channel but never removes the
   variable, so a descendant spawned with the default environment inherits a
   stale number — a fresh latch could read a closed descriptor or one the OS
-  reassigned to something unrelated.
+  reassigned to something unrelated. Intake marks the descriptor
+  close-on-exec when it claims it, so a descendant exec'd after the claim
+  can never inherit the read end; the receiving process must run intake at
+  startup before spawning any child the grant does not cover.
 - Every resolution checks the lease's process identity, its own lifetime,
   and the host's current custody epoch. A lease inherited across a fork and
   a revoked or expired lease are all refusals; obtaining another lease

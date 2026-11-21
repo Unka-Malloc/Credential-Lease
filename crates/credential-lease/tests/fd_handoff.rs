@@ -21,14 +21,14 @@ use anyhow::Result;
 use credential_lease::credential::LeasedCredential;
 use credential_lease::egress::EgressScope;
 use credential_lease::epoch::LeaseEpochSource;
-use credential_lease::handoff_fd::{receive_handoff_from_env, HANDOFF_FD_ENV};
+use credential_lease::handoff_fd::{receive_handoff, receive_handoff_from_env, HANDOFF_FD_ENV};
 use credential_lease::kind::CredentialKind;
 use credential_lease::lease::CredentialLease;
 use credential_lease::SecretBytes;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -38,6 +38,8 @@ use std::time::Duration;
 const CHILD_MODE_ENV: &str = "CREDENTIAL_LEASE_FD_TEST_MODE";
 /// Names the descriptor the child writes its report to.
 const RESULT_FD_ENV: &str = "CREDENTIAL_LEASE_RESULT_FD";
+/// Names the descriptor number a probe descendant checks for openness.
+const PROBE_FD_ENV: &str = "CREDENTIAL_LEASE_PROBE_FD";
 
 /// The synthetic leased secret. Custody's root key is a different secret that
 /// never crosses this contract; the environment may not receive either one,
@@ -396,6 +398,61 @@ fn descendant_inheriting_the_consumed_variable_fails_closed() {
     );
 }
 
+#[test]
+fn a_descendant_spawned_during_intake_inherits_no_read_end() {
+    // The bounded read can span a concurrent spawn: until the claim marks
+    // the descriptor close-on-exec, an exec'd descendant would inherit the
+    // read end and hold the secret-bearing channel open past intake. This
+    // pipe is deliberately left inheritable, so the claim inside intake is
+    // the only thing that can flip the flag — a descendant exec'd once it
+    // lands must find the descriptor number closed.
+    let mut descriptors = [0; 2];
+    // SAFETY: `pipe` writes exactly two descriptors into the array.
+    assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+    let (read_end, write_end) = (descriptors[0], descriptors[1]);
+    let intake = std::thread::spawn(move || {
+        // SAFETY: `read_end` is exclusively owned by this thread and
+        // transfers to `receive_handoff` exactly once.
+        unsafe { receive_handoff::<Kind>(OwnedFd::from_raw_fd(read_end)) }
+    });
+    // The read blocks while the write end stays open, so the claim's flag
+    // can be observed before any byte arrives.
+    loop {
+        // SAFETY: `fcntl` accepts any number and reports whether it names
+        // an open descriptor.
+        let flags = unsafe { libc::fcntl(read_end, libc::F_GETFD) };
+        assert!(flags >= 0, "the descriptor closed before its claim landed");
+        if flags & libc::FD_CLOEXEC == libc::FD_CLOEXEC {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    let output = Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", "fd_handoff_child_entry", "--nocapture"])
+        .env(CHILD_MODE_ENV, "probe-descriptor")
+        .env(PROBE_FD_ENV, read_end.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
+        .expect("spawn descendant");
+    // Ending the document lets the intake thread finish; an empty channel
+    // refuses as a document, which is enough here — the descriptor flag
+    // and the descendant's table are what this test proves.
+    close_fd(write_end);
+    assert!(
+        output.status.success(),
+        "descendant exited with {}",
+        output.status
+    );
+    let outcome = String::from_utf8(output.stdout).expect("descendant outcome");
+    assert!(
+        outcome.lines().any(|line| line == "INTAKE closed"),
+        "a descendant must not inherit the intake descriptor: {outcome:?}"
+    );
+    assert!(intake.join().expect("intake thread").is_err());
+}
+
 /// The child half. In an ordinary test run the mode is absent and this test
 /// does nothing; the parent re-executes the binary with the mode set.
 #[test]
@@ -532,6 +589,20 @@ fn fd_handoff_child_entry() {
                 }
                 Err(error) => println!("INTAKE refused {error}"),
             }
+        }
+        "probe-descriptor" => {
+            // Report whether the descriptor number the parent names
+            // survived exec into this descendant: intake claims the
+            // handoff descriptor close-on-exec, so the read end must be
+            // absent from the inherited table.
+            let probe = std::env::var(PROBE_FD_ENV)
+                .expect("probe descriptor variable")
+                .parse::<RawFd>()
+                .expect("decimal probe descriptor");
+            // SAFETY: `fcntl` accepts any number and reports whether it
+            // names an open descriptor.
+            let open = unsafe { libc::fcntl(probe, libc::F_GETFD) } >= 0;
+            println!("INTAKE {}", if open { "open" } else { "closed" });
         }
         other => panic!("unknown child mode {other:?}"),
     }

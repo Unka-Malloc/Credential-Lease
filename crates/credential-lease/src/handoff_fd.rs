@@ -12,8 +12,10 @@
 //! - the document is read to end of file, refused before it can grow past
 //!   [`MAX_HANDOFF_DOC_BYTES`], and
 //!   parsed under the same closed rules as any other handoff;
-//! - the descriptor is closed as soon as the read finishes, and every
-//!   secret-bearing buffer — the read scratch and the accumulated document —
+//! - the descriptor is marked close-on-exec the moment intake claims it —
+//!   no descendant exec can inherit the read end while the read runs — and
+//!   closed as soon as the read finishes, while every secret-bearing
+//!   buffer — the read scratch and the accumulated document —
 //!   zeroizes before the parsed handoff takes ownership of the secrets.
 //!
 //! The descriptor channel is a Unix concept. Hosts on other platforms use
@@ -79,6 +81,12 @@ static HANDOFF_CHANNEL_CLAIMED: AtomicBool = AtomicBool::new(false);
 /// the inherited value through, where a fresh latch could read a closed
 /// number or a descriptor the OS reassigned to something unrelated.
 ///
+/// Claiming the descriptor marks it close-on-exec, so a descendant exec'd
+/// after intake can never inherit the read end itself. Until that claim
+/// lands the descriptor is still inheritable: startup must run intake
+/// before spawning any child the grant does not cover, so no ungranted
+/// exec can escape with the channel.
+///
 /// # Safety
 ///
 /// The caller asserts the spawn contract: the descriptor number the
@@ -117,10 +125,12 @@ pub unsafe fn receive_handoff_from_env<K: CredentialKind>() -> Result<Option<Cre
 ///
 /// The descriptor's ownership transfers to this call — an [`OwnedFd`], not
 /// a borrowed number — so it can never close a descriptor the caller still
-/// owns. It is closed once the read finishes, including when the document
-/// is refused. The returned handoff owns its own secret copies; every
-/// secret-bearing buffer this intake touches zeroizes on drop, on the
-/// success path and on every refusal path.
+/// owns. It is marked close-on-exec the moment the claim lands — a
+/// descendant exec'd during the bounded read can never inherit the read
+/// end — and it is closed once the read finishes, including when the
+/// document is refused. The returned handoff owns its own secret copies;
+/// every secret-bearing buffer this intake touches zeroizes on drop, on
+/// the success path and on every refusal path.
 ///
 /// The document accumulator is reserved to [`MAX_HANDOFF_DOC_BYTES`] before
 /// the first read, so it is exactly one allocation that can never grow:
@@ -138,6 +148,19 @@ pub fn receive_handoff<K: CredentialKind>(descriptor: OwnedFd) -> Result<Credent
     ensure!(
         descriptor.as_raw_fd() >= MIN_HANDOFF_FD,
         "credential_lease_handoff_fd_invalid"
+    );
+    // Claiming ownership also marks the descriptor close-on-exec: the
+    // bounded read below can span a concurrent spawn, and a descendant
+    // inheriting the read end would hold the secret-bearing channel open
+    // past intake even where that child follows the grant rule and clears
+    // the variable. The window before this claim — process start to
+    // intake — is the startup rule [`receive_handoff_from_env`] documents:
+    // no exec the grant does not cover may run before intake owns the
+    // descriptor.
+    ensure!(
+        // SAFETY: `descriptor` is a live descriptor owned by this call.
+        unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == 0,
+        "credential_lease_handoff_fd_unavailable"
     );
     let owned = OwnedDescriptor(descriptor.into_raw_fd());
     // Reserved to the intake bound: the bound check below then guarantees

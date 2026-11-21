@@ -26,11 +26,14 @@ setup from silently reading standard input as a handoff.
 ## Receiver behavior
 
 1. Parse `FAIRLINY_HANDOFF_FD` as a plain decimal descriptor number.
-2. Read the descriptor to end of file, refusing the document before the
+2. Claim the descriptor close-on-exec before the first read: a descendant
+   exec'd while the document is still arriving can never inherit the read
+   end, so the secret-bearing channel cannot escape past intake.
+3. Read the descriptor to end of file, refusing the document before the
    accumulated size can exceed `MAX_HANDOFF_DOC_BYTES` (2,229,554 bytes).
-3. Close the descriptor once the read finishes — on the success path and on
+4. Close the descriptor once the read finishes — on the success path and on
    every refusal path.
-4. Parse and validate under the closed document rules in
+5. Parse and validate under the closed document rules in
    [handoff.md](handoff.md). The document is secret-bearing, so the receiver
    reserves the accumulator to the bound before the first read — growth can
    never release an unscrubbed copy — and both the read scratch and the
@@ -65,6 +68,15 @@ variable to its number, or removes the variable from the child's
 environment (`env -u`, `Command::env_remove`, or an explicit environment
 list). A runtime that spawns further processes with no handoff for them
 must clear the variable instead of letting the inherited value through.
+
+Removing the variable alone was never the whole protection: a descriptor
+stays inheritable until intake claims it, and a child exec'd inside that
+window would carry the read end regardless of its environment. Intake
+therefore marks the descriptor close-on-exec at the claim, before the
+first read — a descendant spawned afterwards can never inherit the
+channel. The ordering obligation sits with startup: a receiving process
+must run intake before spawning any child the grant does not cover, so
+no ungranted exec can happen while the descriptor is still inheritable.
 
 ### Refusal codes
 
