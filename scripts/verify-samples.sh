@@ -84,6 +84,53 @@ check_all() {
   fi
 }
 
+check_channel() {
+  # language, variable spec ("ABSENT" or a value), expected status,
+  # expected output, command...
+  local language="$1"
+  local spec="$2"
+  local expected_status="$3"
+  local expected_output="$4"
+  shift 4
+  if [ "$#" -eq 0 ]; then
+    return 0
+  fi
+  checks=$((checks + 1))
+  local output
+  local status
+  if [ "$spec" = "ABSENT" ]; then
+    if output=$(env -u FAIRLINY_HANDOFF_FD "$@" 200<&- 2>/dev/null); then
+      status=0
+    else
+      status=$?
+    fi
+  else
+    if output=$(FAIRLINY_HANDOFF_FD="$spec" "$@" 200<&- 2>/dev/null); then
+      status=0
+    else
+      status=$?
+    fi
+  fi
+  if [ "$status" -ne "$expected_status" ] || [ "$output" != "$expected_output" ]; then
+    echo "FAIL $language fd=$spec: status=$status output=$output (expected $expected_status/$expected_output)"
+    failures=$((failures + 1))
+  fi
+}
+
+check_channel_all() {
+  local spec="$1"
+  local expected_status="$2"
+  local expected_output="$3"
+  check_channel rust "$spec" "$expected_status" "$expected_output" "$rust_sample"
+  if [ -n "$go_sample" ]; then
+    check_channel go "$spec" "$expected_status" "$expected_output" "$go_sample"
+  fi
+  if [ "${#ts_command[@]}" -gt 0 ]; then
+    check_channel typescript "$spec" "$expected_status" "$expected_output" \
+      "${ts_command[@]}" "$root/samples/typescript/handoff.ts"
+  fi
+}
+
 for vector in "$vectors"/*.json; do
   case "$(basename "$vector")" in
     valid.json | valid-*.json)
@@ -104,6 +151,14 @@ oversized="$root/target/samples/oversized-document.json"
 mkdir -p "$root/target/samples"
 dd if=/dev/zero of="$oversized" bs=1024 count=2178 2>/dev/null
 check_all "$oversized" 1 invalid
+
+# Channel verdicts must agree too: an absent variable, a malformed value, a
+# standard-stream number and a granted-but-unreadable descriptor each get
+# the same refusal from every language.
+check_channel_all "ABSENT" 2 "refused credential_lease_handoff_fd_missing"
+check_channel_all "not-a-descriptor" 2 "refused credential_lease_handoff_fd_invalid"
+check_channel_all "2" 2 "refused credential_lease_handoff_fd_invalid"
+check_channel_all "200" 2 "refused credential_lease_handoff_fd_unavailable"
 
 if [ "$checks" -eq 0 ]; then
   echo "FAIL samples: no language sample ran" >&2

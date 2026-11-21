@@ -36,9 +36,9 @@ Boundary rules the consumer relies on:
   document travels only through a process-local channel, never disks, logs or
   configuration. Inventories, debug projections and error output contain no
   secret material. On Unix the channel is an inherited read-only descriptor
-  named by `FAIRLINY_HANDOFF_FD`; `receive_handoff_from_env` consumes it,
-  closes it, and bounds the read. The environment carries only the descriptor
-  number.
+  named by `FAIRLINY_HANDOFF_FD`; `receive_handoff_from_env` consumes the
+  variable once, closes the descriptor, and bounds the read. The environment
+  carries only the descriptor number.
 - **Process-bound** — a lease is bound to the process that minted it, its
   own lifetime, and the custody epoch. A fork inheriting the lease fails
   closed (`credential_lease_process_mismatch`); revocation is a signal the

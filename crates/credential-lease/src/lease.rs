@@ -93,6 +93,10 @@ impl<K: CredentialKind> CredentialLease<K> {
         egress: EgressScope,
         lease_deadline_epoch_seconds: u64,
     ) -> Result<Self> {
+        // The lease carries the whole-second duration the wire format
+        // carries: a fractional grant maps up to the next second, and the
+        // absolute deadline below still caps the real expiry.
+        let lease_duration = crate::handoff::whole_seconds_ceiling(lease_duration);
         ensure!(
             uuid::Uuid::parse_str(&epoch).is_ok_and(|value| value.to_string() == epoch),
             "credential_lease_epoch_invalid"
@@ -107,13 +111,11 @@ impl<K: CredentialKind> CredentialLease<K> {
         // rebuild can therefore never mint a lease that outlives the
         // original grant, and a lapsed deadline yields a dead-on-arrival
         // lease that fails closed on every use.
-        let now_epoch_seconds = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|_| anyhow!("credential_lease_clock_invalid"))?
-            .as_secs();
-        let effective_duration = lease_duration.min(Duration::from_secs(
-            lease_deadline_epoch_seconds.saturating_sub(now_epoch_seconds),
-        ));
+            .map_err(|_| anyhow!("credential_lease_clock_invalid"))?;
+        let effective_duration =
+            lease_duration.min(deadline_remaining(lease_deadline_epoch_seconds, now));
         let expires_at = Instant::now()
             .checked_add(effective_duration)
             .ok_or_else(|| anyhow!("credential_lease_expiry_invalid"))?;
@@ -129,10 +131,11 @@ impl<K: CredentialKind> CredentialLease<K> {
         })
     }
 
-    /// Test-only construction with an explicit process binding and expiry so
-    /// cross-PID replay and timeout paths are exercised deterministically
-    /// instead of by sleeping.
+    /// Test-only construction with an explicit process binding, expiry and
+    /// owner deadline so cross-PID replay, timeout and sub-second-deadline
+    /// paths are exercised deterministically instead of by sleeping.
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_binding_for_test(
         credentials: BTreeMap<K, Vec<LeasedCredential>>,
         lease_duration: Duration,
@@ -141,6 +144,7 @@ impl<K: CredentialKind> CredentialLease<K> {
         egress: EgressScope,
         process_id: u32,
         expires_at: Instant,
+        lease_deadline_epoch_seconds: u64,
     ) -> Result<Self> {
         let mut lease = Self::new_bound(
             credentials,
@@ -149,7 +153,7 @@ impl<K: CredentialKind> CredentialLease<K> {
             epoch_source,
             process_id,
             egress,
-            u64::MAX,
+            lease_deadline_epoch_seconds,
         )?;
         lease.expires_at = expires_at;
         Ok(lease)
@@ -186,7 +190,9 @@ impl<K: CredentialKind> CredentialLease<K> {
     /// The document carries the grant's remaining duration and preserves
     /// the owner-authorized deadline verbatim, so a lease rebuilt from this
     /// projection can never outlive the original grant — extension requires
-    /// a fresh owner grant, not another projection.
+    /// a fresh owner grant, not another projection. The wire format is
+    /// whole seconds: a live fractional remainder maps up to the next
+    /// second, which the preserved deadline still caps on rebuild.
     pub fn handoff_projection(&self) -> Result<CredentialHandoff<K>> {
         self.ensure_active()?;
         let remaining = self.expires_at.saturating_duration_since(Instant::now());
@@ -306,6 +312,18 @@ impl<K: CredentialKind> CredentialLease<K> {
     }
 }
 
+/// The exact time left before an owner-authorized deadline: the current
+/// wall clock is subtracted at full precision so a sub-second remainder
+/// can never round up into nearly a whole extra second of use.
+pub(crate) fn deadline_remaining(
+    deadline_epoch_seconds: u64,
+    now_since_epoch: Duration,
+) -> Duration {
+    Duration::from_secs(deadline_epoch_seconds)
+        .checked_sub(now_since_epoch)
+        .unwrap_or(Duration::ZERO)
+}
+
 struct DisconnectedEpochSource;
 
 impl LeaseEpochSource for DisconnectedEpochSource {
@@ -360,6 +378,19 @@ impl<K: CredentialKind> CredentialSlot<K> {
             .unwrap_or(false)
     }
 
+    /// The next candidate index for `kind`, advancing the rotation cursor
+    /// under its own lock.
+    fn selection_start(&self, kind: K, count: usize) -> Result<usize> {
+        let mut cursors = self
+            .selection_cursors
+            .lock()
+            .map_err(|_| anyhow!("credential_lease_validation_unavailable"))?;
+        let cursor = cursors.entry(kind).or_insert(0);
+        let start = *cursor % count;
+        *cursor = cursor.wrapping_add(1);
+        Ok(start)
+    }
+
     /// Resolve one currently valid secret for `kind`, rotating the
     /// selection across candidates and copying only the chosen secret. The
     /// candidate list is snapshotted once so counting and selection cannot
@@ -371,17 +402,26 @@ impl<K: CredentialKind> CredentialSlot<K> {
             .map_err(|_| anyhow!("credential_lease_validation_unavailable"))?;
         let candidates: Vec<&LeasedCredential> = guard.valid_candidates(kind)?.collect();
         ensure!(!candidates.is_empty(), "credential_lease_unavailable");
-        let start = {
-            let mut cursors = self
-                .selection_cursors
-                .lock()
-                .map_err(|_| anyhow!("credential_lease_validation_unavailable"))?;
-            let cursor = cursors.entry(kind).or_insert(0);
-            let start = *cursor % candidates.len();
-            *cursor = cursor.wrapping_add(1);
-            start
-        };
+        let start = self.selection_start(kind, candidates.len())?;
         Ok(candidates[start].copy_secret())
+    }
+
+    /// Resolve one currently valid secret for `kind` together with the
+    /// egress scope of the lease that produced it. The credential and the
+    /// scope come out of the same lease snapshot under one lock, so a
+    /// concurrent handoff install can never pair a fresh credential with
+    /// the previous grant's outbound boundary — a forwarding runtime reads
+    /// both through this call, not through `resolve` and `egress`
+    /// separately.
+    pub fn resolve_scoped(&self, kind: K) -> Result<(SecretBytes, EgressScope)> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow!("credential_lease_validation_unavailable"))?;
+        let candidates: Vec<&LeasedCredential> = guard.valid_candidates(kind)?.collect();
+        ensure!(!candidates.is_empty(), "credential_lease_unavailable");
+        let start = self.selection_start(kind, candidates.len())?;
+        Ok((candidates[start].copy_secret(), guard.egress.clone()))
     }
 
     /// Returns every currently valid credential in rotating order.
@@ -391,16 +431,7 @@ impl<K: CredentialKind> CredentialSlot<K> {
             .lock()
             .map_err(|_| anyhow!("credential_lease_validation_unavailable"))?
             .resolve_candidates(kind)?;
-        let start = {
-            let mut cursors = self
-                .selection_cursors
-                .lock()
-                .map_err(|_| anyhow!("credential_lease_validation_unavailable"))?;
-            let cursor = cursors.entry(kind).or_insert(0);
-            let start = *cursor % candidates.len();
-            *cursor = cursor.wrapping_add(1);
-            start
-        };
+        let start = self.selection_start(kind, candidates.len())?;
         candidates.rotate_left(start);
         Ok(candidates)
     }
@@ -434,6 +465,11 @@ impl<K: CredentialKind> CredentialSlot<K> {
 
     /// The installed lease's egress scope — the deny-all scope when the
     /// slot is poisoned or holds a disconnected lease.
+    ///
+    /// A runtime that forwards a resolved credential must read the scope
+    /// together with the secret through [`Self::resolve_scoped`]; reading
+    /// the scope on its own here and resolving separately can observe two
+    /// different grants across a concurrent handoff install.
     pub fn egress(&self) -> EgressScope {
         self.inner
             .lock()

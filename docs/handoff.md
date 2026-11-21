@@ -56,7 +56,7 @@ Closed set — any additional or missing field rejects the document.
 | Field | Type | Rule |
 | --- | --- | --- |
 | `schemaVersion` | string | Must equal the family schema constant pinned by the kind family. A document minted under one family's schema must never parse as another family. |
-| `leaseDurationSeconds` | unsigned integer | `1..=31622400` (366 days). The upper bound of the runtime lease minted from this handoff. For a lease projection this is the grant's remaining time, not the original duration. |
+| `leaseDurationSeconds` | unsigned integer | `1..=31622400` (366 days). The upper bound of the runtime lease minted from this handoff. For a lease projection this is the grant's remaining time, not the original duration. The wire has no fractional seconds: a live remainder maps up to the next whole second, and `leaseExpiresAtEpochSeconds` still caps the rebuild so rounding up cannot extend the grant. |
 | `leaseExpiresAtEpochSeconds` | unsigned integer | `> 0`. The owner-authorized deadline the grant ends at. It is preserved verbatim through every projection and rebuild: a rebuilt lease expires at the earlier of `leaseDurationSeconds` and this deadline, so chained projections can never extend the grant — only a fresh owner grant can. |
 | `epoch` | string | Canonical lowercase UUID; identifies the custody epoch this handoff was minted under. |
 | `egress` | object | Optional. The egress scope below; absent declares the deny-all scope — no outbound target is admitted. |

@@ -1,5 +1,6 @@
 use super::*;
 use crate::handoff::{CredentialHandoff, MAX_HANDOFF_DOC_BYTES};
+use crate::lease::deadline_remaining;
 use crate::SecretBytes;
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -284,6 +285,7 @@ fn lease_bound_to_another_process_fails_closed_on_every_secret_use() {
         EgressScope::deny_all(),
         foreign_process,
         Instant::now() + Duration::from_secs(3600),
+        u64::MAX,
     )
     .unwrap();
 
@@ -341,6 +343,7 @@ fn expired_lease_fails_closed_before_touching_the_epoch() {
         EgressScope::deny_all(),
         std::process::id(),
         Instant::now() - Duration::from_secs(1),
+        u64::MAX,
     )
     .unwrap();
 
@@ -593,8 +596,8 @@ fn rebuilt_lease_never_outlives_the_documents_deadline() {
             assert_eq!(projected.lease_expires_at_epoch_seconds(), deadline);
             assert!(projected.lease_duration() <= Duration::from_secs(2));
         }
-        // A sub-second remainder cannot mint a document at all.
-        Err(error) => assert_eq!(error.to_string(), "credential_lease_duration_invalid"),
+        // An expiry already behind the wall clock refuses before minting.
+        Err(error) => assert_eq!(error.to_string(), "credential_lease_expired"),
     }
     // A lapsed deadline yields a dead-on-arrival lease: parsing succeeds
     // but every use fails closed.
@@ -622,6 +625,66 @@ fn rebuilt_lease_never_outlives_the_documents_deadline() {
         dead.resolve(TestKind::Alpha).unwrap_err().to_string(),
         "credential_lease_expired"
     );
+}
+
+#[test]
+fn deadline_remaining_preserves_full_wall_clock_precision() {
+    // The deadline math subtracts the wall clock at full precision: a
+    // deadline one epoch second out with the clock 0.9s into the current
+    // second leaves 100ms — a rounded-down second-level subtraction would
+    // leave the lease usable for nearly a whole extra second.
+    let now = Duration::new(1_700_000_000, 900_000_000);
+    assert_eq!(
+        deadline_remaining(1_700_000_001, now),
+        Duration::from_millis(100)
+    );
+    // Exact-boundary and lapsed deadlines both leave nothing.
+    assert_eq!(
+        deadline_remaining(1_700_000_001, now + Duration::from_secs(1)),
+        Duration::ZERO
+    );
+    assert_eq!(deadline_remaining(1_700_000_000, now), Duration::ZERO);
+}
+
+#[test]
+fn live_subsecond_remainder_projects_as_a_whole_second() {
+    // The wire format has no fractional seconds: a lease with 500ms of
+    // life left is still live, so projection must succeed — mapping the
+    // remainder up to one whole second while the preserved deadline still
+    // caps every rebuild at the original expiry.
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let source = Arc::new(TestEpochSource(StdMutex::new(Some(epoch.clone()))));
+    let mut credentials = BTreeMap::new();
+    credentials.insert(TestKind::Beta, vec![test_credential(0xD1)]);
+    let deadline = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 2;
+    let lease = CredentialLease::new_with_binding_for_test(
+        credentials,
+        Duration::from_secs(3600),
+        epoch.clone(),
+        source,
+        EgressScope::deny_all(),
+        std::process::id(),
+        Instant::now() + Duration::from_millis(500),
+        deadline,
+    )
+    .unwrap();
+    let projected = lease.handoff_projection().unwrap();
+    assert_eq!(projected.lease_duration(), Duration::from_secs(1));
+    assert_eq!(projected.lease_expires_at_epoch_seconds(), deadline);
+    // A rebuild stays inside the original expiry: the rounded-up wire
+    // value and the preserved deadline both bound it.
+    let rebuilt = CredentialLease::from_handoff(
+        projected,
+        Arc::new(TestEpochSource(StdMutex::new(Some(epoch)))),
+    )
+    .unwrap();
+    let projected_again = rebuilt.handoff_projection().unwrap();
+    assert_eq!(projected_again.lease_expires_at_epoch_seconds(), deadline);
+    assert!(projected_again.lease_duration() <= Duration::from_secs(1));
 }
 
 #[test]

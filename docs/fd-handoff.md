@@ -72,8 +72,13 @@ let secret = lease.resolve(kind)?;
 
 `receive_handoff_from_env` returns `Ok(None)` when the variable is absent, so
 a disconnected runtime can start and receive a handoff later through a slot.
-`receive_handoff(descriptor)` is the same intake for a descriptor the host
-already resolved.
+Environment intake is one-time: the variable is consumed — removed before the
+descriptor is touched — so a later call can never act on a descriptor number
+the OS may have reassigned since the first intake closed it.
+`receive_handoff(owned_fd)` is the same intake for a descriptor the host
+already resolved; it takes an `OwnedFd`, not a borrowed `RawFd`, so ownership
+transfer is explicit and the receiver never closes a descriptor the caller
+still owns.
 
 The end-to-end parent/child test lives in
 `crates/credential-lease/tests/fd_handoff.rs`: it spawns a real child process

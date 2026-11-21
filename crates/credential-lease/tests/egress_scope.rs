@@ -356,3 +356,15 @@ fn disconnected_slot_reports_the_deny_all_scope() {
     assert!(scope.is_deny_all());
     assert!(!scope.allow_redirects());
 }
+
+#[test]
+fn resolve_scoped_returns_the_secret_with_its_own_grants_scope() {
+    // A forwarding runtime reads the secret and the scope from the same
+    // lease snapshot — a concurrent handoff install can never pair the
+    // credential with another grant's boundary.
+    let scope = proxy_scope();
+    let slot = credential_lease::CredentialSlot::new(scoped_lease(scope.clone()));
+    let (secret, resolved_scope) = slot.resolve_scoped(Kind::Api).unwrap();
+    assert_eq!(secret.expose_bytes(), &[0xE4u8; 24]);
+    assert_eq!(resolved_scope, scope);
+}

@@ -27,9 +27,10 @@ let secret = lease.resolve(kind)?;
 ```
 
 When the host already resolved the descriptor, call
-`credential_lease::handoff_fd::receive_handoff(descriptor)` directly. The
-receiver bounds the read, parses the closed document, and closes the
-descriptor on every path. See `docs/fd-handoff.md` for the channel contract
+`credential_lease::handoff_fd::receive_handoff(owned_fd)` — it takes an
+`OwnedFd` so ownership transfer is explicit. The receiver bounds the read,
+parses the closed document, and closes the descriptor on every path. See
+`docs/fd-handoff.md` for the channel contract
 and the shared Rust/Go/TypeScript validation samples.
 
 The host supplies `Kind`, the authorized secret-bearing document, the epoch
@@ -57,9 +58,13 @@ can install their `CustodyPort` through `port::install` and access it through
   `auth_expired` `failureClass` that AwP and Fairliny-Gateway use to renew or
   switch safely. Process-integrity and epoch-source failures return `None`
   and must not trigger an automatic renewal.
-- A handoff also carries the owner-declared `EgressScope`: gate every
-  outbound target through `lease.egress().permits(&target)` (or
-  `handoff.egress()` / `slot.egress()`), honor `allow_redirects()` (off
+- A handoff also carries the owner-declared `EgressScope`: when forwarding
+  a resolved credential, take the secret and the scope from the same lease
+  snapshot through `slot.resolve_scoped(kind)` — resolving and reading
+  `slot.egress()` separately can observe two different grants across a
+  concurrent handoff install. Gate every outbound target through
+  `scope.permits(&target)` (or `lease.egress()` / `handoff.egress()` for a
+  single lease), honor `allow_redirects()` (off
   unless explicitly enabled), and render header injections through
   `HeaderTemplate::render` with the `{secret}` marker. An undeclared scope
   denies every target — it is a boundary, not a hint.

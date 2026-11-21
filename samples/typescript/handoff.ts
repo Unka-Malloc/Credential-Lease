@@ -503,10 +503,15 @@ function validate(document: Json): number {
   return kinds;
 }
 
-function handoffDescriptor(): number | undefined {
+// An absent variable is its own refusal — fd_missing — distinct from a
+// present but malformed value, matching the Rust and Go samples.
+function handoffDescriptor(): number | "missing" | "invalid" {
   const raw = process.env[HANDOFF_FD_ENV];
-  if (raw === undefined || !/^[0-9]{1,10}$/.test(raw)) {
-    return undefined;
+  if (raw === undefined) {
+    return "missing";
+  }
+  if (!/^[0-9]{1,10}$/.test(raw)) {
+    return "invalid";
   }
   const descriptor = Number(raw);
   if (
@@ -514,7 +519,7 @@ function handoffDescriptor(): number | undefined {
     descriptor < 3 ||
     descriptor > MAX_HANDOFF_DESCRIPTOR
   ) {
-    return undefined;
+    return "invalid";
   }
   return descriptor;
 }
@@ -543,8 +548,8 @@ function readDocument(descriptor: number): Buffer {
 
 function main(): number {
   const descriptor = handoffDescriptor();
-  if (descriptor === undefined) {
-    console.log("refused credential_lease_handoff_fd_invalid");
+  if (typeof descriptor !== "number") {
+    console.log(`refused credential_lease_handoff_fd_${descriptor}`);
     return 2;
   }
   let bytes: Buffer;
@@ -563,6 +568,16 @@ function main(): number {
   }
   let document: Json;
   try {
+    // A leading UTF-8 BOM is not part of the document, but TextDecoder
+    // strips it silently; refuse it explicitly like Rust and Go do.
+    if (
+      bytes.length >= 3 &&
+      bytes[0] === 0xef &&
+      bytes[1] === 0xbb &&
+      bytes[2] === 0xbf
+    ) {
+      throw new Rejected();
+    }
     const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     document = new StrictParser(text).parse();
   } catch {

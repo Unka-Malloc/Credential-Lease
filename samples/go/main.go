@@ -22,6 +22,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -60,9 +61,9 @@ func main() {
 }
 
 func run() int {
-	fd, ok := handoffDescriptor()
-	if !ok {
-		fmt.Fprintln(standardOutput, "refused credential_lease_handoff_fd_invalid")
+	fd, refusal := handoffDescriptor()
+	if refusal != "" {
+		fmt.Fprintln(standardOutput, "refused "+refusal)
 		return 2
 	}
 	document, err := readDocument(fd)
@@ -89,22 +90,27 @@ func run() int {
 }
 
 // handoffDescriptor accepts a plain decimal descriptor number at or above 3;
-// standard streams are never a valid handoff channel.
-func handoffDescriptor() (int, bool) {
+// standard streams are never a valid handoff channel. An absent variable is
+// its own refusal — credential_lease_handoff_fd_missing — distinct from a
+// present but malformed value.
+func handoffDescriptor() (descriptor int, refusal string) {
 	raw, present := os.LookupEnv(handoffFDEnv)
-	if !present || raw == "" || len(raw) > 10 {
-		return 0, false
+	if !present {
+		return 0, "credential_lease_handoff_fd_missing"
+	}
+	if raw == "" || len(raw) > 10 {
+		return 0, "credential_lease_handoff_fd_invalid"
 	}
 	for _, character := range raw {
 		if character < '0' || character > '9' {
-			return 0, false
+			return 0, "credential_lease_handoff_fd_invalid"
 		}
 	}
 	descriptor, err := strconv.Atoi(raw)
 	if err != nil || descriptor < 3 || descriptor > maxHandoffDescriptor {
-		return 0, false
+		return 0, "credential_lease_handoff_fd_invalid"
 	}
-	return descriptor, true
+	return descriptor, ""
 }
 
 func readDocument(descriptor int) ([]byte, error) {
@@ -414,6 +420,13 @@ func unsigned(value any) (uint64, bool) {
 // refused at every level, matching the reference implementation's closed
 // contract rather than JSON's usual last-wins behaviour.
 func parseDocument(data []byte) (any, error) {
+	// Go's decoder silently repairs malformed Unicode: invalid UTF-8 and an
+	// unpaired \u surrogate escape both decode as U+FFFD. The contract refuses
+	// both, so the raw bytes are validated before the decoder can replace
+	// them — matching the Rust and TypeScript implementations.
+	if !validJSONText(data) {
+		return nil, errInvalid
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
 	value, err := parseValue(decoder, 0)
@@ -487,4 +500,82 @@ func parseArray(decoder *json.Decoder, depth int) ([]any, error) {
 		return nil, err
 	}
 	return array, nil
+}
+
+// validJSONText enforces the two Unicode rules Go's decoder relaxes: the
+// document must be valid UTF-8, and a \u escape inside a string must not
+// carry an unpaired surrogate — both of which the decoder would otherwise
+// replace with U+FFFD. Escapes the scanner skips over (a truncated or
+// non-hex \u, a stray backslash) are left for the decoder itself to refuse.
+func validJSONText(data []byte) bool {
+	if !utf8.Valid(data) {
+		return false
+	}
+	inString := false
+	for index := 0; index < len(data); index++ {
+		if !inString {
+			if data[index] == '"' {
+				inString = true
+			}
+			continue
+		}
+		if data[index] == '"' {
+			inString = false
+			continue
+		}
+		if data[index] != '\\' {
+			continue
+		}
+		if index+1 >= len(data) {
+			return true
+		}
+		if data[index+1] != 'u' {
+			index++
+			continue
+		}
+		if index+6 > len(data) {
+			return true
+		}
+		code, ok := hex4(data[index+2 : index+6])
+		if !ok {
+			index += 5
+			continue
+		}
+		index += 5
+		switch {
+		case code >= 0xd800 && code <= 0xdbff:
+			// A high surrogate is valid only immediately paired with a low
+			// surrogate escape.
+			if index+6 > len(data) || data[index+1] != '\\' || data[index+2] != 'u' {
+				return false
+			}
+			low, ok := hex4(data[index+3 : index+7])
+			if !ok || low < 0xdc00 || low > 0xdfff {
+				return false
+			}
+			index += 6
+		case code >= 0xdc00 && code <= 0xdfff:
+			return false
+		}
+	}
+	return true
+}
+
+// hex4 reads exactly four hexadecimal digits as a UTF-16 code unit.
+func hex4(digits []byte) (uint32, bool) {
+	var value uint32
+	for _, digit := range digits {
+		value <<= 4
+		switch {
+		case digit >= '0' && digit <= '9':
+			value += uint32(digit - '0')
+		case digit >= 'a' && digit <= 'f':
+			value += uint32(digit-'a') + 10
+		case digit >= 'A' && digit <= 'F':
+			value += uint32(digit-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return value, true
 }

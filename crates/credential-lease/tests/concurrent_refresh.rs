@@ -416,3 +416,95 @@ fn epoch_revocation_broadcasts_to_every_lease_and_concurrent_refresh_recovers() 
         assert_slot_revoked(slot);
     }
 }
+
+#[test]
+fn resolve_scoped_never_pairs_a_secret_with_another_grants_scope() {
+    // Two grants pair distinct secrets with distinct egress scopes. A
+    // forwarding runtime resolves both through `resolve_scoped`; under a
+    // concurrent install the pair must always come from one lease
+    // snapshot — a fresh credential can never travel under the previous
+    // grant's boundary.
+    let epoch = credential_id(0xf000);
+    let source = Arc::new(SharedEpoch::new(Some(&epoch)));
+    let deny = EgressScope::deny_all();
+    let admit = EgressScope::new(
+        vec!["api.example.com".to_owned()],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        false,
+    )
+    .unwrap();
+    let slot = Arc::new(CredentialSlot::new(
+        CredentialLease::new(
+            credentials(seed(0, 0), "pair-deny"),
+            Duration::from_secs(3600),
+            epoch.clone(),
+            source.clone(),
+            deny.clone(),
+        )
+        .unwrap(),
+    ));
+    let start = Arc::new(Barrier::new(4));
+    let writer = {
+        let slot = slot.clone();
+        let source = source.clone();
+        let start = start.clone();
+        let epoch = epoch.clone();
+        let deny = deny.clone();
+        let admit = admit.clone();
+        thread::spawn(move || {
+            start.wait();
+            for round in 1..=REFRESH_ROUNDS {
+                let (value, scope) = if round % 2 == 0 {
+                    ("pair-deny", deny.clone())
+                } else {
+                    ("pair-admit", admit.clone())
+                };
+                slot.install_handoff(
+                    CredentialHandoff::new(
+                        credentials(seed(0, 70_000 + round), value),
+                        Duration::from_secs(3600),
+                        epoch.clone(),
+                        scope,
+                    )
+                    .unwrap(),
+                    source.clone(),
+                )
+                .unwrap();
+                thread::yield_now();
+            }
+        })
+    };
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let slot = slot.clone();
+            let start = start.clone();
+            let deny = deny.clone();
+            let admit = admit.clone();
+            thread::spawn(move || {
+                start.wait();
+                let mut seen = 0usize;
+                for _ in 0..READS_AFTER_REFRESH {
+                    let (secret, scope) = slot
+                        .resolve_scoped(Kind::Api)
+                        .expect("a live lease resolves during refresh");
+                    let bytes = secret.expose_bytes();
+                    assert!(
+                        (bytes == b"pair-deny" && scope == deny)
+                            || (bytes == b"pair-admit" && scope == admit),
+                        "a concurrent install paired a credential with another grant's scope"
+                    );
+                    seen += 1;
+                }
+                seen
+            })
+        })
+        .collect();
+    start.wait();
+    writer.join().unwrap();
+    for reader in readers {
+        assert_eq!(reader.join().unwrap(), READS_AFTER_REFRESH);
+    }
+}

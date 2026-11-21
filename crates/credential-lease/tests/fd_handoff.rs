@@ -375,6 +375,15 @@ fn fd_handoff_child_entry() {
                 -1,
                 "the receiver must close the descriptor after reading"
             );
+            // Intake is one-time: the variable was consumed, so a second
+            // call sees the channel as absent and can never re-close a
+            // descriptor number the OS may have reassigned.
+            assert!(
+                receive_handoff_from_env::<Kind>()
+                    .expect("the second intake")
+                    .is_none(),
+                "a consumed handoff variable must read as absent"
+            );
             let lease = CredentialLease::from_handoff(handoff, epoch_source())
                 .expect("rebuild the child's own lease");
             let secret = lease

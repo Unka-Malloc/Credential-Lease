@@ -26,7 +26,7 @@ use crate::kind::CredentialKind;
 use anyhow::{anyhow, ensure, Result};
 use std::ffi::OsString;
 use std::io::ErrorKind;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use zeroize::Zeroizing;
 
 /// The environment variable naming the inherited read-only descriptor that
@@ -44,19 +44,38 @@ pub const MIN_HANDOFF_FD: RawFd = 3;
 ///
 /// Returns `Ok(None)` when the variable is absent: a runtime may legitimately
 /// start disconnected and receive a handoff later through a slot.
+///
+/// Intake is one-time: the variable is consumed — removed before the
+/// descriptor is touched — so a later call can never act on a descriptor
+/// number the OS may have reassigned since the first intake closed it.
 pub fn receive_handoff_from_env<K: CredentialKind>() -> Result<Option<CredentialHandoff<K>>> {
-    match std::env::var_os(HANDOFF_FD_ENV) {
-        None => Ok(None),
-        Some(value) => Ok(Some(receive_handoff(parse_descriptor(&value)?)?)),
-    }
+    let Some(value) = take_handoff_variable() else {
+        return Ok(None);
+    };
+    let descriptor = parse_descriptor(&value)?;
+    // SAFETY: the spawn contract grants this process ownership of the
+    // descriptor the variable names — the same ownership transfer
+    // `receive_handoff` requires of a direct caller.
+    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    receive_handoff(descriptor).map(Some)
+}
+
+/// Consume the descriptor-number variable: read it and remove it so the
+/// environment cannot hand the same number to a second intake.
+fn take_handoff_variable() -> Option<OsString> {
+    let value = std::env::var_os(HANDOFF_FD_ENV)?;
+    std::env::remove_var(HANDOFF_FD_ENV);
+    Some(value)
 }
 
 /// Receive a handoff from an inherited read-only descriptor.
 ///
-/// The descriptor is consumed — closed once the read finishes, including
-/// when the document is refused. The returned handoff owns its own secret
-/// copies; every secret-bearing buffer this intake touches zeroizes on
-/// drop, on the success path and on every refusal path.
+/// The descriptor's ownership transfers to this call — an [`OwnedFd`], not
+/// a borrowed number — so it can never close a descriptor the caller still
+/// owns. It is closed once the read finishes, including when the document
+/// is refused. The returned handoff owns its own secret copies; every
+/// secret-bearing buffer this intake touches zeroizes on drop, on the
+/// success path and on every refusal path.
 ///
 /// The document accumulator is reserved to [`MAX_HANDOFF_DOC_BYTES`] before
 /// the first read, so it is exactly one allocation that can never grow:
@@ -70,12 +89,12 @@ pub fn receive_handoff_from_env<K: CredentialKind>() -> Result<Option<Credential
 /// must become the stable `credential_lease_handoff_fd_unavailable` refusal,
 /// and the standard library treats an ownable descriptor that turns out to
 /// be closed as a process-wide I/O safety violation instead.
-pub fn receive_handoff<K: CredentialKind>(descriptor: RawFd) -> Result<CredentialHandoff<K>> {
+pub fn receive_handoff<K: CredentialKind>(descriptor: OwnedFd) -> Result<CredentialHandoff<K>> {
     ensure!(
-        descriptor >= MIN_HANDOFF_FD,
+        descriptor.as_raw_fd() >= MIN_HANDOFF_FD,
         "credential_lease_handoff_fd_invalid"
     );
-    let owned = OwnedDescriptor(descriptor);
+    let owned = OwnedDescriptor(descriptor.into_raw_fd());
     // Reserved to the intake bound: the bound check below then guarantees
     // `extend_from_slice` never reallocates, so no superseded allocation
     // holding secret material is ever released unwiped.
