@@ -296,6 +296,12 @@ impl<K: CredentialKind> CredentialLease<K> {
         // a later monotonic reading would stamp a deadline past the
         // grant it projects whenever the preserved deadline is looser.
         let projected_at = self.clock_source.wall_now()?;
+        // The stamp samples are deadline readings like every other: a
+        // sample that lands past its deadline is an observed expiry and
+        // must latch here — otherwise a backward step of that clock
+        // before the final recheck would wash the crossing out and let
+        // the document carry credentials the grant no longer owns.
+        self.ensure_deadline_sample_live(projected_at, self.lease_deadline_epoch_seconds)?;
         // A lease carrying a shared-clock deadline can stamp it only
         // from a fresh sample on that same clock: the preserved wire
         // deadline may sit later than this lease's true monotonic
@@ -308,7 +314,10 @@ impl<K: CredentialKind> CredentialLease<K> {
             self.lease_monotonic_deadline_seconds,
             self.clock_source.monotonic_now(),
         ) {
-            (Some(_), Ok(Some(now))) => Some(now),
+            (Some(deadline), Ok(Some(now))) => {
+                self.ensure_deadline_sample_live(now, deadline)?;
+                Some(now)
+            }
             (Some(_), _) => return Err(anyhow!("credential_lease_clock_unavailable")),
             (None, reading) => reading?,
         };
@@ -562,10 +571,7 @@ impl<K: CredentialKind> CredentialLease<K> {
             bail!("credential_lease_expired");
         }
         let wall_now = self.clock_source.wall_now()?;
-        if wall_now >= Duration::from_secs(self.lease_deadline_epoch_seconds) {
-            self.deadline_expired.store(true, Ordering::Release);
-            bail!("credential_lease_expired");
-        }
+        self.ensure_deadline_sample_live(wall_now, self.lease_deadline_epoch_seconds)?;
         if let Some(deadline) = self.lease_monotonic_deadline_seconds {
             // An unreadable shared clock — a failed read, or a platform
             // reporting no comparable clock while a deadline rides it —
@@ -577,12 +583,28 @@ impl<K: CredentialKind> CredentialLease<K> {
                 .clock_source
                 .monotonic_now()?
                 .ok_or_else(|| anyhow!("credential_lease_clock_unavailable"))?;
-            if now >= Duration::from_secs(deadline) {
-                self.deadline_expired.store(true, Ordering::Release);
-                bail!("credential_lease_expired");
-            }
+            self.ensure_deadline_sample_live(now, deadline)?;
         }
         Ok(wall_now)
+    }
+
+    /// Enforce one clock-domain deadline against a sample just taken on
+    /// that clock. A sample at or past its deadline is an observed
+    /// expiry: recorded once so a later backward step of that clock can
+    /// never revive the grant, and refused the same way
+    /// [`Self::ensure_unexpired`] reports it. Every path that spends a
+    /// clock reading — a deadline check or a projection stamp — runs
+    /// the sample through here so no reading goes unenforced.
+    fn ensure_deadline_sample_live(
+        &self,
+        sample_since_epoch: Duration,
+        deadline_epoch_seconds: u64,
+    ) -> Result<()> {
+        if sample_since_epoch >= Duration::from_secs(deadline_epoch_seconds) {
+            self.deadline_expired.store(true, Ordering::Release);
+            bail!("credential_lease_expired");
+        }
+        Ok(())
     }
 }
 
@@ -758,8 +780,29 @@ impl<K: CredentialKind> CredentialSlot<K> {
         epoch_source: Arc<dyn LeaseEpochSource>,
     ) -> Result<()> {
         let lease = CredentialLease::from_handoff(handoff, epoch_source)?;
+        self.install_lease(lease)
+    }
+
+    /// Swap `lease` in only while it is still live. The incoming grant is
+    /// proven twice: once before waiting on the slot — a dead-on-arrival
+    /// lease refuses without queueing behind a resolution — and again
+    /// under the slot lock immediately before the swap. A resolution can
+    /// hold that lock while it consults its epoch source, so a grant that
+    /// crosses its deadline during the wait must refuse here instead of
+    /// reporting success while discarding the installed lease.
+    ///
+    /// `pub(crate)` is the test seam: a scripted-clock lease cannot come
+    /// through `install_handoff`, whose rebuild always reads the system
+    /// clocks.
+    pub(crate) fn install_lease(&self, lease: CredentialLease<K>) -> Result<()> {
         lease.ensure_unexpired()?;
-        self.replace(lease)
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow!("credential_lease_validation_unavailable"))?;
+        lease.ensure_unexpired()?;
+        *guard = lease;
+        Ok(())
     }
 
     /// The installed lease's egress scope — the deny-all scope when the

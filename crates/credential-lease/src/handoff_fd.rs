@@ -9,6 +9,8 @@
 //! - the value is a plain decimal descriptor number and nothing else;
 //! - descriptors below [`MIN_HANDOFF_FD`] are refused, so a missing or
 //!   misspelled setup can never fall back to reading standard input;
+//! - the descriptor's access mode is verified read-only before the first
+//!   read — a write-capable channel is refused, not merely unused;
 //! - the document is read to end of file, refused before it can grow past
 //!   [`MAX_HANDOFF_DOC_BYTES`], and
 //!   parsed under the same closed rules as any other handoff;
@@ -123,6 +125,12 @@ pub unsafe fn receive_handoff_from_env<K: CredentialKind>() -> Result<Option<Cre
 
 /// Receive a handoff from an inherited read-only descriptor.
 ///
+/// The descriptor must be open read-only: the grant is a one-way channel,
+/// so a descriptor whose access mode allows writing is refused as
+/// `credential_lease_handoff_fd_invalid` before any byte is read — a
+/// read-write end could carry material back to the producer even where
+/// the read side supplies a perfectly valid document.
+///
 /// The descriptor's ownership transfers to this call — an [`OwnedFd`], not
 /// a borrowed number — so it can never close a descriptor the caller still
 /// owns. It is marked close-on-exec the moment the claim lands — a
@@ -147,6 +155,21 @@ pub unsafe fn receive_handoff_from_env<K: CredentialKind>() -> Result<Option<Cre
 pub fn receive_handoff<K: CredentialKind>(descriptor: OwnedFd) -> Result<CredentialHandoff<K>> {
     ensure!(
         descriptor.as_raw_fd() >= MIN_HANDOFF_FD,
+        "credential_lease_handoff_fd_invalid"
+    );
+    // The contract grants a read-only channel: a descriptor opened
+    // read-write or write-only is refused before the first read — a
+    // write-capable end could carry material back to the producer, and
+    // a read-write descriptor can answer a bounded read without ever
+    // being the one-way channel the grant requires. A flags query that
+    // cannot answer means the descriptor cannot serve the channel at
+    // all: refused as unavailable, not as a contract violation.
+    let flags =
+        // SAFETY: `descriptor` is a live descriptor owned by this call.
+        unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFL) };
+    ensure!(flags != -1, "credential_lease_handoff_fd_unavailable");
+    ensure!(
+        flags & libc::O_ACCMODE == libc::O_RDONLY,
         "credential_lease_handoff_fd_invalid"
     );
     // Claiming ownership also marks the descriptor close-on-exec: the

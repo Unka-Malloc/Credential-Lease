@@ -5,8 +5,9 @@
 //! the secret, and reports it back over a second pipe.
 //!
 //! The child also proves the negative half of the contract: the environment
-//! carries the descriptor number and nothing else, the read end is not
-//! writable, the descriptor is closed once read, malformed or oversized
+//! carries the descriptor number and nothing else, a descriptor whose
+//! access mode permits writing is refused through both intake entry
+//! points, the descriptor is closed once read, malformed or oversized
 //! documents fail closed with stable codes, and a descendant that inherits
 //! the consumed variable fails closed at start instead of reading a stale
 //! or reassigned descriptor number.
@@ -150,6 +151,31 @@ struct SpawnedChild {
 impl SpawnedChild {
     fn spawn(mode: &str, descriptor_value: &str) -> Self {
         let (handoff_read, handoff_write) = pipe();
+        Self::spawn_over(mode, descriptor_value, handoff_read, handoff_write)
+    }
+
+    /// Spawn with a read-write channel standing in for the handoff
+    /// descriptor: both ends of a socketpair are read-write — the shape
+    /// the read-only contract refuses. The parent end is held open so
+    /// the child's refusal cannot be confused with a broken channel.
+    fn spawn_rw(mode: &str, descriptor_value: &str) -> Self {
+        let mut pair = [0; 2];
+        // SAFETY: `socketpair` writes exactly two descriptors into the array.
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) },
+            0
+        );
+        close_on_exec(pair[0]);
+        close_on_exec(pair[1]);
+        Self::spawn_over(mode, descriptor_value, pair[0], pair[1])
+    }
+
+    fn spawn_over(
+        mode: &str,
+        descriptor_value: &str,
+        handoff_source: RawFd,
+        parent_end: RawFd,
+    ) -> Self {
         let (result_read, result_write) = pipe();
         let executable = std::env::current_exe().expect("test binary path");
         let mut command = Command::new(executable);
@@ -168,7 +194,7 @@ impl SpawnedChild {
                 // Move both sources out of the 3/4 target range first, so a
                 // source that happens to already be 3 or 4 cannot be
                 // clobbered by the other duplication.
-                let handoff_source = libc::fcntl(handoff_read, libc::F_DUPFD, 60);
+                let handoff_source = libc::fcntl(handoff_source, libc::F_DUPFD, 60);
                 if handoff_source < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -193,14 +219,14 @@ impl SpawnedChild {
             });
         }
         let child = command.spawn().expect("spawn handoff child");
-        close_fd(handoff_read);
+        close_fd(handoff_source);
         close_fd(result_write);
         // SAFETY: the two kept descriptors are owned by this struct and are
         // closed exactly once through the `File` values.
         unsafe {
             Self {
                 child,
-                handoff: Some(File::from_raw_fd(handoff_write)),
+                handoff: Some(File::from_raw_fd(parent_end)),
                 result: File::from_raw_fd(result_read),
             }
         }
@@ -344,6 +370,41 @@ fn unavailable_descriptor_fails_closed() {
         report,
         [REFUSED_FRAME, b"credential_lease_handoff_fd_unavailable"].concat()
     );
+}
+
+#[test]
+fn read_write_descriptor_fails_closed_through_the_environment() {
+    // The environment intake: the descriptor the variable names is a
+    // socketpair end — read-write. The one-way contract refuses it
+    // before any byte is read, even though its read side could supply
+    // a document.
+    let (status, report) = SpawnedChild::spawn_rw("invalid-fd", "3").finish();
+    assert!(status.success(), "child exited with {status}");
+    assert_eq!(
+        report,
+        [REFUSED_FRAME, b"credential_lease_handoff_fd_invalid"].concat()
+    );
+}
+
+#[test]
+fn write_capable_descriptors_fail_closed_through_direct_intake() {
+    // The direct intake: an `OwnedFd` whose access mode permits writing
+    // is refused before the first read — the contract is enforced, not
+    // merely assumed of the producer.
+    for mode in [libc::O_RDWR, libc::O_WRONLY] {
+        // SAFETY: /dev/null opens with the requested access mode; the
+        // descriptor transfers to `receive_handoff` exactly once.
+        let descriptor = unsafe { libc::open(c"/dev/null".as_ptr(), mode) };
+        assert!(
+            descriptor >= 3,
+            "/dev/null must open above the standard descriptor set"
+        );
+        // SAFETY: `descriptor` is a live descriptor exclusively owned by
+        // this call.
+        let error = receive_handoff::<Kind>(unsafe { OwnedFd::from_raw_fd(descriptor) })
+            .expect_err("a write-capable descriptor must refuse");
+        assert_eq!(error.to_string(), "credential_lease_handoff_fd_invalid");
+    }
 }
 
 #[test]

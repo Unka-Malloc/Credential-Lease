@@ -8,6 +8,7 @@ use crate::lease::{
 use crate::SecretBytes;
 use anyhow::Result;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1360,6 +1361,238 @@ fn a_deadline_crossed_during_projection_refuses_the_secret_bearing_handoff() {
     assert_eq!(
         lease.handoff_projection().unwrap_err().to_string(),
         "credential_lease_expired"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_stamp_sample_past_the_deadline_latches_the_projection() {
+    // Projection's wall stamp sample is a deadline reading like every
+    // other: sampled past the owner-authorized deadline it latches the
+    // lease right there. The script lands the stamp sample past the
+    // deadline and steps back inside before the freshness recheck —
+    // without enforcement on the sample itself, the recheck would read
+    // the rewound clock and release a secret-bearing document over a
+    // grant already seen elapsed.
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let source = Arc::new(TestEpochSource(StdMutex::new(Some(epoch.clone()))));
+    let mut credentials = BTreeMap::new();
+    credentials.insert(TestKind::Beta, vec![test_credential(0xE9)]);
+    let wall_now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Mint and both epoch-bracketing reads stay inside the deadline;
+    // the stamp sample lands past it; the tail steps back inside.
+    let clock_source = Arc::new(TestClocks::with_wall_sequence(
+        vec![
+            Duration::from_secs(wall_now),
+            Duration::from_secs(wall_now),
+            Duration::from_secs(wall_now),
+            Duration::from_secs(wall_now + 120),
+            Duration::from_secs(wall_now),
+        ],
+        None,
+    ));
+    let lease = CredentialLease::new_with_binding_for_test(
+        credentials,
+        Duration::from_secs(3600),
+        epoch,
+        source,
+        EgressScope::deny_all(),
+        std::process::id(),
+        Instant::now() + Duration::from_secs(3600),
+        wall_now + 60,
+        None,
+        clock_source,
+    )
+    .unwrap();
+    assert_eq!(
+        lease.handoff_projection().unwrap_err().to_string(),
+        "credential_lease_expired"
+    );
+    // The wall script has stepped back inside the deadline; the latched
+    // expiry still refuses every later use.
+    for _ in 0..2 {
+        assert_eq!(
+            lease.resolve(TestKind::Beta).unwrap_err().to_string(),
+            "credential_lease_expired"
+        );
+        assert_eq!(
+            lease.handoff_projection().unwrap_err().to_string(),
+            "credential_lease_expired"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_stamp_sample_past_the_monotonic_deadline_latches_the_projection() {
+    // The monotonic stamp sample enforces the carried wire deadline the
+    // same way: a sample that lands past it latches the lease before the
+    // document is produced, so a monotonic reading that steps back
+    // cannot revive the grant on the freshness recheck.
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let source = Arc::new(TestEpochSource(StdMutex::new(Some(epoch.clone()))));
+    let mut credentials = BTreeMap::new();
+    credentials.insert(TestKind::Beta, vec![test_credential(0xEA)]);
+    let wall_now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let monotonic_reading = crate::handoff::monotonic_now().unwrap().unwrap();
+    // Mint and both epoch-bracketing reads stay inside the deadline;
+    // the stamp sample lands past it; the tail steps back inside.
+    let clock_source = Arc::new(TestClocks::with_monotonic_sequence(
+        wall_now,
+        vec![
+            Ok(Some(monotonic_reading)),
+            Ok(Some(monotonic_reading)),
+            Ok(Some(monotonic_reading)),
+            Ok(Some(monotonic_reading + Duration::from_secs(120))),
+            Ok(Some(monotonic_reading)),
+        ],
+    ));
+    let lease = CredentialLease::new_with_binding_for_test(
+        credentials,
+        Duration::from_secs(3600),
+        epoch,
+        source,
+        EgressScope::deny_all(),
+        std::process::id(),
+        Instant::now() + Duration::from_secs(3600),
+        wall_now.as_secs() + 3600,
+        Some(monotonic_reading.as_secs() + 60),
+        clock_source,
+    )
+    .unwrap();
+    assert_eq!(
+        lease.handoff_projection().unwrap_err().to_string(),
+        "credential_lease_expired"
+    );
+    // The monotonic script has stepped back inside the deadline; the
+    // latched expiry still refuses every later use.
+    for _ in 0..2 {
+        assert_eq!(
+            lease.resolve(TestKind::Beta).unwrap_err().to_string(),
+            "credential_lease_expired"
+        );
+        assert_eq!(
+            lease.handoff_projection().unwrap_err().to_string(),
+            "credential_lease_expired"
+        );
+    }
+}
+
+/// An epoch source that signals when a consultation starts and holds it
+/// open until released — a resolution keeps the slot lock for the whole
+/// consult, which is exactly the wait a concurrent install can outlive
+/// its grant inside.
+struct ConsultingEpoch {
+    epoch: String,
+    entered: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+}
+
+impl LeaseEpochSource for ConsultingEpoch {
+    fn active_epoch(&self) -> Result<Option<String>> {
+        self.entered.store(true, Ordering::Release);
+        while !self.release.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        Ok(Some(self.epoch.clone()))
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_grant_expired_during_the_install_wait_never_replaces_the_live_lease() {
+    // Install proves the incoming grant twice — once before waiting on
+    // the slot and again under the slot lock immediately before the
+    // swap. A resolution holds that lock for its whole epoch consult,
+    // long enough for the incoming deadline to pass. The script answers
+    // the mint and the pre-lock check inside the deadline and the
+    // under-lock check past it: the install must refuse and the live
+    // installed lease must survive — the pre-fix shape would have
+    // swapped the dead grant in and still reported success.
+    let epoch = uuid::Uuid::new_v4().to_string();
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let epoch_source: Arc<dyn LeaseEpochSource> = Arc::new(ConsultingEpoch {
+        epoch: epoch.clone(),
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+    let mut installed = BTreeMap::new();
+    installed.insert(TestKind::Beta, vec![test_credential(0xF1)]);
+    let slot = Arc::new(CredentialSlot::new(
+        CredentialLease::new(
+            installed,
+            Duration::from_secs(3600),
+            epoch.clone(),
+            epoch_source,
+            EgressScope::deny_all(),
+        )
+        .unwrap(),
+    ));
+    let wall_now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Mint and the pre-lock check stay inside the deadline; the
+    // under-lock reading lands past it.
+    let clock_source = Arc::new(TestClocks::with_wall_sequence(
+        vec![
+            Duration::from_secs(wall_now),
+            Duration::from_secs(wall_now),
+            Duration::from_secs(wall_now + 120),
+        ],
+        None,
+    ));
+    let mut incoming = BTreeMap::new();
+    incoming.insert(TestKind::Beta, vec![test_credential(0xF2)]);
+    let incoming = CredentialLease::new_with_binding_for_test(
+        incoming,
+        Duration::from_secs(3600),
+        epoch,
+        Arc::new(TestEpochSource(StdMutex::new(Some(
+            "00000000-0000-4000-8000-000000000000".to_owned(),
+        )))),
+        EgressScope::deny_all(),
+        std::process::id(),
+        Instant::now() + Duration::from_secs(3600),
+        wall_now + 60,
+        None,
+        clock_source,
+    )
+    .unwrap();
+    // A resolution parks inside its epoch consult holding the slot lock;
+    // the installer waits behind it.
+    let resolver = {
+        let slot = slot.clone();
+        std::thread::spawn(move || slot.resolve(TestKind::Beta))
+    };
+    while !entered.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+    let installer = {
+        let slot = slot.clone();
+        std::thread::spawn(move || slot.install_lease(incoming))
+    };
+    for _ in 0..8 {
+        std::thread::yield_now();
+    }
+    release.store(true, Ordering::Release);
+    assert_eq!(
+        resolver.join().unwrap().unwrap().expose_bytes(),
+        &[0xF1u8; 16]
+    );
+    assert_eq!(
+        installer.join().unwrap().unwrap_err().to_string(),
+        "credential_lease_expired"
+    );
+    // The refused install left the live lease installed.
+    assert!(slot.connected());
+    assert_eq!(
+        slot.resolve(TestKind::Beta).unwrap().expose_bytes(),
+        &[0xF1u8; 16]
     );
 }
 

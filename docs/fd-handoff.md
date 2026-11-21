@@ -26,14 +26,19 @@ setup from silently reading standard input as a handoff.
 ## Receiver behavior
 
 1. Parse `FAIRLINY_HANDOFF_FD` as a plain decimal descriptor number.
-2. Claim the descriptor close-on-exec before the first read: a descendant
+2. Verify the descriptor's access mode is read-only before the first
+   read: the grant is a one-way channel, so a descriptor that permits
+   writing — a read-write socket end, a write-only end — is refused as
+   `credential_lease_handoff_fd_invalid` even where its read side would
+   supply a valid document.
+3. Claim the descriptor close-on-exec before the first read: a descendant
    exec'd while the document is still arriving can never inherit the read
    end, so the secret-bearing channel cannot escape past intake.
-3. Read the descriptor to end of file, refusing the document before the
+4. Read the descriptor to end of file, refusing the document before the
    accumulated size can exceed `MAX_HANDOFF_DOC_BYTES` (2,229,554 bytes).
-4. Close the descriptor once the read finishes — on the success path and on
+5. Close the descriptor once the read finishes — on the success path and on
    every refusal path.
-5. Parse and validate under the closed document rules in
+6. Parse and validate under the closed document rules in
    [handoff.md](handoff.md). The document is secret-bearing, so the receiver
    reserves the accumulator to the bound before the first read — growth can
    never release an unscrubbed copy — and both the read scratch and the
@@ -82,7 +87,7 @@ no ungranted exec can happen while the descriptor is still inheritable.
 
 | Refusal | Meaning |
 | --- | --- |
-| `credential_lease_handoff_fd_invalid` | `FAIRLINY_HANDOFF_FD` is not a plain decimal descriptor number, or names a number below 3. |
+| `credential_lease_handoff_fd_invalid` | `FAIRLINY_HANDOFF_FD` is not a plain decimal descriptor number, names a number below 3, or the descriptor's access mode is not read-only. |
 | `credential_lease_handoff_fd_unavailable` | The descriptor cannot be read: closed, unreadable, or interrupted by an error other than a retryable signal. |
 | `credential_lease_handoff_invalid` | The document is oversized, truncated, non-UTF-8, or violates any closed-document rule. |
 

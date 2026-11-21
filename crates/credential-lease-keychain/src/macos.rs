@@ -312,9 +312,19 @@ pub(crate) fn selected_backend() -> Option<KeychainBackend> {
 
 impl Keychain {
     /// Write one protected item: update the existing record when present,
-    /// otherwise add it. The add path retries a lost update race exactly
-    /// once so a duplicate that appears between the two calls is still
-    /// written.
+    /// otherwise add it.
+    ///
+    /// `SecItemUpdate` cannot attach or change an item's `SecAccessControl`
+    /// on the Data Protection Keychain: an update carrying one reports
+    /// success while the item keeps the protection it was created with.
+    /// The write therefore verifies the existing item's protection on the
+    /// Data Protection Keychain first — an item already carrying this
+    /// backend's access control takes a value-only update; one under any
+    /// other protection is deleted and re-added, the only way protection
+    /// changes; an absent item is added directly. A duplicate that
+    /// appears between the check and the add re-runs the verification
+    /// once before the last write, and every completed write re-reads the
+    /// item's attributes to prove the required protection landed.
     ///
     /// A query declaring `synchronizable` is refused before any SecItem
     /// call: the platform cannot attach the device-only access control
@@ -332,48 +342,66 @@ impl Keychain {
     ) -> Result<(), KeychainError> {
         let store = effective_store(query, self.backend)?;
         ensure_write_supported(query, store)?;
-        let query_dict =
-            CFDictionary::from_CFType_pairs(&base_pairs(query, context, self.backend)?);
-        // Data Protection applies SecAccessControl. The classic Keychain has
-        // separate application ACLs; this update cannot convert those ACLs.
-        let update =
-            CFDictionary::from_CFType_pairs(&protected_secret_pairs(secret.expose_bytes())?);
-        // SAFETY: query and update own their CF values for the synchronous call.
-        let update_status = keychain_effect(store, || unsafe {
-            SecItemUpdate(
-                query_dict.as_concrete_TypeRef(),
-                update.as_concrete_TypeRef(),
-            )
-        })?;
-        match keychain_update_transition(update_status) {
-            KeychainUpdateTransition::Complete => return Ok(()),
-            KeychainUpdateTransition::AddNew => {}
-            KeychainUpdateTransition::Fail(status) => {
-                return status_result("write", status);
+        let query_pairs = base_pairs(query, context, self.backend)?;
+        let query_dict = CFDictionary::from_CFType_pairs(&query_pairs);
+        let mut retry_on_duplicate = true;
+        loop {
+            match protection_action(existing_item_protection(&query_pairs, store)?) {
+                ProtectionAction::UpdateValue => {
+                    let update = CFDictionary::from_CFType_pairs(&secret_value_pairs(
+                        secret.expose_bytes(),
+                    )?);
+                    // SAFETY: query and update own their CF values for the
+                    // synchronous call.
+                    let update_status = keychain_effect(store, || unsafe {
+                        SecItemUpdate(
+                            query_dict.as_concrete_TypeRef(),
+                            update.as_concrete_TypeRef(),
+                        )
+                    })?;
+                    match keychain_update_transition(update_status) {
+                        KeychainUpdateTransition::Complete => {
+                            return ensure_write_protected(&query_pairs, store);
+                        }
+                        // The item vanished between the protection check
+                        // and the update: fall through to the add.
+                        KeychainUpdateTransition::AddNew => {}
+                        KeychainUpdateTransition::Fail(status) => {
+                            return status_result("write", status);
+                        }
+                    }
+                }
+                ProtectionAction::ReplaceItem => {
+                    // SAFETY: query_dict owns its CF values for the
+                    // synchronous call.
+                    let delete_status = keychain_effect(store, || unsafe {
+                        SecItemDelete(query_dict.as_concrete_TypeRef())
+                    })?;
+                    if delete_status != errSecSuccess && delete_status != errSecItemNotFound {
+                        return status_result("delete", delete_status);
+                    }
+                }
+                ProtectionAction::AddItem => {}
             }
-        }
-
-        let mut pairs = base_pairs(query, context, self.backend)?;
-        pairs.extend(protected_secret_pairs(secret.expose_bytes())?);
-        let add_query = CFDictionary::from_CFType_pairs(&pairs);
-        // SAFETY: add_query owns all referenced values for the synchronous call.
-        let add_status = keychain_effect(store, || unsafe {
-            SecItemAdd(add_query.as_concrete_TypeRef(), ptr::null_mut())
-        })?;
-        if add_status == errSecSuccess {
-            return Ok(());
-        }
-        if add_status == errSecDuplicateItem {
-            // SAFETY: query and update remain valid for the synchronous retry.
-            let retry_status = keychain_effect(store, || unsafe {
-                SecItemUpdate(
-                    query_dict.as_concrete_TypeRef(),
-                    update.as_concrete_TypeRef(),
-                )
+            let mut pairs = query_pairs.clone();
+            pairs.extend(protected_secret_pairs(secret.expose_bytes())?);
+            let add_query = CFDictionary::from_CFType_pairs(&pairs);
+            // SAFETY: add_query owns all referenced values for the synchronous call.
+            let add_status = keychain_effect(store, || unsafe {
+                SecItemAdd(add_query.as_concrete_TypeRef(), ptr::null_mut())
             })?;
-            return status_result("write", retry_status);
+            if add_status == errSecSuccess {
+                return ensure_write_protected(&query_pairs, store);
+            }
+            // A duplicate appeared between the check and the add: a
+            // racing writer placed the item, and its own protection is
+            // unknown — the check runs once more before the last write.
+            if add_status == errSecDuplicateItem && retry_on_duplicate {
+                retry_on_duplicate = false;
+                continue;
+            }
+            return status_result("write", add_status);
         }
-        status_result("write", add_status)
     }
 
     /// Append-only add: the item is created or `Duplicate` is reported —
@@ -760,8 +788,10 @@ fn classic_migration_pairs(
     ])
 }
 
-/// The write payload: a `SecAccessControl` requiring user presence plus
-/// the value bytes.
+/// The add payload: a `SecAccessControl` requiring user presence plus
+/// the value bytes. Only `SecItemAdd` can attach the access control;
+/// [`Keychain::set_item`]'s update path uses [`secret_value_pairs`]
+/// after verifying the existing item already carries it.
 fn protected_secret_pairs(secret: &[u8]) -> Result<Vec<(CFString, CFType)>, KeychainError> {
     Ok(vec![
         (
@@ -773,6 +803,18 @@ fn protected_secret_pairs(secret: &[u8]) -> Result<Vec<(CFString, CFType)>, Keyc
             zeroizing_cf_data(secret)?.into_CFType(),
         ),
     ])
+}
+
+/// The update payload: the value bytes alone. `SecItemUpdate` cannot
+/// attach or change an item's `SecAccessControl`, so the update runs
+/// only on an item whose protection [`existing_item_protection`] just
+/// verified — carrying the control in the update dictionary would
+/// report success while the item kept whatever it was created with.
+fn secret_value_pairs(secret: &[u8]) -> Result<Vec<(CFString, CFType)>, KeychainError> {
+    Ok(vec![(
+        security_framework_static!(kSecValueData, sec_key),
+        zeroizing_cf_data(secret)?.into_CFType(),
+    )])
 }
 
 /// The access control every protected write carries — and the one
@@ -943,18 +985,18 @@ fn keychain_update_transition(status: i32) -> KeychainUpdateTransition {
     }
 }
 
-/// Data-only copy — the legacy classic read and any path that does not
-/// need attributes.
-fn copy_secret_from_query_effect(
+/// Run `SecItemCopyMatching` over `pairs`. Any returned object is owned
+/// before the status resolves or classic UI restores — in particular, a
+/// restore failure must drop the returned object. An absent item and an
+/// empty success both answer `None`.
+fn copy_matching(
     pairs: &[(CFString, CFType)],
     backend: KeychainBackend,
-) -> Result<Option<SecretBytes>, KeychainError> {
+) -> Result<Option<CFType>, KeychainError> {
     let query = CFDictionary::from_CFType_pairs(pairs);
     let mut copied: CFTypeRef = ptr::null();
     // SAFETY: query is valid and copied is an initialized out-pointer.
     let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut copied) };
-    // Own any result before resolving status or restoring classic UI. In
-    // particular, a restore failure must drop the returned secret object.
     let value = if copied.is_null() {
         None
     } else {
@@ -966,7 +1008,16 @@ fn copy_secret_from_query_effect(
         return Ok(None);
     }
     status_result("read", status)?;
-    let Some(value) = value else {
+    Ok(value)
+}
+
+/// Data-only copy — the legacy classic read and any path that does not
+/// need attributes.
+fn copy_secret_from_query_effect(
+    pairs: &[(CFString, CFType)],
+    backend: KeychainBackend,
+) -> Result<Option<SecretBytes>, KeychainError> {
+    let Some(value) = copy_matching(pairs, backend)? else {
         return Ok(None);
     };
     let data = value.downcast::<CFData>().ok_or_else(data_invalid)?;
@@ -988,22 +1039,7 @@ fn copy_item_from_query_effect(
     pairs: &[(CFString, CFType)],
     backend: KeychainBackend,
 ) -> Result<Option<KeychainItem>, KeychainError> {
-    let query = CFDictionary::from_CFType_pairs(pairs);
-    let mut copied: CFTypeRef = ptr::null();
-    // SAFETY: query is valid and copied is an initialized out-pointer.
-    let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut copied) };
-    let value = if copied.is_null() {
-        None
-    } else {
-        // SAFETY: SecItemCopyMatching returns its object at +1 ownership.
-        Some(unsafe { CFType::wrap_under_create_rule(copied) })
-    };
-    let status = keychain_effect_status(backend, status)?;
-    if status == errSecItemNotFound {
-        return Ok(None);
-    }
-    status_result("read", status)?;
-    let Some(value) = value else {
+    let Some(value) = copy_matching(pairs, backend)? else {
         return Ok(None);
     };
     let attributes = value.downcast::<CFDictionary>().ok_or_else(data_invalid)?;
@@ -1050,6 +1086,73 @@ fn item_provenance(attributes: &CFDictionary) -> Result<KeychainItemProvenance, 
             },
         ),
     })
+}
+
+/// What an existing item's protection decides for a write: `None` when
+/// no item matches the query, `Some(true)` only when it already carries
+/// exactly this backend's `SecAccessControl`, `Some(false)` for every
+/// other protection — an accessible-only item, a different
+/// `SecAccessControl`, or no access control at all. The attribute query
+/// rides the caller's `query_pairs`, so it lands on the same pinned
+/// store the write targets — for a protected write, the Data Protection
+/// Keychain — and it never asks for value data.
+fn existing_item_protection(
+    query_pairs: &[(CFString, CFType)],
+    store: KeychainBackend,
+) -> Result<Option<bool>, KeychainError> {
+    let mut pairs = query_pairs.to_vec();
+    pairs.push((
+        security_framework_static!(kSecReturnAttributes, sec_key),
+        CFBoolean::from(true).into_CFType(),
+    ));
+    let Some(value) = copy_matching(&pairs, store)? else {
+        return Ok(None);
+    };
+    let attributes = value.downcast::<CFDictionary>().ok_or_else(data_invalid)?;
+    item_provenance(&attributes).map(|provenance| Some(provenance.has_backend_access_control()))
+}
+
+/// The closing check of every protected write: re-read the item's
+/// attributes on the same store and require the access control this
+/// backend writes. A write the store reported successful but cannot
+/// prove its protection on — a racing writer's replacement, or a store
+/// that silently dropped the control — refuses rather than reporting an
+/// unprotected item as written.
+fn ensure_write_protected(
+    query_pairs: &[(CFString, CFType)],
+    store: KeychainBackend,
+) -> Result<(), KeychainError> {
+    match existing_item_protection(query_pairs, store)? {
+        Some(true) => Ok(()),
+        _ => Err(KeychainError::new(
+            "credential_lease_keychain_protection_unenforced",
+            KeychainErrorKind::Failed,
+            None,
+        )),
+    }
+}
+
+/// What the existing item's verified protection allows [`Keychain::set_item`]
+/// to do.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProtectionAction {
+    /// The item already carries this backend's access control: update
+    /// its value only — the protection stays whatever it was created
+    /// with, and it was just proven correct.
+    UpdateValue,
+    /// The item exists under different protection `SecItemUpdate` can
+    /// never change: delete it so the add re-stores it protected.
+    ReplaceItem,
+    /// No item exists: add one carrying the required access control.
+    AddItem,
+}
+
+fn protection_action(existing_protection: Option<bool>) -> ProtectionAction {
+    match existing_protection {
+        Some(true) => ProtectionAction::UpdateValue,
+        Some(false) => ProtectionAction::ReplaceItem,
+        None => ProtectionAction::AddItem,
+    }
 }
 
 fn dictionary_value(dictionary: &CFDictionary, key: CFStringRef) -> Option<CFType> {
@@ -1542,7 +1645,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_item_updates_include_user_presence_access_control() {
+    fn the_add_payload_carries_user_presence_access_control() {
         let pairs = protected_secret_pairs(&[0xA5u8; 24]).unwrap();
         assert_eq!(pairs.len(), 2);
         assert_eq!(
@@ -1553,6 +1656,32 @@ mod tests {
             pairs[1].0,
             security_framework_static!(kSecValueData, sec_key)
         );
+    }
+
+    #[test]
+    fn the_update_payload_carries_only_the_value_bytes() {
+        // SecItemUpdate cannot attach a SecAccessControl to an item that
+        // already exists: the update dictionary must carry the value
+        // alone, so a mismatched item can never report success while
+        // keeping weaker protection.
+        let pairs = secret_value_pairs(&[0xA5u8; 24]).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(
+            pairs[0].0,
+            security_framework_static!(kSecValueData, sec_key)
+        );
+    }
+
+    #[test]
+    fn only_a_verified_matching_item_takes_a_value_update() {
+        assert_eq!(protection_action(Some(true)), ProtectionAction::UpdateValue);
+        // Any other protection — weaker, different, or absent access
+        // control — is re-stored through delete-then-add, never updated.
+        assert_eq!(
+            protection_action(Some(false)),
+            ProtectionAction::ReplaceItem
+        );
+        assert_eq!(protection_action(None), ProtectionAction::AddItem);
     }
 
     #[test]
