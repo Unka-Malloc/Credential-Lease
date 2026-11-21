@@ -174,6 +174,56 @@ check_channel_all() {
   fi
 }
 
+check_writable_channel() {
+  # language, open mode ("RDWR" over the valid vector or "WRONLY" to
+  # /dev/null), expected status, expected output, command...
+  local language="$1"
+  local mode="$2"
+  local expected_status="$3"
+  local expected_output="$4"
+  shift 4
+  if [ "$#" -eq 0 ]; then
+    return 0
+  fi
+  checks=$((checks + 1))
+  local output
+  local status
+  # The channel is write-capable: the access-mode check must refuse it as
+  # fd_invalid before the first read, even where — read-write over the
+  # real valid vector — the bytes behind the descriptor would pass.
+  if [ "$mode" = "RDWR" ]; then
+    if output=$(FAIRLINY_HANDOFF_FD=3 "$@" 3<>"$vectors/valid.json" 2>/dev/null); then
+      status=0
+    else
+      status=$?
+    fi
+  else
+    if output=$(FAIRLINY_HANDOFF_FD=3 "$@" 3>/dev/null 2>/dev/null); then
+      status=0
+    else
+      status=$?
+    fi
+  fi
+  if [ "$status" -ne "$expected_status" ] || [ "$output" != "$expected_output" ]; then
+    echo "FAIL $language channel=$mode: status=$status output=$output (expected $expected_status/$expected_output)"
+    failures=$((failures + 1))
+  fi
+}
+
+check_writable_channel_all() {
+  local mode="$1"
+  local expected_status="$2"
+  local expected_output="$3"
+  check_writable_channel rust "$mode" "$expected_status" "$expected_output" "$rust_sample"
+  if [ -n "$go_sample" ]; then
+    check_writable_channel go "$mode" "$expected_status" "$expected_output" "$go_sample"
+  fi
+  if [ "${#ts_command[@]}" -gt 0 ]; then
+    check_writable_channel typescript "$mode" "$expected_status" "$expected_output" \
+      "${ts_command[@]}" "$root/samples/typescript/handoff.ts"
+  fi
+}
+
 for vector in "$vectors"/*.json; do
   case "$(basename "$vector")" in
     valid.json | valid-*.json)
@@ -202,6 +252,12 @@ check_channel_all "ABSENT" 2 "refused credential_lease_handoff_fd_missing"
 check_channel_all "not-a-descriptor" 2 "refused credential_lease_handoff_fd_invalid"
 check_channel_all "2" 2 "refused credential_lease_handoff_fd_invalid"
 check_channel_all "200" 2 "refused credential_lease_handoff_fd_unavailable"
+
+# A write-capable channel is refused before the first read even where the
+# document behind it is valid: read-write over the real vector, and
+# write-only to /dev/null, each get the same refusal from every language.
+check_writable_channel_all "RDWR" 2 "refused credential_lease_handoff_fd_invalid"
+check_writable_channel_all "WRONLY" 2 "refused credential_lease_handoff_fd_invalid"
 
 if [ "$checks" -eq 0 ]; then
   echo "FAIL samples: no language sample ran" >&2

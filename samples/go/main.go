@@ -22,6 +22,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"unicode/utf8"
 )
 
@@ -63,6 +64,10 @@ func main() {
 func run() int {
 	fd, refusal := handoffDescriptor()
 	if refusal != "" {
+		fmt.Fprintln(standardOutput, "refused "+refusal)
+		return 2
+	}
+	if refusal := channelAccess(fd); refusal != "" {
 		fmt.Fprintln(standardOutput, "refused "+refusal)
 		return 2
 	}
@@ -111,6 +116,25 @@ func handoffDescriptor() (descriptor int, refusal string) {
 		return 0, "credential_lease_handoff_fd_invalid"
 	}
 	return descriptor, ""
+}
+
+// channelAccess proves the descriptor is the read-only one-way channel the
+// grant requires before the first read — the same check the Rust intake
+// runs through fcntl F_GETFL/O_ACCMODE. A flags query that cannot answer
+// reports the channel unavailable; a descriptor whose access mode permits
+// writing is refused as invalid — never merely unread — because a
+// read-write end could carry material back to the producer even where the
+// read side supplies a perfectly valid document.
+func channelAccess(descriptor int) string {
+	flags, _, errno := syscall.Syscall(
+		syscall.SYS_FCNTL, uintptr(descriptor), syscall.F_GETFL, 0)
+	if errno != 0 {
+		return "credential_lease_handoff_fd_unavailable"
+	}
+	if flags&uintptr(syscall.O_ACCMODE) != syscall.O_RDONLY {
+		return "credential_lease_handoff_fd_invalid"
+	}
+	return ""
 }
 
 func readDocument(descriptor int) ([]byte, error) {

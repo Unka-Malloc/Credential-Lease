@@ -174,8 +174,11 @@ rejects it. Document refusals print `invalid` and exit `1`; channel
 refusals print `refused <code>` and exit `2`.
 
 `scripts/verify-samples.sh` builds and runs every available language against
-every vector and requires identical verdicts. It skips a language whose
-toolchain is absent rather than pretending it ran.
+every vector and requires identical verdicts — on the channel refusal cases
+too: an absent or malformed variable, a standard-stream number, a closed
+descriptor, and a write-capable channel all answer the same refusal in every
+language. It skips a language whose toolchain is absent rather than
+pretending it ran.
 
 ## Portability
 

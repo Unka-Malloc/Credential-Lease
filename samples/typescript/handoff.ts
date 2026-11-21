@@ -10,7 +10,7 @@
 // Duplicate object member names are refused at every level, matching the Rust
 // reference implementation rather than JSON's usual last-wins behaviour.
 
-import { closeSync, readSync } from "node:fs";
+import { closeSync, readSync, writeSync } from "node:fs";
 
 const HANDOFF_FD_ENV = "FAIRLINY_HANDOFF_FD";
 const MAX_DOCUMENT_BYTES = 2229554;
@@ -43,6 +43,11 @@ const CANONICAL_UUID =
 type Json = null | boolean | string | bigint | Json[] | { [key: string]: Json };
 
 class Rejected extends Error {}
+
+// A channel whose access mode cannot be proven read-only: reported as
+// credential_lease_handoff_fd_invalid, distinct both from a document
+// verdict and from a channel that cannot be read at all.
+class ChannelInvalid extends Error {}
 
 class StrictParser {
   text: string;
@@ -540,11 +545,35 @@ function handoffDescriptor(): number | "missing" | "invalid" {
   return descriptor;
 }
 
+// The probe the channel check runs: a zero-byte write answers EBADF only
+// when the descriptor's access mode denies writing — the same verdict the
+// Rust intake's fcntl F_GETFL/O_ACCMODE check gives.
+const READ_ONLY_PROBE = Buffer.alloc(0);
+
 function readDocument(descriptor: number): Buffer {
   const chunks: Buffer[] = [];
   let total = 0;
   const buffer = Buffer.alloc(16 * 1024);
   try {
+    // The grant is a one-way read-only channel: the access mode is proven
+    // before the first read. A completed write means the channel is
+    // write-capable — a read-write end could carry material back to the
+    // producer — and any probe error other than EBADF leaves the mode
+    // unproven; both refuse as an invalid channel, never as unavailable.
+    // EBADF proves no write access — the read-only mode the contract
+    // requires — and a descriptor that does not exist fails the same
+    // probe, leaving the read below to report the channel unavailable.
+    try {
+      writeSync(descriptor, READ_ONLY_PROBE);
+      throw new ChannelInvalid();
+    } catch (error) {
+      if (error instanceof ChannelInvalid) {
+        throw error;
+      }
+      if ((error as NodeJS.ErrnoException).code !== "EBADF") {
+        throw new ChannelInvalid();
+      }
+    }
     for (;;) {
       const read = readSync(descriptor, buffer, 0, buffer.length, null);
       if (read === 0) {
@@ -578,6 +607,10 @@ function main(): number {
     if (error instanceof Rejected) {
       console.log("invalid");
       return 1;
+    }
+    if (error instanceof ChannelInvalid) {
+      console.log("refused credential_lease_handoff_fd_invalid");
+      return 2;
     }
     console.log("refused credential_lease_handoff_fd_unavailable");
     return 2;

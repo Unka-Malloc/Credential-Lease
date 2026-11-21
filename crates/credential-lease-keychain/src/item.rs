@@ -162,8 +162,10 @@ impl KeychainItemProvenance {
         self.synchronizable
     }
 
-    /// Whether the item carries exactly the `SecAccessControl` this backend
-    /// writes: user presence, accessible when unlocked, this device only.
+    /// Whether the item carries this backend's access control policy:
+    /// user presence, accessible when unlocked, this device only —
+    /// compared policy-wise, so the binding metadata `SecItemAdd` stamps
+    /// on the stored control is never a difference.
     pub fn has_backend_access_control(&self) -> bool {
         self.backend_access_control
     }

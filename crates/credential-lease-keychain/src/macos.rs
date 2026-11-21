@@ -26,6 +26,7 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
+use core_foundation::array::CFArray;
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::boolean::CFBoolean;
 use core_foundation::data::CFData;
@@ -46,9 +47,9 @@ use security_framework_sys::base::{
 };
 use security_framework_sys::item::{
     kSecAttrAccessControl, kSecAttrAccessGroup, kSecAttrAccount, kSecAttrService,
-    kSecAttrSynchronizable, kSecClass, kSecClassGenericPassword, kSecReturnAttributes,
-    kSecReturnData, kSecReturnPersistentRef, kSecUseAuthenticationContext, kSecUseAuthenticationUI,
-    kSecUseDataProtectionKeychain, kSecValueData,
+    kSecAttrSynchronizable, kSecClass, kSecClassGenericPassword, kSecMatchLimit, kSecMatchLimitAll,
+    kSecReturnAttributes, kSecReturnData, kSecReturnPersistentRef, kSecUseAuthenticationContext,
+    kSecUseAuthenticationUI, kSecUseDataProtectionKeychain, kSecValueData,
 };
 use security_framework_sys::keychain::{
     SecKeychainGetUserInteractionAllowed, SecKeychainSetUserInteractionAllowed,
@@ -81,6 +82,14 @@ extern "C" {
     static kSecValuePersistentRef: CFStringRef;
     static kSecAttrAccessible: CFStringRef;
     static kSecUseAuthenticationUIFail: CFStringRef;
+    // SecAccessControlPriv.h — exported by Security.framework though not
+    // declared in the public header. Both return references the control
+    // owns: the protection class and the ACL constraint dictionary — the
+    // two policy fields insertion-time binding does not touch.
+    fn SecAccessControlGetProtection(access_control: CFTypeRef) -> CFTypeRef;
+    fn SecAccessControlGetConstraints(access_control: CFTypeRef) -> CFTypeRef;
+    #[cfg(test)]
+    fn SecAccessControlSetBound(access_control: CFTypeRef, bound: u8);
 }
 
 // The classic Keychain has a process-wide UI switch, independent of the
@@ -317,14 +326,21 @@ impl Keychain {
     /// `SecItemUpdate` cannot attach or change an item's `SecAccessControl`
     /// on the Data Protection Keychain: an update carrying one reports
     /// success while the item keeps the protection it was created with.
-    /// The write therefore verifies the existing item's protection on the
-    /// Data Protection Keychain first — an item already carrying this
-    /// backend's access control takes a value-only update; one under any
-    /// other protection is deleted and re-added, the only way protection
-    /// changes; an absent item is added directly. A duplicate that
-    /// appears between the check and the add re-runs the verification
-    /// once before the last write, and every completed write re-reads the
-    /// item's attributes to prove the required protection landed.
+    /// The write therefore enumerates the records the query matches first.
+    /// More than one match refuses before any mutation — an unscoped query
+    /// can select records sharing a service and account in several access
+    /// groups, and a `SecItemUpdate` or `SecItemDelete` acts on *every*
+    /// match, not on the one record a limit-one read returned. The single
+    /// selected record is pinned by its persistent reference for every
+    /// mutation and verification that follows: an item already carrying
+    /// this backend's access control takes a value-only update on the
+    /// pinned record; one under any other protection is replaced through
+    /// `replace_item`'s recoverable tombstone swap — the only
+    /// way protection changes; an absent item is added directly. A
+    /// duplicate that appears between the check and the add re-runs the
+    /// verification once before the last write, and every completed write
+    /// re-reads the pinned record's attributes to prove the required
+    /// protection landed.
     ///
     /// A query declaring `synchronizable` is refused before any SecItem
     /// call: the platform cannot attach the device-only access control
@@ -343,25 +359,33 @@ impl Keychain {
         let store = effective_store(query, self.backend)?;
         ensure_write_supported(query, store)?;
         let query_pairs = base_pairs(query, context, self.backend)?;
-        let query_dict = CFDictionary::from_CFType_pairs(&query_pairs);
         let mut retry_on_duplicate = true;
         loop {
-            match protection_action(existing_item_protection(&query_pairs, store)?) {
+            let matched =
+                match with_keychain_backend(store, || find_matching_item(&query_pairs, store))? {
+                    ItemMatch::Absent => None,
+                    ItemMatch::Ambiguous => return Err(item_ambiguous()),
+                    ItemMatch::One(item) => Some(item),
+                };
+            match protection_action(matched.as_ref().map(|item| item.protected)) {
                 ProtectionAction::UpdateValue => {
+                    let item = matched.as_ref().expect("a protected match exists");
+                    let pinned = pinned_pairs(&item.reference, context, store);
+                    let pinned_dict = CFDictionary::from_CFType_pairs(&pinned);
                     let update = CFDictionary::from_CFType_pairs(&secret_value_pairs(
                         secret.expose_bytes(),
                     )?);
-                    // SAFETY: query and update own their CF values for the
-                    // synchronous call.
+                    // SAFETY: pinned_dict and update own their CF values
+                    // for the synchronous call.
                     let update_status = keychain_effect(store, || unsafe {
                         SecItemUpdate(
-                            query_dict.as_concrete_TypeRef(),
+                            pinned_dict.as_concrete_TypeRef(),
                             update.as_concrete_TypeRef(),
                         )
                     })?;
                     match keychain_update_transition(update_status) {
                         KeychainUpdateTransition::Complete => {
-                            return ensure_write_protected(&query_pairs, store);
+                            return ensure_write_protected(&pinned, store);
                         }
                         // The item vanished between the protection check
                         // and the update: fall through to the add.
@@ -372,26 +396,53 @@ impl Keychain {
                     }
                 }
                 ProtectionAction::ReplaceItem => {
-                    // SAFETY: query_dict owns its CF values for the
-                    // synchronous call.
-                    let delete_status = keychain_effect(store, || unsafe {
-                        SecItemDelete(query_dict.as_concrete_TypeRef())
-                    })?;
-                    if delete_status != errSecSuccess && delete_status != errSecItemNotFound {
-                        return status_result("delete", delete_status);
+                    let item = matched.as_ref().expect("an unprotected match exists");
+                    match self.replace_item(context, query, secret, item, &query_pairs, store)? {
+                        ReplaceTransition::Done => return Ok(()),
+                        ReplaceTransition::Duplicate if retry_on_duplicate => {
+                            retry_on_duplicate = false;
+                            continue;
+                        }
+                        ReplaceTransition::Duplicate => {
+                            return status_result("write", errSecDuplicateItem);
+                        }
                     }
                 }
                 ProtectionAction::AddItem => {}
             }
             let mut pairs = query_pairs.clone();
+            // The matched record's access group is preserved: a query that
+            // declared no group places the write in the record's group,
+            // never silently in the default group.
+            if query.access_group.is_none() {
+                if let Some(group) = matched
+                    .as_ref()
+                    .and_then(|item| item.access_group.as_deref())
+                {
+                    pairs.push((
+                        security_framework_static!(kSecAttrAccessGroup, sec_key),
+                        CFString::from(group).into_CFType(),
+                    ));
+                }
+            }
             pairs.extend(protected_secret_pairs(secret.expose_bytes())?);
+            // The add answers the new record's persistent reference so the
+            // closing protection proof reads exactly the record written.
+            pairs.push((
+                security_framework_static!(kSecReturnPersistentRef, sec_key),
+                CFBoolean::from(true).into_CFType(),
+            ));
             let add_query = CFDictionary::from_CFType_pairs(&pairs);
+            let mut added_reference: CFTypeRef = ptr::null();
             // SAFETY: add_query owns all referenced values for the synchronous call.
             let add_status = keychain_effect(store, || unsafe {
-                SecItemAdd(add_query.as_concrete_TypeRef(), ptr::null_mut())
+                SecItemAdd(add_query.as_concrete_TypeRef(), &mut added_reference)
             })?;
             if add_status == errSecSuccess {
-                return ensure_write_protected(&query_pairs, store);
+                return ensure_write_protected(
+                    &pinned_result_reference(added_reference, context, store)?,
+                    store,
+                );
             }
             // A duplicate appeared between the check and the add: a
             // racing writer placed the item, and its own protection is
@@ -402,6 +453,108 @@ impl Keychain {
             }
             return status_result("write", add_status);
         }
+    }
+
+    /// The recoverable replacement of one existing record whose protection
+    /// `SecItemUpdate` can never change.
+    ///
+    /// The selected record is never destroyed outright: it is first
+    /// renamed aside to a unique tombstone account through an update
+    /// pinned to its persistent reference — a mutation that leaves the
+    /// record, its access group, and its access control intact — and only
+    /// then is the protected item added under the original identity. A
+    /// failed rename refuses the write with the record untouched. A failed
+    /// add restores the original name before the refusal is reported, so
+    /// the existing credential is intact on every failure path. The
+    /// tombstoned record is deleted — pinned, so no other record the
+    /// identity matches can be taken with it — only after the new item
+    /// exists, and the write still reports its failure if the tombstone
+    /// cannot be removed. The replacement add preserves the record's
+    /// access group when the query declared none.
+    fn replace_item(
+        &self,
+        context: &KeychainAuthContext,
+        query: &KeychainItemQuery<'_>,
+        secret: &SecretBytes,
+        item: &MatchedItem,
+        query_pairs: &[(CFString, CFType)],
+        store: KeychainBackend,
+    ) -> Result<ReplaceTransition, KeychainError> {
+        // The full add payload is prepared before the existing record is
+        // touched: a preparation failure leaves the record intact.
+        let mut add_pairs = query_pairs.to_vec();
+        if query.access_group.is_none() {
+            if let Some(group) = item.access_group.as_deref() {
+                add_pairs.push((
+                    security_framework_static!(kSecAttrAccessGroup, sec_key),
+                    CFString::from(group).into_CFType(),
+                ));
+            }
+        }
+        add_pairs.extend(protected_secret_pairs(secret.expose_bytes())?);
+        add_pairs.push((
+            security_framework_static!(kSecReturnPersistentRef, sec_key),
+            CFBoolean::from(true).into_CFType(),
+        ));
+        let add_query = CFDictionary::from_CFType_pairs(&add_pairs);
+        let pinned = pinned_pairs(&item.reference, context, store);
+        let pinned_dict = CFDictionary::from_CFType_pairs(&pinned);
+        let tombstone = format!("credential-lease.replace.{}", Uuid::new_v4());
+        let rename = CFDictionary::from_CFType_pairs(&[(
+            security_framework_static!(kSecAttrAccount, sec_key),
+            CFString::from(tombstone.as_str()).into_CFType(),
+        )]);
+        // SAFETY: pinned_dict and rename own their CF values for the
+        // synchronous call.
+        let rename_status = keychain_effect(store, || unsafe {
+            SecItemUpdate(
+                pinned_dict.as_concrete_TypeRef(),
+                rename.as_concrete_TypeRef(),
+            )
+        })?;
+        if rename_status != errSecSuccess {
+            return status_result("write", rename_status).map(|_| ReplaceTransition::Done);
+        }
+        let mut added_reference: CFTypeRef = ptr::null();
+        // SAFETY: add_query owns all referenced values for the synchronous call.
+        let add_status = keychain_effect(store, || unsafe {
+            SecItemAdd(add_query.as_concrete_TypeRef(), &mut added_reference)
+        })?;
+        if add_status != errSecSuccess {
+            // Restore the record's original identity — still pinned to the
+            // same persistent reference — before the add's refusal is
+            // reported. A restore failure is not reported separately: the
+            // record still exists under its tombstone name, never erased.
+            let restore = CFDictionary::from_CFType_pairs(&[(
+                security_framework_static!(kSecAttrAccount, sec_key),
+                CFString::from(query.account).into_CFType(),
+            )]);
+            let _ = keychain_effect(store, || unsafe {
+                SecItemUpdate(
+                    pinned_dict.as_concrete_TypeRef(),
+                    restore.as_concrete_TypeRef(),
+                )
+            });
+            if add_status == errSecDuplicateItem {
+                // A racing writer claimed the identity between the rename
+                // and the add: the caller re-runs the protection check on
+                // whatever the identity now holds.
+                return Ok(ReplaceTransition::Duplicate);
+            }
+            return status_result("write", add_status).map(|_| ReplaceTransition::Done);
+        }
+        // SAFETY: pinned_dict owns its CF values for the synchronous call.
+        let delete_status = keychain_effect(store, || unsafe {
+            SecItemDelete(pinned_dict.as_concrete_TypeRef())
+        })?;
+        if delete_status != errSecSuccess && delete_status != errSecItemNotFound {
+            return status_result("delete", delete_status).map(|_| ReplaceTransition::Done);
+        }
+        ensure_write_protected(
+            &pinned_result_reference(added_reference, context, store)?,
+            store,
+        )?;
+        Ok(ReplaceTransition::Done)
     }
 
     /// Append-only add: the item is created or `Duplicate` is reported —
@@ -467,17 +620,30 @@ impl Keychain {
     }
 
     /// Delete one item; an absent item is not an error.
+    ///
+    /// The delete is pinned to one record's persistent reference for the
+    /// same reason [`Keychain::set_item`] pins its mutations: an unscoped
+    /// query can match records sharing a service and account in several
+    /// access groups, and `SecItemDelete` removes every match. More than
+    /// one match refuses `credential_lease_keychain_item_ambiguous`
+    /// instead of deleting records the lookup did not select.
     pub fn delete_item(
         &self,
         context: &KeychainAuthContext,
         query: &KeychainItemQuery<'_>,
     ) -> Result<(), KeychainError> {
         let store = effective_store(query, self.backend)?;
-        let query_dict =
-            CFDictionary::from_CFType_pairs(&base_pairs(query, context, self.backend)?);
-        // SAFETY: query owns valid CF values for the synchronous call.
+        let query_pairs = base_pairs(query, context, self.backend)?;
+        let item = match with_keychain_backend(store, || find_matching_item(&query_pairs, store))? {
+            ItemMatch::Absent => return Ok(()),
+            ItemMatch::Ambiguous => return Err(item_ambiguous()),
+            ItemMatch::One(item) => item,
+        };
+        let pinned_dict =
+            CFDictionary::from_CFType_pairs(&pinned_pairs(&item.reference, context, store));
+        // SAFETY: pinned_dict owns valid CF values for the synchronous call.
         let status = keychain_effect(store, || unsafe {
-            SecItemDelete(query_dict.as_concrete_TypeRef())
+            SecItemDelete(pinned_dict.as_concrete_TypeRef())
         })?;
         if status == errSecItemNotFound {
             Ok(())
@@ -1079,28 +1245,204 @@ fn item_provenance(attributes: &CFDictionary) -> Result<KeychainItemProvenance, 
         synchronizable: dictionary_value(attributes, synchronizable)
             .and_then(|value| value.downcast::<CFBoolean>())
             .map(bool::from),
-        backend_access_control: dictionary_value(attributes, access_control).is_some_and(
-            // SAFETY: both references are live CF objects for the call.
-            |value| unsafe {
-                CFEqual(value.as_CFTypeRef(), expected_access_control.as_CFTypeRef()) != 0
-            },
-        ),
+        backend_access_control: dictionary_value(attributes, access_control)
+            .is_some_and(|value| access_control_policy_matches(&value, &expected_access_control)),
     })
 }
 
-/// What an existing item's protection decides for a write: `None` when
-/// no item matches the query, `Some(true)` only when it already carries
-/// exactly this backend's `SecAccessControl`, `Some(false)` for every
-/// other protection — an accessible-only item, a different
-/// `SecAccessControl`, or no access control at all. The attribute query
-/// rides the caller's `query_pairs`, so it lands on the same pinned
-/// store the write targets — for a protected write, the Data Protection
-/// Keychain — and it never asks for value data.
-fn existing_item_protection(
+/// Whether a stored `kSecAttrAccessControl` carries this backend's
+/// protection policy. `SecItemAdd` re-evaluates the control on insertion
+/// and serializes it back with its binding state set, so `CFEqual` on the
+/// whole control counts a correctly-protected stored item as different —
+/// `SecAccessControlCompare` compares the binding metadata too. The
+/// policy comparison covers only the parts that are not binding: the
+/// protection class and the ACL constraint dictionary.
+fn access_control_policy_matches(value: &CFType, expected: &SecAccessControl) -> bool {
+    if value.type_of() != SecAccessControl::type_id() {
+        return false;
+    }
+    // SAFETY: both arguments are live SecAccessControl objects for the
+    // calls; the getters return references the controls own, valid for
+    // the comparisons below.
+    let stored_protection = unsafe { SecAccessControlGetProtection(value.as_CFTypeRef()) };
+    let stored_constraints = unsafe { SecAccessControlGetConstraints(value.as_CFTypeRef()) };
+    let expected_protection = unsafe { SecAccessControlGetProtection(expected.as_CFTypeRef()) };
+    let expected_constraints = unsafe { SecAccessControlGetConstraints(expected.as_CFTypeRef()) };
+    cf_equal_or_both_absent(stored_protection, expected_protection)
+        && cf_equal_or_both_absent(stored_constraints, expected_constraints)
+}
+
+/// `CFEqual` over two possibly-absent references: absent matches absent
+/// and never matches present.
+fn cf_equal_or_both_absent(left: CFTypeRef, right: CFTypeRef) -> bool {
+    match (left.is_null(), right.is_null()) {
+        (true, true) => true,
+        // SAFETY: both references name live Core Foundation objects.
+        (false, false) => unsafe { CFEqual(left, right) != 0 },
+        _ => false,
+    }
+}
+
+/// What a mutation query matched — and therefore what the mutation may
+/// act on. `Ambiguous` refuses: an unscoped query can match records
+/// sharing a service and account in several access groups, and a
+/// `SecItemUpdate` or `SecItemDelete` acts on *every* match, not on the
+/// one record a limit-one read returned, so a mutation may only proceed
+/// when the lookup selected exactly one record.
+enum ItemMatch {
+    Absent,
+    One(MatchedItem),
+    Ambiguous,
+}
+
+/// The one record the lookup selected: the persistent reference every
+/// mutation and verification is pinned to, the record's verified
+/// protection, and the access group a replacement must keep it in.
+struct MatchedItem {
+    reference: CFData,
+    protected: bool,
+    access_group: Option<String>,
+}
+
+/// The outcome of a tombstone-swap replacement: completed, or the
+/// replacement add met a racing writer and the protection check runs
+/// again.
+enum ReplaceTransition {
+    Done,
+    Duplicate,
+}
+
+/// The refusal a mutation issues when the lookup selected more than one
+/// record: acting on one picked match could still update or delete every
+/// match, so the write refuses before any SecItem mutation runs.
+fn item_ambiguous() -> KeychainError {
+    KeychainError::new(
+        "credential_lease_keychain_item_ambiguous",
+        KeychainErrorKind::Failed,
+        None,
+    )
+}
+
+/// Enumerate every record the query addresses. The attribute query rides
+/// the caller's `query_pairs` — the same pinned store the write targets
+/// — and asks for each record's attributes and persistent reference,
+/// never value data. A lone match may arrive unboxed as a bare attribute
+/// dictionary rather than a one-element array; both shapes are accepted.
+fn find_matching_item(
     query_pairs: &[(CFString, CFType)],
     store: KeychainBackend,
-) -> Result<Option<bool>, KeychainError> {
+) -> Result<ItemMatch, KeychainError> {
     let mut pairs = query_pairs.to_vec();
+    pairs.push((
+        security_framework_static!(kSecReturnAttributes, sec_key),
+        CFBoolean::from(true).into_CFType(),
+    ));
+    pairs.push((
+        security_framework_static!(kSecReturnPersistentRef, sec_key),
+        CFBoolean::from(true).into_CFType(),
+    ));
+    pairs.push((
+        security_framework_static!(kSecMatchLimit, sec_key),
+        security_framework_static!(kSecMatchLimitAll, sec_string_value),
+    ));
+    let Some(value) = copy_matching(&pairs, store)? else {
+        return Ok(ItemMatch::Absent);
+    };
+    match value.downcast::<CFArray>() {
+        Some(array) => match array.len() {
+            0 => Ok(ItemMatch::Absent),
+            // SAFETY: get_unchecked is in bounds, and the array owns live
+            // CF objects wrapped under the get rule for inspection.
+            1 => unsafe {
+                matched_item(&CFType::wrap_under_get_rule(
+                    *array.get_unchecked(0) as CFTypeRef
+                ))
+            },
+            _ => Ok(ItemMatch::Ambiguous),
+        },
+        None => matched_item(&value),
+    }
+}
+
+/// The one matched record projected for mutation decisions: its pinned
+/// reference, its proven protection, and the access group a replacement
+/// preserves. A record the platform cannot name with a persistent
+/// reference — a synchronizable item, which is served only as attributes
+/// and data — cannot have a mutation pinned to it, so it is refused
+/// rather than mutated unscoped.
+fn matched_item(value: &CFType) -> Result<ItemMatch, KeychainError> {
+    let attributes = value.downcast::<CFDictionary>().ok_or_else(data_invalid)?;
+    let reference =
+        dictionary_data(&attributes, unsafe { kSecValuePersistentRef }).ok_or_else(data_invalid)?;
+    let provenance = item_provenance(&attributes)?;
+    Ok(ItemMatch::One(MatchedItem {
+        reference,
+        protected: provenance.has_backend_access_control(),
+        access_group: provenance.access_group().map(str::to_owned),
+    }))
+}
+
+/// A mutation or verification query pinned to one record's persistent
+/// reference: the platform addresses the exact record the reference
+/// names, so an update, a delete, or an attributes read lands on the
+/// record the lookup selected — never on every record an unscoped query
+/// happens to match. The routing pin and authorization context are the
+/// same ones the ordinary query carries.
+fn pinned_pairs(
+    reference: &CFData,
+    context: &KeychainAuthContext,
+    store: KeychainBackend,
+) -> Vec<(CFString, CFType)> {
+    let mut pairs = vec![
+        (
+            security_framework_static!(kSecClass, sec_key),
+            security_framework_static!(kSecClassGenericPassword, sec_string_value),
+        ),
+        (
+            security_framework_static!(kSecValuePersistentRef, sec_key),
+            reference.clone().into_CFType(),
+        ),
+        (
+            security_framework_static!(kSecUseAuthenticationContext, sec_key),
+            context.as_cf_type(),
+        ),
+    ];
+    if store == KeychainBackend::DataProtection {
+        pairs.push((
+            security_framework_static!(kSecUseAuthenticationUI, sec_key),
+            security_framework_static!(kSecUseAuthenticationUIFail, sec_string_value),
+        ));
+    }
+    pairs.push(data_protection_routing(store));
+    pairs
+}
+
+/// The pinned verification query for a record a `SecItemAdd` just
+/// created. The add requested `kSecReturnPersistentRef`, so the closing
+/// protection proof reads exactly the record written, not whatever else
+/// the identity could match at verification time.
+fn pinned_result_reference(
+    added_reference: CFTypeRef,
+    context: &KeychainAuthContext,
+    store: KeychainBackend,
+) -> Result<Vec<(CFString, CFType)>, KeychainError> {
+    if added_reference.is_null() {
+        return Err(data_invalid());
+    }
+    // SAFETY: SecItemAdd returned its result object at +1 ownership.
+    let reference = unsafe { CFType::wrap_under_create_rule(added_reference) };
+    let reference = reference.downcast::<CFData>().ok_or_else(data_invalid)?;
+    Ok(pinned_pairs(&reference, context, store))
+}
+
+/// The stored protection of the record a pinned query names: `None` when
+/// the record is absent, `Some(true)` only when it carries this backend's
+/// protection policy, `Some(false)` under any other protection.
+fn pinned_item_protection(
+    pinned_pairs: &[(CFString, CFType)],
+    store: KeychainBackend,
+) -> Result<Option<bool>, KeychainError> {
+    let mut pairs = pinned_pairs.to_vec();
     pairs.push((
         security_framework_static!(kSecReturnAttributes, sec_key),
         CFBoolean::from(true).into_CFType(),
@@ -1112,17 +1454,17 @@ fn existing_item_protection(
     item_provenance(&attributes).map(|provenance| Some(provenance.has_backend_access_control()))
 }
 
-/// The closing check of every protected write: re-read the item's
-/// attributes on the same store and require the access control this
-/// backend writes. A write the store reported successful but cannot
+/// The closing check of every protected write: re-read the pinned
+/// record's attributes on the same store and require the access control
+/// this backend writes. A write the store reported successful but cannot
 /// prove its protection on — a racing writer's replacement, or a store
 /// that silently dropped the control — refuses rather than reporting an
 /// unprotected item as written.
 fn ensure_write_protected(
-    query_pairs: &[(CFString, CFType)],
+    pinned_pairs: &[(CFString, CFType)],
     store: KeychainBackend,
 ) -> Result<(), KeychainError> {
-    match existing_item_protection(query_pairs, store)? {
+    match pinned_item_protection(pinned_pairs, store)? {
         Some(true) => Ok(()),
         _ => Err(KeychainError::new(
             "credential_lease_keychain_protection_unenforced",
@@ -1750,6 +2092,15 @@ mod tests {
         let foreign = item_provenance(&attributes(weaker.into_CFType())).unwrap();
         assert!(!foreign.has_backend_access_control());
 
+        // The control SecItem stores is the same policy plus its
+        // insertion-time binding: it still proves the item is protected —
+        // the binding is metadata, not a policy difference.
+        let bound = backend_access_control().unwrap();
+        // SAFETY: bound is a live SecAccessControl this test owns.
+        unsafe { SecAccessControlSetBound(bound.as_CFTypeRef(), 1) };
+        let bound_item = item_provenance(&attributes(bound.into_CFType())).unwrap();
+        assert!(bound_item.has_backend_access_control());
+
         // Absent or mistyped attributes are reported as absent, never guessed.
         let sparse = CFDictionary::from_CFType_pairs(&[(
             security_framework_static!(kSecAttrService, sec_key),
@@ -1761,6 +2112,122 @@ mod tests {
         assert_eq!(sparse.account(), None);
         assert_eq!(sparse.synchronizable(), None);
         assert!(!sparse.has_backend_access_control());
+    }
+
+    #[test]
+    fn the_stored_binding_is_not_a_policy_difference() {
+        let expected = backend_access_control().unwrap();
+        // Insertion binds the control it stores: same protection class,
+        // same ACL constraints, binding metadata added. The policy
+        // comparison still matches.
+        let bound = backend_access_control().unwrap();
+        // SAFETY: bound is a live SecAccessControl this test owns.
+        unsafe { SecAccessControlSetBound(bound.as_CFTypeRef(), 1) };
+        assert!(access_control_policy_matches(
+            &bound.clone().into_CFType(),
+            &expected
+        ));
+        // A different policy still fails: a weaker protection class, the
+        // same class without the user-presence constraint, and a value
+        // that is not an access control at all.
+        let weaker_protection = SecAccessControl::create_with_protection(
+            Some(ProtectionMode::AccessibleWhenUnlocked),
+            kSecAccessControlUserPresence,
+        )
+        .unwrap();
+        assert!(!access_control_policy_matches(
+            &weaker_protection.into_CFType(),
+            &expected
+        ));
+        let unconstrained = SecAccessControl::create_with_protection(
+            Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
+            0,
+        )
+        .unwrap();
+        assert!(!access_control_policy_matches(
+            &unconstrained.into_CFType(),
+            &expected
+        ));
+        assert!(!access_control_policy_matches(
+            &CFBoolean::true_value().into_CFType(),
+            &expected
+        ));
+    }
+
+    #[test]
+    fn a_pinned_mutation_addresses_one_record_alone() {
+        let context = synthetic_context();
+        let reference = CFData::from_buffer(&[0xABu8; 16]);
+        let dict = CFDictionary::from_CFType_pairs(&pinned_pairs(
+            &reference,
+            &context,
+            KeychainBackend::DataProtection,
+        ));
+        assert_eq!(
+            dict_value(&dict, unsafe { kSecValuePersistentRef }).map(|value| value.as_CFTypeRef()),
+            Some(reference.as_CFTypeRef())
+        );
+        // The persistent reference selects the record: no identity or
+        // scope attribute travels in a pinned mutation, so it can never
+        // act on every record an unscoped query would match.
+        // SAFETY: the keys are SDK-exported static CFStrings.
+        for key in unsafe { [kSecAttrService, kSecAttrAccount, kSecAttrAccessGroup] } {
+            assert!(dict_value(&dict, key).is_none());
+        }
+        assert_eq!(
+            dict_value(&dict, unsafe { kSecUseAuthenticationContext })
+                .map(|value| value.as_CFTypeRef()),
+            Some(context.as_cf_type().as_CFTypeRef())
+        );
+        assert_eq!(
+            dict_value(&dict, unsafe { kSecUseDataProtectionKeychain })
+                .map(|value| value.as_CFTypeRef()),
+            Some(CFBoolean::from(true).as_CFTypeRef())
+        );
+        // The classic routing carries the flag the other way and no UI
+        // policy — its interaction policy is the process-wide switch.
+        let classic = CFDictionary::from_CFType_pairs(&pinned_pairs(
+            &reference,
+            &context,
+            KeychainBackend::Classic,
+        ));
+        assert_eq!(
+            dict_value(&classic, unsafe { kSecUseDataProtectionKeychain })
+                .map(|value| value.as_CFTypeRef()),
+            Some(CFBoolean::from(false).as_CFTypeRef())
+        );
+        assert!(dict_value(&classic, unsafe { kSecUseAuthenticationUI }).is_none());
+    }
+
+    #[test]
+    fn ambiguous_matches_refuse_before_any_mutation() {
+        assert_eq!(
+            item_ambiguous().code(),
+            "credential_lease_keychain_item_ambiguous"
+        );
+        // The protection lookup adds the enumeration keys to the write's
+        // own query pairs: every record the mutation could reach is
+        // counted before any SecItem mutation runs.
+        let context = synthetic_context();
+        let query = KeychainItemQuery::new("synthetic-service", "synthetic-account").unwrap();
+        let query_pairs = base_pairs(&query, &context, KeychainBackend::DataProtection).unwrap();
+        let mut pairs = query_pairs.clone();
+        pairs.push((
+            security_framework_static!(kSecMatchLimit, sec_key),
+            security_framework_static!(kSecMatchLimitAll, sec_string_value),
+        ));
+        let dict = CFDictionary::from_CFType_pairs(&pairs);
+        assert_eq!(
+            dict_value(&dict, unsafe { kSecMatchLimit }).map(|value| value.as_CFTypeRef()),
+            Some(security_framework_static!(kSecMatchLimitAll, sec_string_value).as_CFTypeRef())
+        );
+        assert_eq!(
+            dict_value(&dict, unsafe { kSecAttrService })
+                .and_then(|value| value.downcast::<CFString>())
+                .map(|value| value.to_string())
+                .as_deref(),
+            Some("synthetic-service")
+        );
     }
 
     #[test]
