@@ -292,6 +292,13 @@ function isHostPattern(value: string): boolean {
   if (value.length === 0 || Buffer.byteLength(value) > MAX_EGRESS_HOST_BYTES) {
     return false;
   }
+  // The label rules are ASCII: non-ASCII input must be refused on the
+  // original characters — Unicode-aware lowercasing can fold some of them
+  // (for example U+212A KELVIN SIGN) into ASCII and carry them past the
+  // label check the Rust contract applies.
+  if (/[^\x00-\x7f]/.test(value)) {
+    return false;
+  }
   const normalized = value.toLowerCase();
   const name = normalized.startsWith("*.")
     ? normalized.slice(2)

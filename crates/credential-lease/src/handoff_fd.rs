@@ -27,6 +27,7 @@ use anyhow::{anyhow, ensure, Result};
 use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use zeroize::Zeroizing;
 
 /// The environment variable naming the inherited read-only descriptor that
@@ -40,32 +41,53 @@ pub const HANDOFF_FD_ENV: &str = "FAIRLINY_HANDOFF_FD";
 /// it is refused as a malformed handoff channel instead of being read.
 pub const MIN_HANDOFF_FD: RawFd = 3;
 
+/// The process-local one-time intake claim: the first caller to observe the
+/// variable wins the descriptor outright, before its value is even parsed.
+/// The environment itself is never mutated — removing a variable is not
+/// synchronized with readers outside Rust's environment API — so the number
+/// stays in place but can never drive a second intake.
+static HANDOFF_CHANNEL_CLAIMED: AtomicBool = AtomicBool::new(false);
+
 /// Receive a handoff from the descriptor named by [`HANDOFF_FD_ENV`].
 ///
-/// Returns `Ok(None)` when the variable is absent: a runtime may legitimately
-/// start disconnected and receive a handoff later through a slot.
+/// Returns `Ok(None)` when the variable is absent — and when an earlier
+/// call already claimed the channel, which a disconnected runtime or a
+/// second concurrent caller observes identically.
 ///
-/// Intake is one-time: the variable is consumed — removed before the
-/// descriptor is touched — so a later call can never act on a descriptor
-/// number the OS may have reassigned since the first intake closed it.
+/// Intake is one-time: the first caller claims the channel through a
+/// process-local latch before touching the descriptor, so concurrent
+/// callers can never both take ownership of the same descriptor, and a
+/// later call can never act on a descriptor number the OS may have
+/// reassigned since the first intake closed it.
+///
+/// The parsed number stays a plain [`RawFd`] until the platform proves it
+/// names an open descriptor; only then is it claimed as an [`OwnedFd`].
+/// Ownership itself is the spawn contract — the host must grant this
+/// process exclusive ownership of the descriptor the variable names, the
+/// same transfer [`receive_handoff`] requires of a direct caller.
 pub fn receive_handoff_from_env<K: CredentialKind>() -> Result<Option<CredentialHandoff<K>>> {
-    let Some(value) = take_handoff_variable() else {
+    let Some(value) = std::env::var_os(HANDOFF_FD_ENV) else {
         return Ok(None);
     };
+    if HANDOFF_CHANNEL_CLAIMED.swap(true, Ordering::AcqRel) {
+        return Ok(None);
+    }
     let descriptor = parse_descriptor(&value)?;
-    // SAFETY: the spawn contract grants this process ownership of the
-    // descriptor the variable names — the same ownership transfer
-    // `receive_handoff` requires of a direct caller.
+    // The number stays outside `OwnedFd` until it is proven open:
+    // `from_raw_fd` requires a live descriptor its caller exclusively
+    // owns, so an unverified number can never be wrapped.
+    ensure!(
+        // SAFETY: `fcntl` accepts any number and reports whether it
+        // currently names an open descriptor.
+        unsafe { libc::fcntl(descriptor, libc::F_GETFD) } != -1,
+        "credential_lease_handoff_fd_unavailable"
+    );
+    // SAFETY: the spawn contract grants this process exclusive ownership
+    // of the descriptor the variable names — the same ownership transfer
+    // `receive_handoff` requires of a direct caller — and the probe just
+    // proved the descriptor open.
     let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
     receive_handoff(descriptor).map(Some)
-}
-
-/// Consume the descriptor-number variable: read it and remove it so the
-/// environment cannot hand the same number to a second intake.
-fn take_handoff_variable() -> Option<OsString> {
-    let value = std::env::var_os(HANDOFF_FD_ENV)?;
-    std::env::remove_var(HANDOFF_FD_ENV);
-    Some(value)
 }
 
 /// Receive a handoff from an inherited read-only descriptor.

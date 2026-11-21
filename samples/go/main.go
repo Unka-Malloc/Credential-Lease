@@ -350,6 +350,15 @@ func isHostPattern(value string) bool {
 	if value == "" || len(value) > maxEgressHostBytes {
 		return false
 	}
+	// The label rules are ASCII: non-ASCII input must be refused on the
+	// original bytes — a Unicode-aware lowercase can fold some characters
+	// (for example U+212A KELVIN SIGN) into ASCII and carry them past the
+	// label check the Rust contract applies.
+	for i := 0; i < len(value); i++ {
+		if value[i] > 0x7f {
+			return false
+		}
+	}
 	normalized := strings.ToLower(value)
 	name := strings.TrimPrefix(normalized, "*.")
 	if name == "" || strings.Contains(name, "*") {
@@ -545,8 +554,10 @@ func validJSONText(data []byte) bool {
 		switch {
 		case code >= 0xd800 && code <= 0xdbff:
 			// A high surrogate is valid only immediately paired with a low
-			// surrogate escape.
-			if index+6 > len(data) || data[index+1] != '\\' || data[index+2] != 'u' {
+			// surrogate escape. The full second escape must be present
+			// before any of it is read — a truncated tail must refuse, not
+			// slice past the input's end.
+			if index+7 > len(data) || data[index+1] != '\\' || data[index+2] != 'u' {
 				return false
 			}
 			low, ok := hex4(data[index+3 : index+7])

@@ -650,17 +650,19 @@ fn deadline_remaining_preserves_full_wall_clock_precision() {
 fn live_subsecond_remainder_projects_as_a_whole_second() {
     // The wire format has no fractional seconds: a lease with 500ms of
     // life left is still live, so projection must succeed — mapping the
-    // remainder up to one whole second while the preserved deadline still
-    // caps every rebuild at the original expiry.
+    // remainder up to one whole second. Here the lease's own expiry is
+    // the tighter bound, so the stamped deadline is that expiry floored,
+    // not the later owner deadline: a rebuild that restarted the
+    // rounded-up second would outlive the lease it came from.
     let epoch = uuid::Uuid::new_v4().to_string();
     let source = Arc::new(TestEpochSource(StdMutex::new(Some(epoch.clone()))));
     let mut credentials = BTreeMap::new();
     credentials.insert(TestKind::Beta, vec![test_credential(0xD1)]);
-    let deadline = SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_secs()
-        + 2;
+        .as_secs();
+    let deadline = now + 2;
     let lease = CredentialLease::new_with_binding_for_test(
         credentials,
         Duration::from_secs(3600),
@@ -674,17 +676,28 @@ fn live_subsecond_remainder_projects_as_a_whole_second() {
     .unwrap();
     let projected = lease.handoff_projection().unwrap();
     assert_eq!(projected.lease_duration(), Duration::from_secs(1));
-    assert_eq!(projected.lease_expires_at_epoch_seconds(), deadline);
+    let stamped = projected.lease_expires_at_epoch_seconds();
+    // floor(now + 500ms) is the current second or the next — never the
+    // owner deadline, and never beyond the lease's real expiry second.
+    assert!(stamped <= now + 1 && stamped < deadline);
     // A rebuild stays inside the original expiry: the rounded-up wire
-    // value and the preserved deadline both bound it.
+    // value and the stamped deadline both bound it — and when the stamped
+    // deadline is already the current second, the rebuild is dead on
+    // arrival and refuses instead of minting extra life.
     let rebuilt = CredentialLease::from_handoff(
         projected,
         Arc::new(TestEpochSource(StdMutex::new(Some(epoch)))),
     )
     .unwrap();
-    let projected_again = rebuilt.handoff_projection().unwrap();
-    assert_eq!(projected_again.lease_expires_at_epoch_seconds(), deadline);
-    assert!(projected_again.lease_duration() <= Duration::from_secs(1));
+    match rebuilt.handoff_projection() {
+        Ok(projected_again) => {
+            // A chained projection can never stamp a later deadline than
+            // it received.
+            assert!(projected_again.lease_expires_at_epoch_seconds() <= stamped);
+            assert!(projected_again.lease_duration() <= Duration::from_secs(1));
+        }
+        Err(error) => assert_eq!(error.to_string(), "credential_lease_expired"),
+    }
 }
 
 #[test]

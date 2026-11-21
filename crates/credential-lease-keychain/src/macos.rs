@@ -321,8 +321,9 @@ impl Keychain {
         query: &KeychainItemQuery<'_>,
         secret: &SecretBytes,
     ) -> Result<(), KeychainError> {
-        let store = effective_store(query, self.backend);
-        let query_dict = CFDictionary::from_CFType_pairs(&base_pairs(query, context, self.backend));
+        let store = effective_store(query, self.backend)?;
+        let query_dict =
+            CFDictionary::from_CFType_pairs(&base_pairs(query, context, self.backend)?);
         // Data Protection applies SecAccessControl. The classic Keychain has
         // separate application ACLs; this update cannot convert those ACLs.
         let update =
@@ -342,7 +343,7 @@ impl Keychain {
             }
         }
 
-        let mut pairs = base_pairs(query, context, self.backend);
+        let mut pairs = base_pairs(query, context, self.backend)?;
         pairs.extend(protected_secret_pairs(secret.expose_bytes())?);
         let add_query = CFDictionary::from_CFType_pairs(&pairs);
         // SAFETY: add_query owns all referenced values for the synchronous call.
@@ -375,8 +376,8 @@ impl Keychain {
         query: &KeychainItemQuery<'_>,
         secret: &SecretBytes,
     ) -> Result<AddItemOutcome, KeychainError> {
-        let store = effective_store(query, self.backend);
-        let mut pairs = base_pairs(query, context, self.backend);
+        let store = effective_store(query, self.backend)?;
+        let mut pairs = base_pairs(query, context, self.backend)?;
         pairs.extend(protected_secret_pairs(secret.expose_bytes())?);
         let add_query = CFDictionary::from_CFType_pairs(&pairs);
         // SAFETY: add_query owns all referenced values for the synchronous call.
@@ -399,8 +400,8 @@ impl Keychain {
         context: &KeychainAuthContext,
         query: &KeychainItemQuery<'_>,
     ) -> Result<Option<SecretBytes>, KeychainError> {
-        let store = effective_store(query, self.backend);
-        let mut pairs = base_pairs(query, context, self.backend);
+        let store = effective_store(query, self.backend)?;
+        let mut pairs = base_pairs(query, context, self.backend)?;
         pairs.push((
             security_framework_static!(kSecReturnData, sec_key),
             CFBoolean::from(true).into_CFType(),
@@ -415,8 +416,8 @@ impl Keychain {
         context: &KeychainAuthContext,
         query: &KeychainItemQuery<'_>,
     ) -> Result<Option<KeychainItem>, KeychainError> {
-        let store = effective_store(query, self.backend);
-        let mut pairs = base_pairs(query, context, self.backend);
+        let store = effective_store(query, self.backend)?;
+        let mut pairs = base_pairs(query, context, self.backend)?;
         pairs.push((
             security_framework_static!(kSecReturnAttributes, sec_key),
             CFBoolean::from(true).into_CFType(),
@@ -438,8 +439,9 @@ impl Keychain {
         context: &KeychainAuthContext,
         query: &KeychainItemQuery<'_>,
     ) -> Result<(), KeychainError> {
-        let store = effective_store(query, self.backend);
-        let query_dict = CFDictionary::from_CFType_pairs(&base_pairs(query, context, self.backend));
+        let store = effective_store(query, self.backend)?;
+        let query_dict =
+            CFDictionary::from_CFType_pairs(&base_pairs(query, context, self.backend)?);
         // SAFETY: query owns valid CF values for the synchronous call.
         let status = keychain_effect(store, || unsafe {
             SecItemDelete(query_dict.as_concrete_TypeRef())
@@ -515,30 +517,48 @@ impl Keychain {
 }
 
 /// The store a query actually lands on: the host's explicit routing flag
-/// when set, otherwise this handle's probed backend. Both the routing flag
-/// and the interaction policy are derived from this store, so a
-/// classic-routed query can never escape the backend's classic
-/// interaction suppression — the bypass a forced `use_data_protection =
-/// false` would otherwise open on a Data Protection handle.
-fn effective_store(query: &KeychainItemQuery<'_>, backend: KeychainBackend) -> KeychainBackend {
+/// when set, otherwise this handle's probed backend — except a
+/// synchronizable item, which the platform serves only from the Data
+/// Protection Keychain regardless of the handle's store (TN3137). Both
+/// the routing flag and the interaction policy are derived from this
+/// store, so a classic-routed query can never escape the backend's
+/// classic interaction suppression — the bypass a forced
+/// `use_data_protection = false` would otherwise open on a Data
+/// Protection handle — and a synchronizable query always gets the Data
+/// Protection no-UI policy and error handling.
+fn effective_store(
+    query: &KeychainItemQuery<'_>,
+    backend: KeychainBackend,
+) -> Result<KeychainBackend, KeychainError> {
     match query.use_data_protection {
-        Some(true) => KeychainBackend::DataProtection,
-        Some(false) => KeychainBackend::Classic,
-        None => backend,
+        Some(true) => Ok(KeychainBackend::DataProtection),
+        // A synchronizable item cannot live in the classic store — the
+        // platform would serve it from Data Protection anyway, so routing
+        // flags that claim classic contradict the declared attributes and
+        // are refused rather than silently re-routed.
+        Some(false) if query.synchronizable == Some(true) => Err(KeychainError::new(
+            "credential_lease_keychain_routing_invalid",
+            KeychainErrorKind::Failed,
+            None,
+        )),
+        Some(false) => Ok(KeychainBackend::Classic),
+        None if query.synchronizable == Some(true) => Ok(KeychainBackend::DataProtection),
+        None => Ok(backend),
     }
 }
 
 /// The ordinary item query: class, service, account, the optional storage
 /// attributes the host asked for, and the authorized context. The routing
-/// flag follows `use_data_protection` when set, otherwise the selected
-/// backend — explicit on Data Protection, absent on Classic so a classic
+/// flag follows `use_data_protection` when set, otherwise the effective
+/// store — explicit on Data Protection, absent on Classic so a classic
 /// add does not get routed into a store that would discard the protection
 /// attribute it carries.
 fn base_pairs(
     query: &KeychainItemQuery<'_>,
     context: &KeychainAuthContext,
     backend: KeychainBackend,
-) -> Vec<(CFString, CFType)> {
+) -> Result<Vec<(CFString, CFType)>, KeychainError> {
+    let store = effective_store(query, backend)?;
     let mut pairs = vec![
         (
             security_framework_static!(kSecClass, sec_key),
@@ -569,7 +589,7 @@ fn base_pairs(
         security_framework_static!(kSecUseAuthenticationContext, sec_key),
         context.as_cf_type(),
     ));
-    if effective_store(query, backend) == KeychainBackend::DataProtection {
+    if store == KeychainBackend::DataProtection {
         // Ordinary operations on the Data Protection store must never raise
         // authentication UI outside the host's authorization workflow: when
         // the authorized context does not satisfy the item's access
@@ -587,13 +607,13 @@ fn base_pairs(
             security_framework_static!(kSecUseDataProtectionKeychain, sec_key),
             CFBoolean::from(use_data_protection).into_CFType(),
         )),
-        None if backend == KeychainBackend::DataProtection => pairs.push((
+        None if store == KeychainBackend::DataProtection => pairs.push((
             security_framework_static!(kSecUseDataProtectionKeychain, sec_key),
             CFBoolean::from(true).into_CFType(),
         )),
         None => {}
     }
-    pairs
+    Ok(pairs)
 }
 
 /// Legacy migration source pairs: an explicit classic-only query. Valid
@@ -1274,7 +1294,7 @@ mod tests {
         for backend in [KeychainBackend::Classic, KeychainBackend::DataProtection] {
             for account in ["synthetic-account-one", "synthetic-account-two"] {
                 let query = KeychainItemQuery::new("synthetic-service", account).unwrap();
-                let pairs = base_pairs(&query, &context, backend);
+                let pairs = base_pairs(&query, &context, backend).unwrap();
                 let dict = CFDictionary::from_CFType_pairs(&pairs);
                 assert_eq!(
                     dict_value(&dict, unsafe { kSecAttrService })
@@ -1307,12 +1327,13 @@ mod tests {
         // A classic-routed query leaves the data-protection flag unset, and a
         // query may pin the flag explicitly in either direction.
         let query = KeychainItemQuery::new("synthetic-service", "synthetic-account").unwrap();
-        let classic_pairs = base_pairs(&query, &context, KeychainBackend::Classic);
+        let classic_pairs = base_pairs(&query, &context, KeychainBackend::Classic).unwrap();
         let classic_dict = CFDictionary::from_CFType_pairs(&classic_pairs);
         assert!(dict_value(&classic_dict, unsafe { kSecUseDataProtectionKeychain }).is_none());
         for forced in [false, true] {
             let forced_query = query.clone().with_data_protection(forced);
-            let forced_pairs = base_pairs(&forced_query, &context, KeychainBackend::Classic);
+            let forced_pairs =
+                base_pairs(&forced_query, &context, KeychainBackend::Classic).unwrap();
             let forced_dict = CFDictionary::from_CFType_pairs(&forced_pairs);
             assert_eq!(
                 dict_value(&forced_dict, unsafe { kSecUseDataProtectionKeychain })
@@ -1325,11 +1346,9 @@ mod tests {
             .clone()
             .with_access_group("synthetic-access-group")
             .with_synchronizable(false);
-        let grouped_dict = CFDictionary::from_CFType_pairs(&base_pairs(
-            &grouped,
-            &context,
-            KeychainBackend::DataProtection,
-        ));
+        let grouped_dict = CFDictionary::from_CFType_pairs(
+            &base_pairs(&grouped, &context, KeychainBackend::DataProtection).unwrap(),
+        );
         assert_eq!(
             dict_value(&grouped_dict, unsafe { kSecAttrAccessGroup })
                 .and_then(|value| value.downcast::<CFString>())
@@ -1559,16 +1578,65 @@ mod tests {
     fn effective_store_follows_explicit_routing_over_the_selected_backend() {
         let query = KeychainItemQuery::new("synthetic-service", "synthetic-account").unwrap();
         for backend in [KeychainBackend::Classic, KeychainBackend::DataProtection] {
-            assert_eq!(effective_store(&query, backend), backend);
+            assert_eq!(effective_store(&query, backend).unwrap(), backend);
             assert_eq!(
-                effective_store(&query.clone().with_data_protection(true), backend),
+                effective_store(&query.clone().with_data_protection(true), backend).unwrap(),
                 KeychainBackend::DataProtection
             );
             assert_eq!(
-                effective_store(&query.clone().with_data_protection(false), backend),
+                effective_store(&query.clone().with_data_protection(false), backend).unwrap(),
                 KeychainBackend::Classic
             );
         }
+    }
+
+    #[test]
+    fn synchronizable_queries_route_to_data_protection() {
+        let context = synthetic_context();
+        let query = KeychainItemQuery::new("synthetic-service", "synthetic-account").unwrap();
+        // A synchronizable item is served only by the Data Protection
+        // Keychain (TN3137): an unflagged query on a Classic handle still
+        // lands there, so it takes the Data Protection no-UI policy and
+        // error handling rather than Classic's.
+        let sync = query.clone().with_synchronizable(true);
+        assert_eq!(
+            effective_store(&sync, KeychainBackend::Classic).unwrap(),
+            KeychainBackend::DataProtection
+        );
+        let dict = CFDictionary::from_CFType_pairs(
+            &base_pairs(&sync, &context, KeychainBackend::Classic).unwrap(),
+        );
+        assert_eq!(
+            dict_value(&dict, unsafe { kSecUseDataProtectionKeychain })
+                .map(|value| value.as_CFTypeRef()),
+            Some(CFBoolean::from(true).as_CFTypeRef())
+        );
+        assert_eq!(
+            dict_value(&dict, unsafe { kSecUseAuthenticationUI }).map(|value| value.as_CFTypeRef()),
+            Some(
+                security_framework_static!(kSecUseAuthenticationUIFail, sec_string_value)
+                    .as_CFTypeRef()
+            )
+        );
+        // Forcing classic routing on a synchronizable item contradicts the
+        // declared attributes: refused, never silently re-routed.
+        let contradictory = query
+            .clone()
+            .with_synchronizable(true)
+            .with_data_protection(false);
+        for backend in [KeychainBackend::Classic, KeychainBackend::DataProtection] {
+            assert_eq!(
+                effective_store(&contradictory, backend).unwrap_err().code(),
+                "credential_lease_keychain_routing_invalid"
+            );
+            assert!(base_pairs(&contradictory, &context, backend).is_err());
+        }
+        // An explicitly non-synchronizable item may still route classic.
+        let classic_only = query.with_synchronizable(false).with_data_protection(false);
+        assert_eq!(
+            effective_store(&classic_only, KeychainBackend::DataProtection).unwrap(),
+            KeychainBackend::Classic
+        );
     }
 
     #[test]
@@ -1576,11 +1644,9 @@ mod tests {
         let context = synthetic_context();
         let query = KeychainItemQuery::new("synthetic-service", "synthetic-account").unwrap();
         // The effective Data Protection store carries the fail-on-UI policy.
-        let dict = CFDictionary::from_CFType_pairs(&base_pairs(
-            &query,
-            &context,
-            KeychainBackend::DataProtection,
-        ));
+        let dict = CFDictionary::from_CFType_pairs(
+            &base_pairs(&query, &context, KeychainBackend::DataProtection).unwrap(),
+        );
         assert_eq!(
             dict_value(&dict, unsafe { kSecUseAuthenticationUI }).map(|value| value.as_CFTypeRef()),
             Some(
@@ -1591,19 +1657,15 @@ mod tests {
         // A classic-routed query carries none — its interaction policy is
         // the classic process-wide switch, applied by the operation itself.
         for query in [query.clone(), query.clone().with_data_protection(false)] {
-            let dict = CFDictionary::from_CFType_pairs(&base_pairs(
-                &query,
-                &context,
-                KeychainBackend::Classic,
-            ));
+            let dict = CFDictionary::from_CFType_pairs(
+                &base_pairs(&query, &context, KeychainBackend::Classic).unwrap(),
+            );
             assert!(dict_value(&dict, unsafe { kSecUseAuthenticationUI }).is_none());
         }
         let forced = query.with_data_protection(false);
-        let dict = CFDictionary::from_CFType_pairs(&base_pairs(
-            &forced,
-            &context,
-            KeychainBackend::DataProtection,
-        ));
+        let dict = CFDictionary::from_CFType_pairs(
+            &base_pairs(&forced, &context, KeychainBackend::DataProtection).unwrap(),
+        );
         assert!(dict_value(&dict, unsafe { kSecUseAuthenticationUI }).is_none());
     }
 

@@ -87,17 +87,30 @@ impl Drop for HandoffDocument {
 }
 
 /// The wall-clock deadline an owner grant authorizes, in epoch seconds:
-/// `SystemTime` at grant time plus the granted duration. It travels in the
-/// handoff document so a rebuilt lease can never outlive the original
-/// grant — extending past it requires a fresh owner grant, not another
-/// projection.
+/// `SystemTime` at grant time plus the granted duration, floored to the
+/// wire's whole-second precision — the largest deadline that can never
+/// authorize past the offered expiry. It travels in the handoff document
+/// so a rebuilt lease can never outlive the original grant — extending
+/// past it requires a fresh owner grant, not another projection.
 pub(crate) fn lease_deadline_epoch_seconds(lease_duration: Duration) -> Result<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| anyhow!("credential_lease_clock_invalid"))?
-        .as_secs()
-        .checked_add(whole_seconds_ceiling(lease_duration).as_secs())
+        .checked_add(lease_duration)
+        .map(|expiry| expiry.as_secs())
         .ok_or_else(|| anyhow!("credential_lease_expiry_invalid"))
+}
+
+/// The granted duration, validated exactly as offered — before it is
+/// converted to wire seconds — so a fractional or oversized grant is
+/// refused rather than rounded up into a larger one.
+pub(crate) fn ensure_lease_duration_bounds(lease_duration: Duration) -> Result<()> {
+    ensure!(
+        !lease_duration.is_zero()
+            && lease_duration <= Duration::from_secs(MAX_LEASE_DURATION_SECONDS),
+        "credential_lease_duration_invalid"
+    );
+    Ok(())
 }
 
 /// The whole-second ceiling the wire format carries: a live fractional
@@ -105,7 +118,11 @@ pub(crate) fn lease_deadline_epoch_seconds(lease_duration: Duration) -> Result<u
 /// project, and the absolute `leaseExpiresAtEpochSeconds` deadline caps
 /// every rebuild so rounding up can never extend the grant.
 pub(crate) fn whole_seconds_ceiling(duration: Duration) -> Duration {
-    Duration::from_secs(duration.as_secs() + u64::from(duration.subsec_nanos() != 0))
+    Duration::from_secs(
+        duration
+            .as_secs()
+            .saturating_add(u64::from(duration.subsec_nanos() != 0)),
+    )
 }
 
 /// A portable projection of unlocked credentials for one kind family.
@@ -160,8 +177,9 @@ impl<K: CredentialKind> CredentialHandoff<K> {
     }
 
     /// The owner-authorized deadline this grant ends at, in epoch seconds.
-    /// It is carried verbatim through every projection and rebuild, so a
-    /// chain of re-projected handoffs still dies at the original deadline;
+    /// A projection stamps the grant's effective deadline — the earlier of
+    /// the preserved deadline and the lease's own projected expiry — so a
+    /// chain of re-projected handoffs still dies at the earliest bound;
     /// only a fresh owner grant can authorize beyond it.
     pub fn lease_expires_at_epoch_seconds(&self) -> u64 {
         self.lease_expires_at_epoch_seconds
@@ -196,6 +214,7 @@ impl<K: CredentialKind> CredentialHandoff<K> {
         epoch: String,
         egress: EgressScope,
     ) -> Result<Self> {
+        ensure_lease_duration_bounds(lease_duration)?;
         let lease_expires_at_epoch_seconds = lease_deadline_epoch_seconds(lease_duration)?;
         Self::with_deadline(
             credentials,
@@ -221,15 +240,15 @@ impl<K: CredentialKind> CredentialHandoff<K> {
             uuid::Uuid::parse_str(&epoch).is_ok_and(|value| value.to_string() == epoch),
             "credential_lease_epoch_invalid"
         );
+        // The offered duration is validated before it is converted to wire
+        // seconds: the whole-second ceiling below is only the serialized
+        // form, never a larger grant.
+        ensure_lease_duration_bounds(lease_duration)?;
         // The wire carries whole seconds: a live fractional remainder maps
-        // up to the next second. The absolute deadline below is preserved
-        // verbatim and caps every rebuild, so the rounded value cannot
-        // grant time the owner did not authorize.
+        // up to the next second. The absolute deadline below still caps
+        // every rebuild, so the rounded value cannot grant time the owner
+        // did not authorize.
         let lease_duration = whole_seconds_ceiling(lease_duration);
-        ensure!(
-            (1..=MAX_LEASE_DURATION_SECONDS).contains(&lease_duration.as_secs()),
-            "credential_lease_duration_invalid"
-        );
         ensure!(
             lease_expires_at_epoch_seconds > 0,
             "credential_lease_expiry_invalid"

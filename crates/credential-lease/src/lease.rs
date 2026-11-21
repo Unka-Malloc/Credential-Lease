@@ -71,6 +71,7 @@ impl<K: CredentialKind> CredentialLease<K> {
         epoch_source: Arc<dyn LeaseEpochSource>,
         egress: EgressScope,
     ) -> Result<Self> {
+        crate::handoff::ensure_lease_duration_bounds(lease_duration)?;
         let lease_deadline_epoch_seconds =
             crate::handoff::lease_deadline_epoch_seconds(lease_duration)?;
         Self::new_bound(
@@ -93,24 +94,17 @@ impl<K: CredentialKind> CredentialLease<K> {
         egress: EgressScope,
         lease_deadline_epoch_seconds: u64,
     ) -> Result<Self> {
-        // The lease carries the whole-second duration the wire format
-        // carries: a fractional grant maps up to the next second, and the
-        // absolute deadline below still caps the real expiry.
-        let lease_duration = crate::handoff::whole_seconds_ceiling(lease_duration);
         ensure!(
             uuid::Uuid::parse_str(&epoch).is_ok_and(|value| value.to_string() == epoch),
             "credential_lease_epoch_invalid"
         );
-        ensure!(
-            (1..=crate::credential::MAX_LEASE_DURATION_SECONDS).contains(&lease_duration.as_secs()),
-            "credential_lease_duration_invalid"
-        );
+        crate::handoff::ensure_lease_duration_bounds(lease_duration)?;
         validate_credentials(&credentials, "credential_lease_inventory_invalid")?;
-        // The monotonic expiry honors both bounds: the granted duration and
-        // the owner-authorized deadline carried in from the handoff. A
-        // rebuild can therefore never mint a lease that outlives the
-        // original grant, and a lapsed deadline yields a dead-on-arrival
-        // lease that fails closed on every use.
+        // The monotonic expiry honors both bounds: the granted duration
+        // exactly as offered and the owner-authorized deadline carried in
+        // from the handoff. A rebuild can therefore never mint a lease
+        // that outlives the original grant, and a lapsed deadline yields a
+        // dead-on-arrival lease that fails closed on every use.
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| anyhow!("credential_lease_clock_invalid"))?;
@@ -121,7 +115,11 @@ impl<K: CredentialKind> CredentialLease<K> {
             .ok_or_else(|| anyhow!("credential_lease_expiry_invalid"))?;
         Ok(Self {
             credentials,
-            lease_duration,
+            // The lease carries the whole-second duration the wire format
+            // carries: a fractional grant maps up to the next second for
+            // serialization, while the exact offered duration above still
+            // bounds the real expiry.
+            lease_duration: crate::handoff::whole_seconds_ceiling(lease_duration),
             expires_at,
             lease_deadline_epoch_seconds,
             epoch,
@@ -187,12 +185,14 @@ impl<K: CredentialKind> CredentialLease<K> {
     /// its lifetime. A lease inherited across a process boundary refuses to
     /// project; only the process that minted it may reproduce its secrets.
     ///
-    /// The document carries the grant's remaining duration and preserves
-    /// the owner-authorized deadline verbatim, so a lease rebuilt from this
-    /// projection can never outlive the original grant — extension requires
-    /// a fresh owner grant, not another projection. The wire format is
-    /// whole seconds: a live fractional remainder maps up to the next
-    /// second, which the preserved deadline still caps on rebuild.
+    /// The document carries the grant's remaining duration and the grant's
+    /// effective deadline — the earlier of the preserved owner-authorized
+    /// deadline and this lease's own expiry expressed on the wall clock —
+    /// so a lease rebuilt from this projection can never outlive the
+    /// original grant. Extension requires a fresh owner grant, not another
+    /// projection. The wire format is whole seconds: a live fractional
+    /// remainder maps up to the next second, which the stamped deadline
+    /// still caps on rebuild.
     pub fn handoff_projection(&self) -> Result<CredentialHandoff<K>> {
         self.ensure_active()?;
         let remaining = self.expires_at.saturating_duration_since(Instant::now());
@@ -208,6 +208,18 @@ impl<K: CredentialKind> CredentialLease<K> {
             }
             credentials.insert(*kind, copied);
         }
+        // When the lease's own expiry — not the owner deadline — is the
+        // tighter bound, the stamped deadline must be that expiry floored
+        // to whole seconds: otherwise a rebuild would restart the
+        // rounded-up wire duration and outlive the lease it came from.
+        let expires_at_epoch_seconds = self.lease_deadline_epoch_seconds.min(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| anyhow!("credential_lease_clock_invalid"))?
+                .checked_add(remaining)
+                .map(|expiry| expiry.as_secs())
+                .ok_or_else(|| anyhow!("credential_lease_expiry_invalid"))?,
+        );
         // The egress scope is part of the grant: a projection carries it
         // forward verbatim so forwarding can never silently widen it.
         CredentialHandoff::with_deadline(
@@ -215,7 +227,7 @@ impl<K: CredentialKind> CredentialLease<K> {
             remaining,
             self.epoch.clone(),
             self.egress.clone(),
-            self.lease_deadline_epoch_seconds,
+            expires_at_epoch_seconds,
         )
     }
 
