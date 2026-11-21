@@ -1,6 +1,6 @@
 use super::*;
 use crate::handoff::{CredentialHandoff, MAX_HANDOFF_DOC_BYTES};
-use crate::lease::deadline_remaining;
+use crate::lease::{deadline_remaining, projected_expiry_epoch_seconds};
 use crate::SecretBytes;
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -539,8 +539,10 @@ fn handoff_round_trip_preserves_credentials_duration_and_epoch() {
 #[test]
 fn projection_and_rebuild_preserve_the_owner_authorized_deadline() {
     // A chained projection must not extend the grant: the deadline stamped
-    // by the original mint travels verbatim into every later projection,
-    // so a lease rebuilt twice still dies at the first grant's deadline.
+    // by the original mint caps every later projection. The stamped value
+    // is the earlier of the received deadline and the rebuilt lease's own
+    // conservatively measured expiry, so a chain can only stamp the same
+    // deadline or an earlier one — never a later one.
     let epoch = uuid::Uuid::new_v4().to_string();
     let source = Arc::new(TestEpochSource(StdMutex::new(Some(epoch.clone()))));
     let lease = CredentialLease::new(
@@ -557,13 +559,13 @@ fn projection_and_rebuild_preserve_the_owner_authorized_deadline() {
         CredentialLease::from_handoff(first, Arc::new(TestEpochSource(StdMutex::new(Some(epoch)))))
             .unwrap();
     let second = rebuilt.handoff_projection().unwrap();
-    assert_eq!(second.lease_expires_at_epoch_seconds(), deadline);
+    assert!(second.lease_expires_at_epoch_seconds() <= deadline);
     // The second projection's duration is bounded by what remained of the
     // original grant, not a fresh full term.
     assert!(second.lease_duration() <= Duration::from_secs(3600));
     let document = second.to_json().unwrap();
     let reparsed = CredentialHandoff::<TestKind>::from_json(document.expose_bytes()).unwrap();
-    assert_eq!(reparsed.lease_expires_at_epoch_seconds(), deadline);
+    assert!(reparsed.lease_expires_at_epoch_seconds() <= deadline);
 }
 
 #[test]
@@ -593,7 +595,10 @@ fn rebuilt_lease_never_outlives_the_documents_deadline() {
     .unwrap();
     match rebuilt.handoff_projection() {
         Ok(projected) => {
-            assert_eq!(projected.lease_expires_at_epoch_seconds(), deadline);
+            // The conservative expiry estimate can floor one second under
+            // the deadline — the cap holds, and the stamp never lands
+            // later than the deadline the document carried.
+            assert!(projected.lease_expires_at_epoch_seconds() <= deadline);
             assert!(projected.lease_duration() <= Duration::from_secs(2));
         }
         // An expiry already behind the wall clock refuses before minting.
@@ -644,6 +649,36 @@ fn deadline_remaining_preserves_full_wall_clock_precision() {
         Duration::ZERO
     );
     assert_eq!(deadline_remaining(1_700_000_000, now), Duration::ZERO);
+}
+
+#[test]
+fn projected_expiry_stays_on_the_early_side_of_a_second_boundary_delay() {
+    // The paired samples work because the wall clock is read first: a
+    // wall sample at 100.9s followed by a pause means the monotonic
+    // remainder was measured with the true clock already across the
+    // boundary — 50ms left, a true expiry in second 101. The stamp uses
+    // the early reading, floor(100.9 + 0.05) = 100, so the deadline can
+    // only sit at or before the real expiry second, never beyond it.
+    // Reading the wall clock after the delay would instead add the stale
+    // remainder to a later reading — floor(101.05 + 0.2) = 101 — letting
+    // a rebuild that restarts the ceiled wire duration outlive the
+    // source lease.
+    assert_eq!(
+        projected_expiry_epoch_seconds(Duration::new(100, 900_000_000), Duration::from_millis(50))
+            .unwrap(),
+        100
+    );
+    // Whole-second math and the exact-boundary case.
+    assert_eq!(
+        projected_expiry_epoch_seconds(Duration::from_secs(100), Duration::from_secs(1)).unwrap(),
+        101
+    );
+    assert_eq!(
+        projected_expiry_epoch_seconds(Duration::from_secs(100), Duration::ZERO).unwrap(),
+        100
+    );
+    // An unrepresentable sum refuses rather than wrapping.
+    assert!(projected_expiry_epoch_seconds(Duration::MAX, Duration::from_secs(1)).is_err());
 }
 
 #[test]

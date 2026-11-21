@@ -6,8 +6,10 @@
 //!
 //! The child also proves the negative half of the contract: the environment
 //! carries the descriptor number and nothing else, the read end is not
-//! writable, the descriptor is closed once read, and malformed or oversized
-//! documents fail closed with stable codes.
+//! writable, the descriptor is closed once read, malformed or oversized
+//! documents fail closed with stable codes, and a descendant that inherits
+//! the consumed variable fails closed at start instead of reading a stale
+//! or reassigned descriptor number.
 //!
 //! The parent test binary is reused as the child. The `fd_handoff_child_entry`
 //! test is inert during an ordinary run and only acts when the parent sets
@@ -252,6 +254,33 @@ fn report_descriptor() -> RawFd {
         .expect("decimal result descriptor")
 }
 
+/// Spawn a descendant of the test child and return the intake outcome it
+/// prints to stdout. The descendant inherits the child's whole environment —
+/// including the consumed `FAIRLINY_HANDOFF_FD` value — and the child's
+/// descriptor table, so whatever the stale number names for it is exactly
+/// what a real descendant would observe. The outcome is reported on a
+/// marked line so the test harness's own output cannot be mistaken for it.
+fn descendant_intake(mode: &str) -> String {
+    let output = Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", "fd_handoff_child_entry", "--nocapture"])
+        .env(CHILD_MODE_ENV, mode)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
+        .expect("spawn descendant");
+    assert!(
+        output.status.success(),
+        "descendant exited with {}",
+        output.status
+    );
+    String::from_utf8(output.stdout)
+        .expect("descendant outcome")
+        .lines()
+        .find_map(|line| line.strip_prefix("INTAKE ").map(str::to_owned))
+        .expect("descendant reported its intake outcome")
+}
+
 fn write_report(frame: &[u8]) {
     // SAFETY: the result descriptor is granted by the parent exactly once
     // and is owned here; closing it with the `File` ends the report.
@@ -342,6 +371,31 @@ fn oversized_document_fails_closed() {
     );
 }
 
+#[test]
+fn descendant_inheriting_the_consumed_variable_fails_closed() {
+    // Intake never mutates the environment, so the consumed descriptor
+    // number stays visible to descendants. A descendant spawned with the
+    // default environment starts a fresh latch over a number that was
+    // never granted to it: a closed number refuses the channel, and a
+    // number the OS reassigned reads an unrelated stream and refuses the
+    // document — never a valid handoff.
+    let document = handoff_document();
+    let (status, report) = SpawnedChild::spawn("descendant", "3")
+        .send(&document)
+        .finish();
+    assert!(status.success(), "child exited with {status}");
+    assert_eq!(
+        report,
+        [
+            REFUSED_FRAME,
+            b"credential_lease_handoff_fd_unavailable",
+            REFUSED_FRAME,
+            b"credential_lease_handoff_invalid"
+        ]
+        .concat()
+    );
+}
+
 /// The child half. In an ordinary test run the mode is absent and this test
 /// does nothing; the parent re-executes the binary with the mode set.
 #[test]
@@ -408,6 +462,57 @@ fn fd_handoff_child_entry() {
         "invalid-document" => {
             let error = receive_handoff_from_env::<Kind>().expect_err("document refused");
             refuse("credential_lease_handoff_invalid", error);
+        }
+        "descendant" => {
+            // Consume the granted descriptor like the valid path; the
+            // variable then stays in this process's environment, carrying
+            // the stale number.
+            let handoff = receive_handoff_from_env::<Kind>()
+                .expect("receiving the handoff")
+                .expect("the descriptor is named");
+            drop(handoff);
+            // A descendant inherits the stale number closed: intake
+            // refuses the channel outright.
+            assert_eq!(
+                descendant_intake("stale-descriptor"),
+                "refused credential_lease_handoff_fd_unavailable"
+            );
+            // A descriptor this process opens afterwards can land on the
+            // stale number: the next descendant inherits it open and
+            // intake reads a stream that was never granted — refused as a
+            // document, never a handoff. This is the hazard the spawn
+            // contract's clear-or-grant rule exists to prevent.
+            // SAFETY: /dev/null opens read-only without CLOEXEC; the
+            // descriptor is closed exactly once below.
+            let alias = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+            assert_eq!(
+                alias, 3,
+                "the reopened descriptor must take the stale number"
+            );
+            assert_eq!(descendant_intake("stale-descriptor"), "invalid");
+            close_fd(alias);
+            // Both descendant outcomes go out in one report: the report
+            // File consumes the write end.
+            let mut frame = REFUSED_FRAME.to_vec();
+            frame.extend_from_slice(b"credential_lease_handoff_fd_unavailable");
+            frame.extend_from_slice(REFUSED_FRAME);
+            frame.extend_from_slice(b"credential_lease_handoff_invalid");
+            write_report(&frame);
+        }
+        "stale-descriptor" => {
+            // A descendant that inherited the stale variable: report the
+            // intake outcome for the spawning process to assert. A closed
+            // number refuses the channel; a reassigned number reads an
+            // unrelated stream and refuses the document. It must never
+            // produce a handoff.
+            match receive_handoff_from_env::<Kind>() {
+                Ok(Some(_)) => println!("INTAKE handoff"),
+                Ok(None) => println!("INTAKE absent"),
+                Err(error) if error.to_string() == "credential_lease_handoff_invalid" => {
+                    println!("INTAKE invalid")
+                }
+                Err(error) => println!("INTAKE refused {error}"),
+            }
         }
         other => panic!("unknown child mode {other:?}"),
     }

@@ -45,7 +45,10 @@ pub const MIN_HANDOFF_FD: RawFd = 3;
 /// variable wins the descriptor outright, before its value is even parsed.
 /// The environment itself is never mutated — removing a variable is not
 /// synchronized with readers outside Rust's environment API — so the number
-/// stays in place but can never drive a second intake.
+/// stays in place but can never drive a second intake in this process.
+/// Descendants are another matter: a child spawned with the inherited
+/// environment sees the stale number under a fresh latch, so the spawn
+/// contract below applies at every exec.
 static HANDOFF_CHANNEL_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// Receive a handoff from the descriptor named by [`HANDOFF_FD_ENV`].
@@ -65,6 +68,15 @@ static HANDOFF_CHANNEL_CLAIMED: AtomicBool = AtomicBool::new(false);
 /// Ownership itself is the spawn contract — the host must grant this
 /// process exclusive ownership of the descriptor the variable names, the
 /// same transfer [`receive_handoff`] requires of a direct caller.
+///
+/// Intake consumes the channel but never removes the variable, so a
+/// process that took its handoff still carries the now-stale number.
+/// The contract therefore applies at every exec: a spawned child either
+/// receives the matching descriptor, or starts without the variable —
+/// a process spawning children with no handoff grant removes
+/// [`HANDOFF_FD_ENV`] from the child's environment rather than letting
+/// the inherited value through, where a fresh latch could read a closed
+/// number or a descriptor the OS reassigned to something unrelated.
 pub fn receive_handoff_from_env<K: CredentialKind>() -> Result<Option<CredentialHandoff<K>>> {
     let Some(value) = std::env::var_os(HANDOFF_FD_ENV) else {
         return Ok(None);

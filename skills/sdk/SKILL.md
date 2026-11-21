@@ -49,6 +49,13 @@ can install their `CustodyPort` through `port::install` and access it through
   or configuration document. The environment names the explicitly granted channel
   (`FAIRLINY_HANDOFF_FD`) by descriptor number only; it never carries the
   document or a root key.
+- The `FAIRLINY_HANDOFF_FD` grant rule applies at every exec, not only the
+  first spawn: set the variable only together with the descriptor the child
+  is actually granted, and remove it from the environment of any child that
+  receives no handoff. Intake consumes the channel but never removes the
+  variable, so a descendant spawned with the default environment inherits a
+  stale number — a fresh latch could read a closed descriptor or one the OS
+  reassigned to something unrelated.
 - Every resolution checks the lease's process identity, its own lifetime,
   and the host's current custody epoch. A lease inherited across a fork and
   a revoked or expired lease are all refusals; obtaining another lease

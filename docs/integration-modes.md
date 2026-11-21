@@ -38,7 +38,10 @@ Boundary rules the consumer relies on:
   secret material. On Unix the channel is an inherited read-only descriptor
   named by `FAIRLINY_HANDOFF_FD`; `receive_handoff_from_env` consumes the
   variable once, closes the descriptor, and bounds the read. The environment
-  carries only the descriptor number.
+  carries only the descriptor number. The grant rule applies at every exec:
+  a spawned child either receives the matching descriptor with the variable
+  set to its number, or starts without the variable — an inherited stale
+  number must never reach a descendant.
 - **Process-bound** — a lease is bound to the process that minted it, its
   own lifetime, and the custody epoch. A fork inheriting the lease fails
   closed (`credential_lease_process_mismatch`); revocation is a signal the

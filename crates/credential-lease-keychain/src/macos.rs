@@ -315,12 +315,19 @@ impl Keychain {
     /// otherwise add it. The add path retries a lost update race exactly
     /// once so a duplicate that appears between the two calls is still
     /// written.
+    ///
+    /// A query declaring `synchronizable` is refused before any SecItem
+    /// call: the platform cannot attach the device-only access control
+    /// every write carries to a synchronizable item. Reads and deletes
+    /// of existing synchronizable items stay supported — only writes are
+    /// refused.
     pub fn set_item(
         &self,
         context: &KeychainAuthContext,
         query: &KeychainItemQuery<'_>,
         secret: &SecretBytes,
     ) -> Result<(), KeychainError> {
+        ensure_write_supported(query)?;
         let store = effective_store(query, self.backend)?;
         let query_dict =
             CFDictionary::from_CFType_pairs(&base_pairs(query, context, self.backend)?);
@@ -370,12 +377,16 @@ impl Keychain {
     /// nothing is ever overwritten through this operation. Item contracts
     /// that are append-only resolve `Duplicate` by comparing the existing
     /// record.
+    ///
+    /// A query declaring `synchronizable` is refused before any SecItem
+    /// call, for the same reason [`Keychain::set_item`] refuses it.
     pub fn add_item(
         &self,
         context: &KeychainAuthContext,
         query: &KeychainItemQuery<'_>,
         secret: &SecretBytes,
     ) -> Result<AddItemOutcome, KeychainError> {
+        ensure_write_supported(query)?;
         let store = effective_store(query, self.backend)?;
         let mut pairs = base_pairs(query, context, self.backend)?;
         pairs.extend(protected_secret_pairs(secret.expose_bytes())?);
@@ -545,6 +556,22 @@ fn effective_store(
         None if query.synchronizable == Some(true) => Ok(KeychainBackend::DataProtection),
         None => Ok(backend),
     }
+}
+
+/// Synchronizable items are readable and deletable through this backend
+/// but never writable: Security.framework refuses a `SecAccessControl`
+/// on a synchronizable item (`errSecParam`), and dropping the control to
+/// satisfy the write would silently store the item without the
+/// device-only protection this backend exists to enforce.
+fn ensure_write_supported(query: &KeychainItemQuery<'_>) -> Result<(), KeychainError> {
+    if query.synchronizable == Some(true) {
+        return Err(KeychainError::new(
+            "credential_lease_keychain_synchronizable_write_invalid",
+            KeychainErrorKind::Failed,
+            None,
+        ));
+    }
+    Ok(())
 }
 
 /// The ordinary item query: class, service, account, the optional storage
@@ -1637,6 +1664,46 @@ mod tests {
             effective_store(&classic_only, KeychainBackend::DataProtection).unwrap(),
             KeychainBackend::Classic
         );
+    }
+
+    #[test]
+    fn synchronizable_writes_refuse_before_any_secitem_call() {
+        // Security.framework answers errSecParam when a SecAccessControl
+        // rides a synchronizable item, so the backend refuses the write
+        // itself — the refusal lands before store selection, and no
+        // SecItem call ever runs. An unset or explicit-false flag keeps
+        // the write path open.
+        let context = synthetic_context();
+        let secret = SecretBytes::try_from_bytes(vec![0xA5u8; 24]).unwrap();
+        for backend in [KeychainBackend::Classic, KeychainBackend::DataProtection] {
+            let keychain = Keychain { backend };
+            let synchronizable = KeychainItemQuery::new("synthetic-service", "synthetic-account")
+                .unwrap()
+                .with_synchronizable(true);
+            assert_eq!(
+                keychain
+                    .add_item(&context, &synchronizable, &secret)
+                    .unwrap_err()
+                    .code(),
+                "credential_lease_keychain_synchronizable_write_invalid"
+            );
+            assert_eq!(
+                keychain
+                    .set_item(&context, &synchronizable, &secret)
+                    .unwrap_err()
+                    .code(),
+                "credential_lease_keychain_synchronizable_write_invalid"
+            );
+            for flag in [None, Some(false)] {
+                let writable =
+                    KeychainItemQuery::new("synthetic-service", "synthetic-account").unwrap();
+                let writable = match flag {
+                    Some(flag) => writable.with_synchronizable(flag),
+                    None => writable,
+                };
+                assert!(ensure_write_supported(&writable).is_ok());
+            }
+        }
     }
 
     #[test]

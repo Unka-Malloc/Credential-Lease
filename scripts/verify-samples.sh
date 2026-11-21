@@ -14,8 +14,16 @@ vectors="$root/samples/vectors"
 checks=0
 failures=0
 
-cargo build --quiet -p credential-lease --example validate_handoff
-rust_sample="$root/target/debug/examples/validate_handoff"
+# The executable path comes from this build's own artifact report, so a
+# relocated target directory (CARGO_TARGET_DIR, build.target-dir) can
+# never point the runner at a missing or stale binary.
+rust_sample="$(cargo build --quiet --message-format=json \
+  -p credential-lease --example validate_handoff \
+  | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)"
+if [ ! -x "$rust_sample" ]; then
+  echo "FAIL samples: cargo build did not produce a validate_handoff executable" >&2
+  exit 1
+fi
 
 go_sample=""
 if command -v go >/dev/null 2>&1; then

@@ -105,12 +105,20 @@ impl<K: CredentialKind> CredentialLease<K> {
         // from the handoff. A rebuild can therefore never mint a lease
         // that outlives the original grant, and a lapsed deadline yields a
         // dead-on-arrival lease that fails closed on every use.
+        //
+        // Paired clock samples in the conservative direction: the mint
+        // instant is read before the wall clock, so the deadline
+        // subtraction runs against a wall reading no earlier than the
+        // instant the expiry is anchored to — a pause between the
+        // samples can only shrink the minted lifetime, never stretch it
+        // past the deadline.
+        let minted_at = Instant::now();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| anyhow!("credential_lease_clock_invalid"))?;
         let effective_duration =
             lease_duration.min(deadline_remaining(lease_deadline_epoch_seconds, now));
-        let expires_at = Instant::now()
+        let expires_at = minted_at
             .checked_add(effective_duration)
             .ok_or_else(|| anyhow!("credential_lease_expiry_invalid"))?;
         Ok(Self {
@@ -195,6 +203,15 @@ impl<K: CredentialKind> CredentialLease<K> {
     /// still caps on rebuild.
     pub fn handoff_projection(&self) -> Result<CredentialHandoff<K>> {
         self.ensure_active()?;
+        // Paired clock samples in the conservative direction: the wall
+        // clock is read before the monotonic remainder is measured, so
+        // the projected expiry estimate below sits at or before the
+        // lease's true expiry — a credential copy or a scheduling pause
+        // after the samples can only shrink the stamped deadline, never
+        // let it drift later than the grant it projects.
+        let projected_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| anyhow!("credential_lease_clock_invalid"))?;
         let remaining = self.expires_at.saturating_duration_since(Instant::now());
         let mut credentials = BTreeMap::new();
         for (kind, keys) in &self.credentials {
@@ -212,14 +229,9 @@ impl<K: CredentialKind> CredentialLease<K> {
         // tighter bound, the stamped deadline must be that expiry floored
         // to whole seconds: otherwise a rebuild would restart the
         // rounded-up wire duration and outlive the lease it came from.
-        let expires_at_epoch_seconds = self.lease_deadline_epoch_seconds.min(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|_| anyhow!("credential_lease_clock_invalid"))?
-                .checked_add(remaining)
-                .map(|expiry| expiry.as_secs())
-                .ok_or_else(|| anyhow!("credential_lease_expiry_invalid"))?,
-        );
+        let expires_at_epoch_seconds = self
+            .lease_deadline_epoch_seconds
+            .min(projected_expiry_epoch_seconds(projected_at, remaining)?);
         // The egress scope is part of the grant: a projection carries it
         // forward verbatim so forwarding can never silently widen it.
         CredentialHandoff::with_deadline(
@@ -334,6 +346,22 @@ pub(crate) fn deadline_remaining(
     Duration::from_secs(deadline_epoch_seconds)
         .checked_sub(now_since_epoch)
         .unwrap_or(Duration::ZERO)
+}
+
+/// A lease's own expiry projected onto the wall clock, floored to whole
+/// seconds. `wall_now` must be sampled no later than the monotonic
+/// instant `remaining` was measured against: the estimate then sits at
+/// or before the true expiry, so a delay between the two samples can
+/// only move the stamp earlier — it can never stamp a deadline past the
+/// real one.
+pub(crate) fn projected_expiry_epoch_seconds(
+    wall_now: Duration,
+    remaining: Duration,
+) -> Result<u64> {
+    wall_now
+        .checked_add(remaining)
+        .map(|expiry| expiry.as_secs())
+        .ok_or_else(|| anyhow!("credential_lease_expiry_invalid"))
 }
 
 struct DisconnectedEpochSource;

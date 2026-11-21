@@ -47,6 +47,25 @@ back through the handoff channel.
 The receiver does not authenticate the writer. It trusts the host that
 spawned it and granted the descriptor; access control belongs to that host.
 
+## Descendant processes
+
+Intake consumes the channel but never removes the variable — environment
+mutation is not synchronized with readers outside the process — so a process
+that took its handoff still carries the consumed descriptor number. A
+descendant spawned with the default inherited environment then sees
+`FAIRLINY_HANDOFF_FD` under a fresh latch, naming a descriptor that was
+never granted to it: at best it refuses the closed number as
+`credential_lease_handoff_fd_unavailable`; worse, the OS may have reassigned
+the number and the descendant would read a descriptor meant for something
+else.
+
+The grant rule therefore applies at every exec, not only the first spawn:
+a spawner either hands the child a matching descriptor and sets the
+variable to its number, or removes the variable from the child's
+environment (`env -u`, `Command::env_remove`, or an explicit environment
+list). A runtime that spawns further processes with no handoff for them
+must clear the variable instead of letting the inherited value through.
+
 ### Refusal codes
 
 | Refusal | Meaning |
@@ -100,7 +119,7 @@ bound and closed-document rules, and print only non-secret shape:
 
 | Sample | Command |
 | --- | --- |
-| Rust (`crates/credential-lease/examples/validate_handoff.rs`) | `cargo build -q -p credential-lease --example validate_handoff`, then `target/debug/examples/validate_handoff` |
+| Rust (`crates/credential-lease/examples/validate_handoff.rs`) | `cargo build -q -p credential-lease --example validate_handoff`, then the executable path the build reports (`target/debug/examples/validate_handoff` under the default target directory) |
 | Go (`samples/go/`) | `cd samples/go && go build -o validate .` |
 | TypeScript (`samples/typescript/handoff.ts`) | `node --experimental-strip-types samples/typescript/handoff.ts` |
 

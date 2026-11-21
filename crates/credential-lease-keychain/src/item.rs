@@ -69,6 +69,13 @@ impl<'a> KeychainItemQuery<'a> {
     }
 
     /// Emit an explicit `kSecAttrSynchronizable` flag.
+    ///
+    /// A `true` flag narrows the operation surface: the platform serves
+    /// the item only from the Data Protection Keychain, and the backend's
+    /// device-only `SecAccessControl` cannot attach to it — reads and
+    /// deletes of existing synchronizable items are supported, writes
+    /// refuse `credential_lease_keychain_synchronizable_write_invalid`
+    /// before any SecItem call.
     pub fn with_synchronizable(mut self, synchronizable: bool) -> Self {
         self.synchronizable = Some(synchronizable);
         self
