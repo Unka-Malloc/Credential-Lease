@@ -195,4 +195,10 @@ fn integrity_and_infrastructure_refusals_do_not_map_to_auth_expired() {
     .unwrap_err();
     assert_eq!(invalid_epoch.to_string(), "credential_lease_epoch_invalid");
     assert_eq!(auth_failure_class(&invalid_epoch), None);
+
+    // An unreadable shared clock is an operational failure too: the
+    // refusal is the distinct clock code, not `credential_lease_expired`,
+    // so host recovery never renews credentials over a broken clock.
+    let clock_failure = anyhow::anyhow!("credential_lease_clock_unavailable");
+    assert_eq!(auth_failure_class(&clock_failure), None);
 }

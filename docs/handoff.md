@@ -148,17 +148,20 @@ exit. Three independent checks apply on every credential use:
    the document carries `leaseMonotonicDeadlineSeconds`, the rebuild is
    capped by that deadline on the same monotonic clock as well: the wall
    clock plays no part in the comparison, so a backward wall-clock step
-   between projection and rebuild cannot stretch the grant. The
-   monotonic deadline is then enforced in its own clock domain on every
+   between projection and rebuild cannot stretch the grant. Both wire
+   deadlines are then enforced in their own clock domains on every
    credential use — before and after the epoch consultation — not only
-   at rebuild time, because the process-local `Instant` and the shared
-   monotonic clock can diverge (on Darwin `CLOCK_MONOTONIC` advances
-   across suspend while the uptime clock `Instant` reads pauses): a
-   lease must still refuse once its shared deadline passed during sleep.
-   A platform that can compare the clock refuses a document that omits
-   the member, and one that cannot refuses a document that carries it —
-   the rebuild fails closed with `credential_lease_expiry_invalid`
-   whenever clock continuity cannot be established.
+   at rebuild time, because the runtime clocks can diverge from each
+   other across suspend in either direction: on Darwin `CLOCK_MONOTONIC`
+   advances while the uptime clock `Instant` reads pauses, and on Linux
+   both runtime clocks pause while the wall clock keeps running. A lease
+   minted before sleep must still refuse once a wire deadline passed
+   during sleep — the wall deadline guards the case where every
+   monotonic-domain clock stopped. A platform that can compare the
+   shared monotonic clock refuses a document that omits the member, and
+   one that cannot refuses a document that carries it — the rebuild
+   fails closed with `credential_lease_expiry_invalid` whenever clock
+   continuity cannot be established.
 3. The custody epoch — the runtime's epoch source is consulted on every
    resolution and must still report the handoff's epoch. An
    owner-initiated revocation rotates the epoch and kills every
@@ -177,8 +180,10 @@ The contract's runtime refusals are stable codes:
 | Refusal | Meaning |
 | --- | --- |
 | `credential_lease_unavailable` | No credential of the requested kind is currently resolvable. |
-| `credential_lease_expired` | The lease's own duration has elapsed — checked both before and after the epoch consultation, so a slow epoch lookup can never release an expired grant. |
+| `credential_lease_expired` | The grant's lifetime has elapsed on any of its clock domains — the `Instant` expiry, the wall-clock deadline, or the shared monotonic deadline — checked both before and after the epoch consultation, so a slow epoch lookup can never release an expired grant. |
 | `credential_lease_expiry_invalid` | The grant's deadline shape is malformed or its clock continuity cannot be established: a deadline at or before the epoch, a deadline of zero, or a monotonic deadline the rebuild cannot compare or must require but is absent. |
+| `credential_lease_clock_invalid` | The wall clock cannot produce a usable reading (for example it precedes the Unix epoch). An operational failure, not an elapsed grant. |
+| `credential_lease_clock_unavailable` | The shared monotonic clock could not be read back for the in-domain deadline check on a lease that carries `leaseMonotonicDeadlineSeconds`. An operational failure, not an elapsed grant. |
 | `credential_lease_revoked` | The active epoch is absent or no longer matches the lease's epoch. |
 | `credential_lease_process_mismatch` | The lease object is being used from a process other than the one that minted it. |
 
@@ -196,9 +201,9 @@ root). `credential_lease_unavailable`, `credential_lease_expired`, and
 `credential_lease_revoked` all mean the credential is unusable and map to
 `auth_expired`, so the host stops using it and requests a fresh authorized
 handoff. Local integrity failures (`credential_lease_process_mismatch`) and
-infrastructure failures (an unreadable epoch source, a poisoned slot lock)
-return `None` and stay operational errors: a host must not silently renew
-credentials across a broken boundary.
+infrastructure failures (an unreadable epoch source, an unreadable clock, a
+poisoned slot lock) return `None` and stay operational errors: a host must
+not silently renew credentials across a broken boundary.
 
 ## Portability notes
 

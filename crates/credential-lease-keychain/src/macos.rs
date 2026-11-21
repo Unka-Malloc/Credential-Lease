@@ -464,17 +464,21 @@ impl Keychain {
     /// may display its consent dialog; otherwise the classic UI is
     /// suppressed for the duration of the read.
     ///
-    /// The operation answers `Ok(None)` when this store is not the Data
-    /// Protection Keychain — a same-store copy is not a migration.
+    /// The migration destination is always the Data Protection Keychain:
+    /// on any other store the operation refuses
+    /// `credential_lease_keychain_migration_target_invalid`, so `Ok(None)`
+    /// unambiguously means the source item is absent — a classic handle
+    /// cannot masquerade a same-store copy as a migration. A grouped
+    /// query refuses `credential_lease_keychain_routing_invalid` instead:
+    /// the classic source path strips `kSecAttrAccessGroup`, so the call
+    /// could never honor the declared scope.
     pub fn copy_legacy_classic_secret(
         &self,
         context: &KeychainAuthContext,
         query: &KeychainItemQuery<'_>,
         allow_interaction: bool,
     ) -> Result<Option<SecretBytes>, KeychainError> {
-        let Some(mut pairs) = classic_migration_pairs(query, context, self.backend) else {
-            return Ok(None);
-        };
+        let mut pairs = classic_migration_pairs(query, context, self.backend)?;
         pairs.push((
             security_framework_static!(kSecReturnData, sec_key),
             CFBoolean::from(true).into_CFType(),
@@ -488,20 +492,16 @@ impl Keychain {
 
     /// Delete one item from the classic Keychain — the legacy migration's
     /// cleanup. Refused outright when this store is not the Data Protection
-    /// Keychain: deleting the only copy is never a migration.
+    /// Keychain: deleting the only copy is never a migration. A grouped
+    /// query refuses `credential_lease_keychain_routing_invalid` for the
+    /// same reason [`Self::copy_legacy_classic_secret`] does.
     pub fn delete_legacy_classic_item(
         &self,
         context: &KeychainAuthContext,
         query: &KeychainItemQuery<'_>,
         allow_interaction: bool,
     ) -> Result<(), KeychainError> {
-        let pairs = classic_migration_pairs(query, context, self.backend).ok_or_else(|| {
-            KeychainError::new(
-                "credential_lease_keychain_migration_target_invalid",
-                KeychainErrorKind::Failed,
-                None,
-            )
-        })?;
+        let pairs = classic_migration_pairs(query, context, self.backend)?;
         let query_dict = CFDictionary::from_CFType_pairs(&pairs);
         let status = with_classic_keychain_interaction(
             &SystemClassicKeychainInteraction,
@@ -524,32 +524,50 @@ impl Keychain {
 /// The store a query actually lands on: the host's explicit routing flag
 /// when set, otherwise this handle's probed backend — except a
 /// synchronizable item, which the platform serves only from the Data
-/// Protection Keychain regardless of the handle's store (TN3137). Both
-/// the routing flag and the interaction policy are derived from this
-/// store, so a classic-routed query can never escape the backend's
-/// classic interaction suppression — the bypass a forced
-/// `use_data_protection = false` would otherwise open on a Data
-/// Protection handle — and a synchronizable query always gets the Data
-/// Protection no-UI policy and error handling.
+/// Protection Keychain regardless of the handle's store (TN3137), and an
+/// access-group-scoped query, whose `kSecAttrAccessGroup` the classic
+/// path strips outright (Security.framework honors the attribute only on
+/// the Data Protection store — a grouped query there would match on
+/// service and account alone). Both the routing flag and the interaction
+/// policy are derived from this store, so a classic-routed query can
+/// never escape the backend's classic interaction suppression — the
+/// bypass a forced `use_data_protection = false` would otherwise open on
+/// a Data Protection handle — and a synchronizable or grouped query
+/// always gets the Data Protection no-UI policy and error handling.
 fn effective_store(
     query: &KeychainItemQuery<'_>,
     backend: KeychainBackend,
 ) -> Result<KeychainBackend, KeychainError> {
     match query.use_data_protection {
         Some(true) => Ok(KeychainBackend::DataProtection),
-        // A synchronizable item cannot live in the classic store — the
-        // platform would serve it from Data Protection anyway, so routing
-        // flags that claim classic contradict the declared attributes and
-        // are refused rather than silently re-routed.
-        Some(false) if query.synchronizable == Some(true) => Err(KeychainError::new(
-            "credential_lease_keychain_routing_invalid",
-            KeychainErrorKind::Failed,
-            None,
-        )),
+        // A synchronizable or access-group-scoped item cannot live in
+        // the classic store — the platform would serve the first from
+        // Data Protection anyway, and it would strip the second's
+        // scoping attribute, so routing flags that claim classic
+        // contradict the declared attributes and are refused rather than
+        // silently re-routed or silently de-scoped.
+        Some(false) if query.synchronizable == Some(true) || query.access_group.is_some() => {
+            Err(routing_invalid())
+        }
         Some(false) => Ok(KeychainBackend::Classic),
         None if query.synchronizable == Some(true) => Ok(KeychainBackend::DataProtection),
+        // A grouped query keeps its scoping only on the Data Protection
+        // store, so implicit routing must not let a fallback-classic
+        // handle serve it unscoped.
+        None if query.access_group.is_some() => Ok(KeychainBackend::DataProtection),
         None => Ok(backend),
     }
+}
+
+/// The refusal for a routing flag that contradicts the query's declared
+/// attributes — explicit classic routing on an item only the Data
+/// Protection store can scope or host.
+fn routing_invalid() -> KeychainError {
+    KeychainError::new(
+        "credential_lease_keychain_routing_invalid",
+        KeychainErrorKind::Failed,
+        None,
+    )
 }
 
 /// Synchronizable items are readable and deletable through this backend
@@ -683,36 +701,54 @@ fn copy_item_pairs(
     Ok(pairs)
 }
 
+/// The refusal every migration entry point returns when the selected
+/// destination is not the Data Protection Keychain.
+fn migration_target_invalid() -> KeychainError {
+    KeychainError::new(
+        "credential_lease_keychain_migration_target_invalid",
+        KeychainErrorKind::Failed,
+        None,
+    )
+}
+
 /// Legacy migration source pairs: an explicit classic-only query. Valid
 /// only when the selected destination is the Data Protection Keychain —
 /// copying and deleting inside the classic store itself is not a
-/// migration, so the pairs exist only for a distinct destination.
+/// migration, so the pairs exist only for a distinct destination. A
+/// grouped query is refused the same way explicit classic routing is:
+/// the source path strips `kSecAttrAccessGroup`, so honoring the call
+/// would silently widen the read or delete to every classic item sharing
+/// the service and account.
 fn classic_migration_pairs(
     query: &KeychainItemQuery<'_>,
     context: &KeychainAuthContext,
     destination: KeychainBackend,
-) -> Option<Vec<(CFString, CFType)>> {
-    (destination == KeychainBackend::DataProtection).then(|| {
-        vec![
-            (
-                security_framework_static!(kSecClass, sec_key),
-                security_framework_static!(kSecClassGenericPassword, sec_string_value),
-            ),
-            (
-                security_framework_static!(kSecAttrService, sec_key),
-                CFString::from(query.service).into_CFType(),
-            ),
-            (
-                security_framework_static!(kSecAttrAccount, sec_key),
-                CFString::from(query.account).into_CFType(),
-            ),
-            (
-                security_framework_static!(kSecUseAuthenticationContext, sec_key),
-                context.as_cf_type(),
-            ),
-            data_protection_routing(KeychainBackend::Classic),
-        ]
-    })
+) -> Result<Vec<(CFString, CFType)>, KeychainError> {
+    if query.access_group.is_some() {
+        return Err(routing_invalid());
+    }
+    if destination != KeychainBackend::DataProtection {
+        return Err(migration_target_invalid());
+    }
+    Ok(vec![
+        (
+            security_framework_static!(kSecClass, sec_key),
+            security_framework_static!(kSecClassGenericPassword, sec_string_value),
+        ),
+        (
+            security_framework_static!(kSecAttrService, sec_key),
+            CFString::from(query.service).into_CFType(),
+        ),
+        (
+            security_framework_static!(kSecAttrAccount, sec_key),
+            CFString::from(query.account).into_CFType(),
+        ),
+        (
+            security_framework_static!(kSecUseAuthenticationContext, sec_key),
+            context.as_cf_type(),
+        ),
+        data_protection_routing(KeychainBackend::Classic),
+    ])
 }
 
 /// The write payload: a `SecAccessControl` requiring user presence plus
@@ -1433,7 +1469,12 @@ mod tests {
     fn classic_migration_requires_a_distinct_data_protection_destination() {
         let context = synthetic_context();
         let query = KeychainItemQuery::new("synthetic-service", "same-item").unwrap();
-        assert!(classic_migration_pairs(&query, &context, KeychainBackend::Classic).is_none());
+        assert_eq!(
+            classic_migration_pairs(&query, &context, KeychainBackend::Classic)
+                .unwrap_err()
+                .code(),
+            "credential_lease_keychain_migration_target_invalid"
+        );
         let pairs =
             classic_migration_pairs(&query, &context, KeychainBackend::DataProtection).unwrap();
         let dict = CFDictionary::from_CFType_pairs(&pairs);
@@ -1706,6 +1747,89 @@ mod tests {
     }
 
     #[test]
+    fn grouped_queries_keep_their_scope_on_data_protection() {
+        let context = synthetic_context();
+        let query = KeychainItemQuery::new("synthetic-service", "synthetic-account").unwrap();
+        // Security.framework strips kSecAttrAccessGroup on the classic
+        // path, so an implicitly routed grouped query must land on the
+        // Data Protection store even on a fallback-classic handle —
+        // otherwise the scope is silently dropped and the operation
+        // matches on service and account alone.
+        let grouped = query.clone().with_access_group("synthetic-access-group");
+        assert_eq!(
+            effective_store(&grouped, KeychainBackend::Classic).unwrap(),
+            KeychainBackend::DataProtection
+        );
+        let dict = CFDictionary::from_CFType_pairs(
+            &base_pairs(&grouped, &context, KeychainBackend::Classic).unwrap(),
+        );
+        assert_eq!(
+            dict_value(&dict, unsafe { kSecUseDataProtectionKeychain })
+                .map(|value| value.as_CFTypeRef()),
+            Some(CFBoolean::from(true).as_CFTypeRef())
+        );
+        assert_eq!(
+            dict_value(&dict, unsafe { kSecAttrAccessGroup })
+                .and_then(|value| value.downcast::<CFString>())
+                .map(|value| value.to_string())
+                .as_deref(),
+            Some("synthetic-access-group")
+        );
+        assert_eq!(
+            dict_value(&dict, unsafe { kSecUseAuthenticationUI }).map(|value| value.as_CFTypeRef()),
+            Some(
+                security_framework_static!(kSecUseAuthenticationUIFail, sec_string_value)
+                    .as_CFTypeRef()
+            )
+        );
+        // Forcing classic routing on a grouped query contradicts the
+        // declared scope: refused, never silently de-scoped.
+        let contradictory = query
+            .clone()
+            .with_access_group("synthetic-access-group")
+            .with_data_protection(false);
+        for backend in [KeychainBackend::Classic, KeychainBackend::DataProtection] {
+            assert_eq!(
+                effective_store(&contradictory, backend).unwrap_err().code(),
+                "credential_lease_keychain_routing_invalid"
+            );
+            assert!(base_pairs(&contradictory, &context, backend).is_err());
+        }
+        // The legacy migration entry points force a classic source query,
+        // so a grouped query refuses there the same way — before any
+        // SecItem call, on either handle.
+        for backend in [KeychainBackend::Classic, KeychainBackend::DataProtection] {
+            assert_eq!(
+                classic_migration_pairs(&grouped, &context, backend)
+                    .unwrap_err()
+                    .code(),
+                "credential_lease_keychain_routing_invalid"
+            );
+            let keychain = Keychain { backend };
+            assert_eq!(
+                keychain
+                    .copy_legacy_classic_secret(&context, &grouped, false)
+                    .unwrap_err()
+                    .code(),
+                "credential_lease_keychain_routing_invalid"
+            );
+            assert_eq!(
+                keychain
+                    .delete_legacy_classic_item(&context, &grouped, false)
+                    .unwrap_err()
+                    .code(),
+                "credential_lease_keychain_routing_invalid"
+            );
+        }
+        // An explicitly unscoped query may still route classic.
+        let unscoped = query.with_synchronizable(false).with_data_protection(false);
+        assert_eq!(
+            effective_store(&unscoped, KeychainBackend::DataProtection).unwrap(),
+            KeychainBackend::Classic
+        );
+    }
+
+    #[test]
     fn synchronizable_writes_refuse_before_any_secitem_call() {
         // Security.framework answers errSecParam when a SecAccessControl
         // rides a synchronizable item, so the backend refuses the write
@@ -1880,10 +2004,10 @@ mod tests {
     #[test]
     fn classic_fallback_reports_availability_without_protected_write_readiness() {
         // When the probe falls back to the classic store the handle is a
-        // real, usable backend — but only for reads, deletes, and the
-        // legacy migration. The availability reports keep that split:
-        // write readiness is `false` exactly on the store whose
-        // `add_item`/`set_item` calls always refuse.
+        // real, usable backend — but only for reads and deletes. The
+        // availability reports keep that split: write readiness is `false`
+        // exactly on the store whose `add_item`/`set_item` calls always
+        // refuse.
         let classic = Keychain {
             backend: KeychainBackend::Classic,
         };
@@ -1904,6 +2028,21 @@ mod tests {
             assert_eq!(
                 result.unwrap_err().code(),
                 "credential_lease_keychain_classic_write_unsupported"
+            );
+        }
+        // The legacy migration entry points refuse outright on the classic
+        // handle — the destination is always the Data Protection store —
+        // so a host can distinguish a missing source item (`Ok(None)` on a
+        // Data Protection handle) from an unavailable destination.
+        for result in [
+            classic
+                .copy_legacy_classic_secret(&context, &query, false)
+                .map(|_| ()),
+            classic.delete_legacy_classic_item(&context, &query, false),
+        ] {
+            assert_eq!(
+                result.unwrap_err().code(),
+                "credential_lease_keychain_migration_target_invalid"
             );
         }
     }

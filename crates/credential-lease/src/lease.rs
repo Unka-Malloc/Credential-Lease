@@ -8,7 +8,9 @@
 //!    and compared with the current process. A child forked with the lease
 //!    in its inherited address space therefore fails closed instead of
 //!    replaying the parent's credentials.
-//! 2. The lease's own `Instant` expiry.
+//! 2. The lease's deadlines — its own `Instant` expiry plus the wall-clock
+//!    and shared-monotonic deadlines it carries — each enforced in the
+//!    clock domain it was declared in, on every use.
 //! 3. The custody epoch, consulted on every resolution so an owner-initiated
 //!    revocation lands on the very next use.
 //!
@@ -29,6 +31,35 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// The clocks a lease enforces its deadlines on: the wall clock the
+/// owner-authorized deadline was stamped in and the process-shared
+/// monotonic clock the wire deadline rides. Production installs the system
+/// pair; the test seam substitutes fixed or failing readings so suspend and
+/// clock-failure paths are exercised deterministically instead of by
+/// sleeping or racing a live second boundary.
+pub(crate) trait LeaseClockSource: Send + Sync {
+    /// The wall clock at full precision, as seconds since the Unix epoch.
+    fn wall_now(&self) -> Result<Duration>;
+    /// The process-shared monotonic clock at full precision — `None` where
+    /// the platform cannot read it.
+    fn monotonic_now(&self) -> Option<Duration>;
+}
+
+/// The host's real clock pair.
+pub(crate) struct SystemLeaseClocks;
+
+impl LeaseClockSource for SystemLeaseClocks {
+    fn wall_now(&self) -> Result<Duration> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| anyhow!("credential_lease_clock_invalid"))
+    }
+
+    fn monotonic_now(&self) -> Option<Duration> {
+        crate::handoff::monotonic_now()
+    }
+}
+
 /// A process-local snapshot of custody-held credentials for one kind family.
 pub struct CredentialLease<K: CredentialKind> {
     credentials: BTreeMap<K, Vec<LeasedCredential>>,
@@ -38,6 +69,7 @@ pub struct CredentialLease<K: CredentialKind> {
     lease_monotonic_deadline_seconds: Option<u64>,
     epoch: String,
     epoch_source: Arc<dyn LeaseEpochSource>,
+    clock_source: Arc<dyn LeaseClockSource>,
     process_id: u32,
     egress: EgressScope,
 }
@@ -56,6 +88,7 @@ impl<K: CredentialKind> CredentialLease<K> {
             lease_monotonic_deadline_seconds: None,
             epoch: String::new(),
             epoch_source: Arc::new(DisconnectedEpochSource),
+            clock_source: Arc::new(SystemLeaseClocks),
             process_id: std::process::id(),
             egress: EgressScope::deny_all(),
         }
@@ -87,6 +120,7 @@ impl<K: CredentialKind> CredentialLease<K> {
             egress,
             lease_deadline_epoch_seconds,
             lease_monotonic_deadline_seconds,
+            Arc::new(SystemLeaseClocks),
         )
     }
 
@@ -100,6 +134,7 @@ impl<K: CredentialKind> CredentialLease<K> {
         egress: EgressScope,
         lease_deadline_epoch_seconds: u64,
         lease_monotonic_deadline_seconds: Option<u64>,
+        clock_source: Arc<dyn LeaseClockSource>,
     ) -> Result<Self> {
         ensure!(
             uuid::Uuid::parse_str(&epoch).is_ok_and(|value| value.to_string() == epoch),
@@ -120,9 +155,7 @@ impl<K: CredentialKind> CredentialLease<K> {
         // samples can only shrink the minted lifetime, never stretch it
         // past the deadline.
         let minted_at = Instant::now();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| anyhow!("credential_lease_clock_invalid"))?;
+        let now = clock_source.wall_now()?;
         let mut effective_duration =
             lease_duration.min(deadline_remaining(lease_deadline_epoch_seconds, now));
         // The same-host anchor: a monotonic deadline is enforced on the
@@ -135,7 +168,7 @@ impl<K: CredentialKind> CredentialLease<K> {
         // answer.
         effective_duration = match (
             lease_monotonic_deadline_seconds,
-            crate::handoff::monotonic_now(),
+            clock_source.monotonic_now(),
         ) {
             (Some(deadline), Some(now)) => {
                 effective_duration.min(deadline_remaining(deadline, now))
@@ -160,14 +193,16 @@ impl<K: CredentialKind> CredentialLease<K> {
             lease_monotonic_deadline_seconds,
             epoch,
             epoch_source,
+            clock_source,
             process_id,
             egress,
         })
     }
 
-    /// Test-only construction with an explicit process binding, expiry and
-    /// owner deadline so cross-PID replay, timeout and sub-second-deadline
-    /// paths are exercised deterministically instead of by sleeping.
+    /// Test-only construction with an explicit process binding, expiry,
+    /// owner deadline and clock pair so cross-PID replay, timeout,
+    /// sub-second-deadline, suspend and clock-failure paths are exercised
+    /// deterministically instead of by sleeping.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_binding_for_test(
@@ -180,6 +215,7 @@ impl<K: CredentialKind> CredentialLease<K> {
         expires_at: Instant,
         lease_deadline_epoch_seconds: u64,
         lease_monotonic_deadline_seconds: Option<u64>,
+        clock_source: Arc<dyn LeaseClockSource>,
     ) -> Result<Self> {
         let mut lease = Self::new_bound(
             credentials,
@@ -190,6 +226,7 @@ impl<K: CredentialKind> CredentialLease<K> {
             egress,
             lease_deadline_epoch_seconds,
             lease_monotonic_deadline_seconds,
+            clock_source,
         )?;
         lease.expires_at = expires_at;
         Ok(lease)
@@ -248,10 +285,8 @@ impl<K: CredentialKind> CredentialLease<K> {
         // only shrink the stamped deadlines. Adding a stale remainder to
         // a later monotonic reading would stamp a deadline past the
         // grant it projects whenever the preserved deadline is looser.
-        let projected_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| anyhow!("credential_lease_clock_invalid"))?;
-        let monotonic_now = crate::handoff::monotonic_now();
+        let projected_at = self.clock_source.wall_now()?;
+        let monotonic_now = self.clock_source.monotonic_now();
         let remaining = self.expires_at.saturating_duration_since(Instant::now());
         let mut credentials = BTreeMap::new();
         for (kind, keys) in &self.credentials {
@@ -308,6 +343,14 @@ impl<K: CredentialKind> CredentialLease<K> {
         handoff: CredentialHandoff<K>,
         epoch_source: Arc<dyn LeaseEpochSource>,
     ) -> Result<Self> {
+        Self::rebuild(handoff, epoch_source, Arc::new(SystemLeaseClocks))
+    }
+
+    fn rebuild(
+        handoff: CredentialHandoff<K>,
+        epoch_source: Arc<dyn LeaseEpochSource>,
+        clock_source: Arc<dyn LeaseClockSource>,
+    ) -> Result<Self> {
         let (
             credentials,
             lease_duration,
@@ -325,7 +368,20 @@ impl<K: CredentialKind> CredentialLease<K> {
             egress,
             lease_deadline_epoch_seconds,
             lease_monotonic_deadline_seconds,
+            clock_source,
         )
+    }
+
+    /// Test-only rebuild under an injected clock pair: the production mint
+    /// calculation runs against fixed samples instead of racing a live
+    /// second boundary.
+    #[cfg(test)]
+    pub(crate) fn from_handoff_with_clock_source(
+        handoff: CredentialHandoff<K>,
+        epoch_source: Arc<dyn LeaseEpochSource>,
+        clock_source: Arc<dyn LeaseClockSource>,
+    ) -> Result<Self> {
+        Self::rebuild(handoff, epoch_source, clock_source)
     }
 
     /// The egress scope this lease's material may leave through — the
@@ -359,10 +415,7 @@ impl<K: CredentialKind> CredentialLease<K> {
             .filter(|values| !values.is_empty())
             .ok_or_else(|| anyhow!("credential_lease_unavailable"))?;
         self.ensure_active()?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| anyhow!("credential_lease_clock_invalid"))?
-            .as_secs();
+        let now = self.clock_source.wall_now()?.as_secs();
         Ok(kind_credentials
             .iter()
             .filter(move |credential| !credential.is_expired(now)))
@@ -408,20 +461,33 @@ impl<K: CredentialKind> CredentialLease<K> {
         self.ensure_unexpired()
     }
 
-    /// The lease's two time bounds, each enforced in the clock domain it
-    /// was declared in. The `Instant` expiry is the mint-time conversion
-    /// of every limit; the wire-carried monotonic deadline is compared
-    /// against the shared clock itself on every use. Those clocks can
-    /// diverge — Darwin `CLOCK_MONOTONIC` advances across suspend while
-    /// the uptime clock `Instant` reads pauses — so the shared deadline
-    /// cannot be left to the `Instant` conversion alone: a lease rebuilt
-    /// before sleep must still refuse once its monotonic deadline passed
-    /// during sleep. A clock that cannot be read back refuses closed.
+    /// The lease's time bounds, each enforced in the clock domain it was
+    /// declared in. The `Instant` expiry is the mint-time conversion of
+    /// every limit; the owner-authorized wall deadline and the wire-carried
+    /// monotonic deadline are compared against their own clocks on every
+    /// use. Those clocks can diverge both ways — Darwin `CLOCK_MONOTONIC`
+    /// advances across suspend while the uptime clock `Instant` reads
+    /// pauses, and on Linux both runtime clocks pause across suspend while
+    /// the wall clock keeps running — so neither wire deadline can be left
+    /// to the `Instant` conversion alone: a lease minted before sleep must
+    /// still refuse once a deadline passed during sleep. A clock that
+    /// cannot be read back refuses closed under its own refusal code, not
+    /// as an elapsed grant.
     fn ensure_unexpired(&self) -> Result<()> {
         ensure!(Instant::now() < self.expires_at, "credential_lease_expired");
+        let wall_now = self.clock_source.wall_now()?;
+        ensure!(
+            wall_now < Duration::from_secs(self.lease_deadline_epoch_seconds),
+            "credential_lease_expired"
+        );
         if let Some(deadline) = self.lease_monotonic_deadline_seconds {
-            let now = crate::handoff::monotonic_now()
-                .ok_or_else(|| anyhow!("credential_lease_expired"))?;
+            // An unreadable shared clock is an operational failure, not an
+            // elapsed grant: refuse closed under the distinct clock code so
+            // `auth_failure_class` never routes it into credential renewal.
+            let now = self
+                .clock_source
+                .monotonic_now()
+                .ok_or_else(|| anyhow!("credential_lease_clock_unavailable"))?;
             ensure!(
                 now < Duration::from_secs(deadline),
                 "credential_lease_expired"

@@ -28,11 +28,14 @@ pub enum AddItemOutcome {
 ///
 /// `use_data_protection` selects which Keychain the query routes to:
 /// `None` follows the [`Keychain`](crate::Keychain)'s probed backend,
-/// while `Some` forces the routing outright. The emitted routing flag is
-/// always explicit — `true` on Data Protection, `false` on Classic — so
-/// no operation can drift onto a store it was not built for. Hosts that
-/// always target the Data Protection Keychain pass `Some(true)`; only
-/// the legacy migration path forces `Some(false)`.
+/// while `Some` forces the routing outright — except attributes only the
+/// Data Protection store can honor (`synchronizable`, `access_group`),
+/// which route there even when the flag is unset and refuse when the
+/// flag claims classic. The emitted routing flag is always explicit —
+/// `true` on Data Protection, `false` on Classic — so no operation can
+/// drift onto a store it was not built for. Hosts that always target
+/// the Data Protection Keychain pass `Some(true)`; only the legacy
+/// migration path forces `Some(false)`.
 #[derive(Clone, Debug)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct KeychainItemQuery<'a> {
@@ -64,6 +67,13 @@ impl<'a> KeychainItemQuery<'a> {
     }
 
     /// Scope the item to a Keychain access group.
+    ///
+    /// The platform honors `kSecAttrAccessGroup` only on the Data
+    /// Protection store — the classic path strips it — so an implicitly
+    /// routed grouped query always lands on Data Protection regardless
+    /// of the handle's probed backend, and explicit classic routing on a
+    /// grouped query refuses `credential_lease_keychain_routing_invalid`
+    /// before any SecItem call.
     pub fn with_access_group(mut self, access_group: &'a str) -> Self {
         self.access_group = Some(access_group);
         self
