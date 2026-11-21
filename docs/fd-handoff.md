@@ -177,8 +177,10 @@ refusals print `refused <code>` and exit `2`.
 every vector and requires identical verdicts — on the channel refusal cases
 too: an absent or malformed variable, a standard-stream number, a closed
 descriptor, and a write-capable channel all answer the same refusal in every
-language. It skips a language whose toolchain is absent rather than
-pretending it ran.
+language. The socket cases go further: a socket end is refused without the
+check ever writing to it, and the peer end is observed to prove the refusal
+delivered nothing. It skips a language whose toolchain is absent rather
+than pretending it ran.
 
 ## Portability
 

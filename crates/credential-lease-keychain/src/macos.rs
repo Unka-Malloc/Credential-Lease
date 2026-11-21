@@ -336,8 +336,11 @@ impl Keychain {
     /// this backend's access control takes a value-only update on the
     /// pinned record; one under any other protection is replaced through
     /// `replace_item`'s recoverable tombstone swap — the only
-    /// way protection changes; an absent item is added directly. A
-    /// duplicate that appears between the check and the add re-runs the
+    /// way protection changes; an absent item is added directly. Before
+    /// any of that, `recover_replace_tombstone` completes or repairs
+    /// whatever an earlier swap left behind, so an interrupted or failed
+    /// replacement can never strand the record it parked. A duplicate
+    /// that appears between the check and the add re-runs the
     /// verification once before the last write, and every completed write
     /// re-reads the pinned record's attributes to prove the required
     /// protection landed.
@@ -361,16 +364,42 @@ impl Keychain {
         let query_pairs = base_pairs(query, context, self.backend)?;
         let mut retry_on_duplicate = true;
         loop {
-            let matched =
-                match with_keychain_backend(store, || find_matching_item(&query_pairs, store))? {
-                    ItemMatch::Absent => None,
-                    ItemMatch::Ambiguous => return Err(item_ambiguous()),
-                    ItemMatch::One(item) => Some(item),
-                };
+            let mut matched = match with_keychain_backend(store, || {
+                find_matching_item(&query_pairs, store, query.synchronizable != Some(true))
+            })? {
+                ItemMatch::Absent => None,
+                ItemMatch::Ambiguous => return Err(item_ambiguous()),
+                ItemMatch::One(item) => Some(item),
+            };
+            match recover_replace_tombstone(context, query, matched, store)? {
+                TombstoneRecovery::Proceed(resolved) => matched = resolved,
+                // A record that is not this swap's claimed the identity
+                // while the original is parked — a racing writer, handled
+                // like a racing writer at the add.
+                TombstoneRecovery::Duplicate if retry_on_duplicate => {
+                    retry_on_duplicate = false;
+                    continue;
+                }
+                TombstoneRecovery::Duplicate => {
+                    return status_result("write", errSecDuplicateItem);
+                }
+            }
+            // A record the platform cannot pin — a synchronizable item —
+            // can never carry the required access control, so the write
+            // refuses rather than mutating it unpinned.
+            if let Some(item) = matched.as_ref() {
+                if item.reference.is_none() {
+                    return Err(synchronizable_write_invalid());
+                }
+            }
             match protection_action(matched.as_ref().map(|item| item.protected)) {
                 ProtectionAction::UpdateValue => {
                     let item = matched.as_ref().expect("a protected match exists");
-                    let pinned = pinned_pairs(&item.reference, context, store);
+                    let pinned = pinned_pairs(
+                        item.reference.as_ref().expect("a pinnable match"),
+                        context,
+                        store,
+                    );
                     let pinned_dict = CFDictionary::from_CFType_pairs(&pinned);
                     let update = CFDictionary::from_CFType_pairs(&secret_value_pairs(
                         secret.expose_bytes(),
@@ -459,18 +488,32 @@ impl Keychain {
     /// `SecItemUpdate` can never change.
     ///
     /// The selected record is never destroyed outright: it is first
-    /// renamed aside to a unique tombstone account through an update
-    /// pinned to its persistent reference — a mutation that leaves the
-    /// record, its access group, and its access control intact — and only
-    /// then is the protected item added under the original identity. A
-    /// failed rename refuses the write with the record untouched. A failed
-    /// add restores the original name before the refusal is reported, so
-    /// the existing credential is intact on every failure path. The
-    /// tombstoned record is deleted — pinned, so no other record the
-    /// identity matches can be taken with it — only after the new item
-    /// exists, and the write still reports its failure if the tombstone
-    /// cannot be removed. The replacement add preserves the record's
-    /// access group when the query declared none.
+    /// renamed aside to the deterministic tombstone account
+    /// [`replace_tombstone_account`] derives — a mutation pinned to the
+    /// record's persistent reference that leaves the record, its access
+    /// group, and its access control intact — and only then is the
+    /// protected item added under the original identity. The name is
+    /// deterministic so an interrupted swap's leftover is always
+    /// discoverable: [`recover_replace_tombstone`] finds it on the next
+    /// call and restores it or completes the cleanup. A failed rename
+    /// refuses the write with the record untouched — a claimed tombstone
+    /// name is a racing writer, handled like the add's duplicate. A
+    /// failed add renames the record back before the refusal is reported,
+    /// and a failed restore is itself reported: the original stays
+    /// parked under the tombstone name the next call's recovery finds,
+    /// never erased.
+    ///
+    /// The added record's protection is verified *before* the tombstoned
+    /// original is removed: a failed proof removes the record the add
+    /// placed and restores the original to its identity, so the write
+    /// never reports an unproven record as written and never destroys the
+    /// existing credential first. Only after the proof lands is the
+    /// tombstone deleted — pinned, so no other record the identity
+    /// matches can be taken with it — and the write still reports its
+    /// failure if the tombstone cannot be removed, a leftover the next
+    /// call's recovery cleans against the verified identity. The
+    /// replacement add preserves the record's access group when the
+    /// query declared none.
     fn replace_item(
         &self,
         context: &KeychainAuthContext,
@@ -497,9 +540,10 @@ impl Keychain {
             CFBoolean::from(true).into_CFType(),
         ));
         let add_query = CFDictionary::from_CFType_pairs(&add_pairs);
-        let pinned = pinned_pairs(&item.reference, context, store);
+        let reference = item.reference.as_ref().expect("a pinnable match");
+        let pinned = pinned_pairs(reference, context, store);
         let pinned_dict = CFDictionary::from_CFType_pairs(&pinned);
-        let tombstone = format!("credential-lease.replace.{}", Uuid::new_v4());
+        let tombstone = replace_tombstone_account(query.account);
         let rename = CFDictionary::from_CFType_pairs(&[(
             security_framework_static!(kSecAttrAccount, sec_key),
             CFString::from(tombstone.as_str()).into_CFType(),
@@ -512,6 +556,12 @@ impl Keychain {
                 rename.as_concrete_TypeRef(),
             )
         })?;
+        if rename_status == errSecDuplicateItem {
+            // The tombstone name was claimed between the recovery pass
+            // and the rename — a racing writer, handled like a racing
+            // writer at the add.
+            return Ok(ReplaceTransition::Duplicate);
+        }
         if rename_status != errSecSuccess {
             return status_result("write", rename_status).map(|_| ReplaceTransition::Done);
         }
@@ -520,21 +570,26 @@ impl Keychain {
         let add_status = keychain_effect(store, || unsafe {
             SecItemAdd(add_query.as_concrete_TypeRef(), &mut added_reference)
         })?;
+        // The restore payload puts the parked record back under its
+        // original identity — still pinned to the same persistent
+        // reference — on every path that cannot keep the swap.
+        let restore = CFDictionary::from_CFType_pairs(&[(
+            security_framework_static!(kSecAttrAccount, sec_key),
+            CFString::from(query.account).into_CFType(),
+        )]);
         if add_status != errSecSuccess {
-            // Restore the record's original identity — still pinned to the
-            // same persistent reference — before the add's refusal is
-            // reported. A restore failure is not reported separately: the
-            // record still exists under its tombstone name, never erased.
-            let restore = CFDictionary::from_CFType_pairs(&[(
-                security_framework_static!(kSecAttrAccount, sec_key),
-                CFString::from(query.account).into_CFType(),
-            )]);
-            let _ = keychain_effect(store, || unsafe {
+            // The restore is itself reported: when it fails the original
+            // stays parked under the deterministic tombstone name the
+            // next call's recovery finds, never erased.
+            let restore_status = keychain_effect(store, || unsafe {
                 SecItemUpdate(
                     pinned_dict.as_concrete_TypeRef(),
                     restore.as_concrete_TypeRef(),
                 )
-            });
+            })?;
+            if restore_status != errSecSuccess {
+                return status_result("write", restore_status).map(|_| ReplaceTransition::Done);
+            }
             if add_status == errSecDuplicateItem {
                 // A racing writer claimed the identity between the rename
                 // and the add: the caller re-runs the protection check on
@@ -543,6 +598,30 @@ impl Keychain {
             }
             return status_result("write", add_status).map(|_| ReplaceTransition::Done);
         }
+        let added = pinned_result_reference(added_reference, context, store)?;
+        if let Err(verify) = ensure_write_protected(&added, store) {
+            // The new record's protection cannot be proven: the record
+            // the add placed is removed and the original returns to its
+            // identity — the original is never destroyed before its
+            // replacement is verified, and a failed cleanup leaves the
+            // deterministic tombstone for the next call's recovery.
+            let added_dict = CFDictionary::from_CFType_pairs(&added);
+            // SAFETY: added_dict and pinned_dict own their CF values for
+            // the synchronous calls.
+            let _ = keychain_effect(store, || unsafe {
+                SecItemDelete(added_dict.as_concrete_TypeRef())
+            });
+            let restore_status = keychain_effect(store, || unsafe {
+                SecItemUpdate(
+                    pinned_dict.as_concrete_TypeRef(),
+                    restore.as_concrete_TypeRef(),
+                )
+            })?;
+            if restore_status != errSecSuccess {
+                return status_result("write", restore_status).map(|_| ReplaceTransition::Done);
+            }
+            return Err(verify);
+        }
         // SAFETY: pinned_dict owns its CF values for the synchronous call.
         let delete_status = keychain_effect(store, || unsafe {
             SecItemDelete(pinned_dict.as_concrete_TypeRef())
@@ -550,10 +629,6 @@ impl Keychain {
         if delete_status != errSecSuccess && delete_status != errSecItemNotFound {
             return status_result("delete", delete_status).map(|_| ReplaceTransition::Done);
         }
-        ensure_write_protected(
-            &pinned_result_reference(added_reference, context, store)?,
-            store,
-        )?;
         Ok(ReplaceTransition::Done)
     }
 
@@ -627,6 +702,13 @@ impl Keychain {
     /// access groups, and `SecItemDelete` removes every match. More than
     /// one match refuses `credential_lease_keychain_item_ambiguous`
     /// instead of deleting records the lookup did not select.
+    ///
+    /// A record the platform cannot name — a synchronizable item, which
+    /// Apple documents as served through attribute- and data-only queries
+    /// — takes the attribute-scoped path `attribute_scoped_delete_pairs`
+    /// builds: the unique match the enumeration verified is narrowed by
+    /// the record's own access group and synchronizable flag, and that
+    /// scoped query carries the delete.
     pub fn delete_item(
         &self,
         context: &KeychainAuthContext,
@@ -634,16 +716,21 @@ impl Keychain {
     ) -> Result<(), KeychainError> {
         let store = effective_store(query, self.backend)?;
         let query_pairs = base_pairs(query, context, self.backend)?;
-        let item = match with_keychain_backend(store, || find_matching_item(&query_pairs, store))? {
+        let item = match with_keychain_backend(store, || {
+            find_matching_item(&query_pairs, store, query.synchronizable != Some(true))
+        })? {
             ItemMatch::Absent => return Ok(()),
             ItemMatch::Ambiguous => return Err(item_ambiguous()),
             ItemMatch::One(item) => item,
         };
-        let pinned_dict =
-            CFDictionary::from_CFType_pairs(&pinned_pairs(&item.reference, context, store));
-        // SAFETY: pinned_dict owns valid CF values for the synchronous call.
+        let delete_pairs = match item.reference.as_ref() {
+            Some(reference) => pinned_pairs(reference, context, store),
+            None => attribute_scoped_delete_pairs(query, &query_pairs, &item),
+        };
+        let delete_dict = CFDictionary::from_CFType_pairs(&delete_pairs);
+        // SAFETY: delete_dict owns valid CF values for the synchronous call.
         let status = keychain_effect(store, || unsafe {
-            SecItemDelete(pinned_dict.as_concrete_TypeRef())
+            SecItemDelete(delete_dict.as_concrete_TypeRef())
         })?;
         if status == errSecItemNotFound {
             Ok(())
@@ -766,6 +853,18 @@ fn routing_invalid() -> KeychainError {
     )
 }
 
+/// The refusal a write issues for an item the platform can never give
+/// the required protection: a synchronizable item, which Security.framework
+/// serves only as attributes and data — no persistent reference to pin a
+/// mutation to and no `SecAccessControl` an add could attach.
+fn synchronizable_write_invalid() -> KeychainError {
+    KeychainError::new(
+        "credential_lease_keychain_synchronizable_write_invalid",
+        KeychainErrorKind::Failed,
+        None,
+    )
+}
+
 /// Synchronizable items are readable and deletable through this backend
 /// but never writable: Security.framework refuses a `SecAccessControl`
 /// on a synchronizable item (`errSecParam`), and dropping the control to
@@ -782,11 +881,7 @@ fn ensure_write_supported(
     store: KeychainBackend,
 ) -> Result<(), KeychainError> {
     if query.synchronizable == Some(true) {
-        return Err(KeychainError::new(
-            "credential_lease_keychain_synchronizable_write_invalid",
-            KeychainErrorKind::Failed,
-            None,
-        ));
+        return Err(synchronizable_write_invalid());
     }
     if store == KeychainBackend::Classic {
         return Err(KeychainError::new(
@@ -1296,12 +1391,15 @@ enum ItemMatch {
 }
 
 /// The one record the lookup selected: the persistent reference every
-/// mutation and verification is pinned to, the record's verified
-/// protection, and the access group a replacement must keep it in.
+/// pinned mutation and verification addresses — `None` only for a record
+/// the platform cannot name, a synchronizable item — the record's
+/// verified protection, and the access group and synchronizable flag an
+/// attribute-scoped operation preserves.
 struct MatchedItem {
-    reference: CFData,
+    reference: Option<CFData>,
     protected: bool,
     access_group: Option<String>,
+    synchronizable: Option<bool>,
 }
 
 /// The outcome of a tombstone-swap replacement: completed, or the
@@ -1323,28 +1421,45 @@ fn item_ambiguous() -> KeychainError {
     )
 }
 
-/// Enumerate every record the query addresses. The attribute query rides
-/// the caller's `query_pairs` — the same pinned store the write targets
-/// — and asks for each record's attributes and persistent reference,
-/// never value data. A lone match may arrive unboxed as a bare attribute
-/// dictionary rather than a one-element array; both shapes are accepted.
-fn find_matching_item(
+/// The enumeration query [`find_matching_item`] issues: every record's
+/// attributes over every match, never value data. The persistent
+/// reference is requested only where the caller's query can address a
+/// record the platform can name — a synchronizable-scoped query omits
+/// it, since the platform serves those records as attributes and data
+/// alone.
+fn enumeration_pairs(
     query_pairs: &[(CFString, CFType)],
-    store: KeychainBackend,
-) -> Result<ItemMatch, KeychainError> {
+    request_reference: bool,
+) -> Vec<(CFString, CFType)> {
     let mut pairs = query_pairs.to_vec();
     pairs.push((
         security_framework_static!(kSecReturnAttributes, sec_key),
         CFBoolean::from(true).into_CFType(),
     ));
-    pairs.push((
-        security_framework_static!(kSecReturnPersistentRef, sec_key),
-        CFBoolean::from(true).into_CFType(),
-    ));
+    if request_reference {
+        pairs.push((
+            security_framework_static!(kSecReturnPersistentRef, sec_key),
+            CFBoolean::from(true).into_CFType(),
+        ));
+    }
     pairs.push((
         security_framework_static!(kSecMatchLimit, sec_key),
         security_framework_static!(kSecMatchLimitAll, sec_string_value),
     ));
+    pairs
+}
+
+/// Enumerate every record the query addresses. The attribute query rides
+/// the caller's `query_pairs` — the same pinned store the operation
+/// targets — through [`enumeration_pairs`]. A lone match may arrive
+/// unboxed as a bare attribute dictionary rather than a one-element
+/// array; both shapes are accepted.
+fn find_matching_item(
+    query_pairs: &[(CFString, CFType)],
+    store: KeychainBackend,
+    request_reference: bool,
+) -> Result<ItemMatch, KeychainError> {
+    let pairs = enumeration_pairs(query_pairs, request_reference);
     let Some(value) = copy_matching(&pairs, store)? else {
         return Ok(ItemMatch::Absent);
     };
@@ -1365,21 +1480,253 @@ fn find_matching_item(
 }
 
 /// The one matched record projected for mutation decisions: its pinned
-/// reference, its proven protection, and the access group a replacement
-/// preserves. A record the platform cannot name with a persistent
-/// reference — a synchronizable item, which is served only as attributes
-/// and data — cannot have a mutation pinned to it, so it is refused
-/// rather than mutated unscoped.
+/// reference where the platform can name one, its proven protection, and
+/// the access group and synchronizable flag an attribute-scoped
+/// operation preserves. A synchronizable record arrives without a
+/// persistent reference — the platform serves it only as attributes and
+/// data — so the projection keeps `None` and the caller decides which
+/// operations may address it.
 fn matched_item(value: &CFType) -> Result<ItemMatch, KeychainError> {
     let attributes = value.downcast::<CFDictionary>().ok_or_else(data_invalid)?;
-    let reference =
-        dictionary_data(&attributes, unsafe { kSecValuePersistentRef }).ok_or_else(data_invalid)?;
+    let reference = dictionary_data(&attributes, unsafe { kSecValuePersistentRef });
     let provenance = item_provenance(&attributes)?;
     Ok(ItemMatch::One(MatchedItem {
         reference,
         protected: provenance.has_backend_access_control(),
         access_group: provenance.access_group().map(str::to_owned),
+        synchronizable: provenance.synchronizable(),
     }))
+}
+
+/// The delete query for a record the platform cannot name with a
+/// persistent reference — a synchronizable item. The unique match the
+/// enumeration already verified is narrowed by the record's own
+/// attributes: its access group and synchronizable flag ride the
+/// caller's query pairs when the query did not declare them, so the
+/// scoped query still names exactly that record. Everything else —
+/// service, account, authorization context, the pinned store — is the
+/// same query the enumeration ran.
+fn attribute_scoped_delete_pairs(
+    query: &KeychainItemQuery<'_>,
+    query_pairs: &[(CFString, CFType)],
+    item: &MatchedItem,
+) -> Vec<(CFString, CFType)> {
+    let mut pairs = query_pairs.to_vec();
+    if query.access_group.is_none() {
+        if let Some(group) = item.access_group.as_deref() {
+            pairs.push((
+                security_framework_static!(kSecAttrAccessGroup, sec_key),
+                CFString::from(group).into_CFType(),
+            ));
+        }
+    }
+    if query.synchronizable.is_none() {
+        if let Some(synchronizable) = item.synchronizable {
+            pairs.push((
+                security_framework_static!(kSecAttrSynchronizable, sec_key),
+                CFBoolean::from(synchronizable).into_CFType(),
+            ));
+        }
+    }
+    pairs
+}
+
+/// The account a replacement parks the original record under while the
+/// swap runs: deterministic, so an interrupted swap's leftover is always
+/// discoverable by the next call's recovery pass — a random name would
+/// be lost with the process that chose it.
+fn replace_tombstone_account(account: &str) -> String {
+    format!("credential-lease.replace.tombstone.{account}")
+}
+
+/// The enumeration query for a swap leftover: the deterministic
+/// tombstone account under the caller's service, scoped to the record's
+/// access group when one is known — the query's declared group or the
+/// matched record's — never synchronizable, because a swap only ever
+/// parks a pinnable record, and carrying the caller's authorization
+/// context and pinned store.
+fn replace_tombstone_pairs(
+    query: &KeychainItemQuery<'_>,
+    tombstone: &str,
+    matched_access_group: Option<&str>,
+    context: &KeychainAuthContext,
+    store: KeychainBackend,
+) -> Vec<(CFString, CFType)> {
+    let mut pairs = vec![
+        (
+            security_framework_static!(kSecClass, sec_key),
+            security_framework_static!(kSecClassGenericPassword, sec_string_value),
+        ),
+        (
+            security_framework_static!(kSecAttrService, sec_key),
+            CFString::from(query.service).into_CFType(),
+        ),
+        (
+            security_framework_static!(kSecAttrAccount, sec_key),
+            CFString::from(tombstone).into_CFType(),
+        ),
+    ];
+    if let Some(group) = query.access_group.or(matched_access_group) {
+        pairs.push((
+            security_framework_static!(kSecAttrAccessGroup, sec_key),
+            CFString::from(group).into_CFType(),
+        ));
+    }
+    pairs.push((
+        security_framework_static!(kSecAttrSynchronizable, sec_key),
+        CFBoolean::from(false).into_CFType(),
+    ));
+    pairs.push((
+        security_framework_static!(kSecUseAuthenticationContext, sec_key),
+        context.as_cf_type(),
+    ));
+    if store == KeychainBackend::DataProtection {
+        pairs.push((
+            security_framework_static!(kSecUseAuthenticationUI, sec_key),
+            security_framework_static!(kSecUseAuthenticationUIFail, sec_string_value),
+        ));
+    }
+    pairs.push(data_protection_routing(store));
+    pairs
+}
+
+/// What the state a previous swap left behind tells the write to do.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TombstoneAction {
+    /// No usable leftover: dispatch on the caller's match unchanged.
+    Proceed,
+    /// The original is parked and the identity is free: rename the
+    /// tombstone back to the identity — the restore direction, never
+    /// away from it — and dispatch on it as the selected record.
+    Restore,
+    /// The swap's verified add landed and a protected record holds the
+    /// identity: only the parked original's pinned deletion remains.
+    Cleanup,
+    /// An unprotected record holds the identity while the original is
+    /// parked: a racing writer claimed it mid-swap — the same verdict
+    /// the add's duplicate carries.
+    Duplicate,
+}
+
+/// The verdict a found swap leftover yields, before any SecItem mutation
+/// runs. Only an unprotected, pinnable record can be a swap leftover —
+/// the swap parks exactly the unprotected original — so a protected or
+/// unnameable record at the tombstone name is foreign and is refused
+/// rather than touched.
+fn tombstone_action(
+    tombstone: &ItemMatch,
+    matched: Option<&MatchedItem>,
+) -> Result<TombstoneAction, KeychainError> {
+    let tombstone = match tombstone {
+        ItemMatch::Absent => return Ok(TombstoneAction::Proceed),
+        ItemMatch::Ambiguous => return Err(item_ambiguous()),
+        ItemMatch::One(tombstone) => tombstone,
+    };
+    if tombstone.protected || tombstone.reference.is_none() {
+        return Err(data_invalid());
+    }
+    Ok(match matched {
+        None => TombstoneAction::Restore,
+        Some(item) if item.protected => TombstoneAction::Cleanup,
+        Some(_) => TombstoneAction::Duplicate,
+    })
+}
+
+/// What the recovery pass hands back to the write.
+enum TombstoneRecovery {
+    /// Dispatch on this match: the caller's match unchanged, the
+    /// restored original, or the caller's match after a completed swap's
+    /// leftover was cleaned.
+    Proceed(Option<MatchedItem>),
+    /// A record that is not this swap's holds the identity while the
+    /// original is parked — the same verdict a racing writer gets.
+    Duplicate,
+}
+
+/// Recover the state an interrupted or failed replacement left behind.
+/// The tombstone account is deterministic, so the leftover is always
+/// findable: a parked original under a free identity is renamed back
+/// before the swap re-runs, a leftover beside a verified identity is
+/// deleted pinned, and an unprotected record holding the identity while
+/// the original is parked is a racing writer's verdict. A record at the
+/// tombstone name that cannot be a swap leftover — protected, or
+/// unnameable — is foreign and refuses untouched.
+fn recover_replace_tombstone(
+    context: &KeychainAuthContext,
+    query: &KeychainItemQuery<'_>,
+    matched: Option<MatchedItem>,
+    store: KeychainBackend,
+) -> Result<TombstoneRecovery, KeychainError> {
+    let tombstone = replace_tombstone_account(query.account);
+    let lookup = replace_tombstone_pairs(
+        query,
+        tombstone.as_str(),
+        matched
+            .as_ref()
+            .and_then(|item| item.access_group.as_deref()),
+        context,
+        store,
+    );
+    let tombstone_match = find_matching_item(&lookup, store, true)?;
+    match tombstone_action(&tombstone_match, matched.as_ref())? {
+        TombstoneAction::Proceed => Ok(TombstoneRecovery::Proceed(matched)),
+        TombstoneAction::Restore => {
+            let ItemMatch::One(tombstone) = tombstone_match else {
+                unreachable!("a restore verdict requires a tombstone match")
+            };
+            // Rename the parked original back to its identity — pinned,
+            // so no other record is touched — and let the write's normal
+            // dispatch replace it through a fresh swap. A failed restore
+            // leaves the tombstone for the next call's pass.
+            let pinned = pinned_pairs(
+                tombstone.reference.as_ref().expect("a pinnable tombstone"),
+                context,
+                store,
+            );
+            let pinned_dict = CFDictionary::from_CFType_pairs(&pinned);
+            let restore = CFDictionary::from_CFType_pairs(&[(
+                security_framework_static!(kSecAttrAccount, sec_key),
+                CFString::from(query.account).into_CFType(),
+            )]);
+            // SAFETY: pinned_dict and restore own their CF values for the
+            // synchronous call.
+            let restore_status = keychain_effect(store, || unsafe {
+                SecItemUpdate(
+                    pinned_dict.as_concrete_TypeRef(),
+                    restore.as_concrete_TypeRef(),
+                )
+            })?;
+            if restore_status != errSecSuccess {
+                return status_result("write", restore_status)
+                    .map(|_| TombstoneRecovery::Proceed(None));
+            }
+            Ok(TombstoneRecovery::Proceed(Some(tombstone)))
+        }
+        TombstoneAction::Cleanup => {
+            let ItemMatch::One(tombstone) = tombstone_match else {
+                unreachable!("a cleanup verdict requires a tombstone match")
+            };
+            // The swap's add landed and the identity holds a verified
+            // record: only the parked original's pinned deletion remains.
+            let pinned = pinned_pairs(
+                tombstone.reference.as_ref().expect("a pinnable tombstone"),
+                context,
+                store,
+            );
+            let pinned_dict = CFDictionary::from_CFType_pairs(&pinned);
+            // SAFETY: pinned_dict owns its CF values for the synchronous
+            // call.
+            let delete_status = keychain_effect(store, || unsafe {
+                SecItemDelete(pinned_dict.as_concrete_TypeRef())
+            })?;
+            if delete_status != errSecSuccess && delete_status != errSecItemNotFound {
+                return status_result("delete", delete_status)
+                    .map(|_| TombstoneRecovery::Proceed(None));
+            }
+            Ok(TombstoneRecovery::Proceed(matched))
+        }
+        TombstoneAction::Duplicate => Ok(TombstoneRecovery::Duplicate),
+    }
 }
 
 /// A mutation or verification query pinned to one record's persistent
@@ -2227,6 +2574,246 @@ mod tests {
                 .map(|value| value.to_string())
                 .as_deref(),
             Some("synthetic-service")
+        );
+    }
+
+    #[test]
+    fn the_enumeration_requests_a_reference_only_where_the_store_serves_it() {
+        // Apple documents attributes and data as the supported return
+        // types for synchronizable items: a synchronizable-scoped
+        // enumeration omits the persistent-reference request, while every
+        // query that can address a pinnable record keeps it.
+        let context = synthetic_context();
+        let query = KeychainItemQuery::new("synthetic-service", "synthetic-account").unwrap();
+        let query_pairs = base_pairs(&query, &context, KeychainBackend::DataProtection).unwrap();
+        for (request, expected) in [(true, Some(true)), (false, None)] {
+            let dict = CFDictionary::from_CFType_pairs(&enumeration_pairs(&query_pairs, request));
+            assert_eq!(
+                dict_value(&dict, unsafe { kSecReturnPersistentRef })
+                    .map(|value| value.as_CFTypeRef()),
+                expected.map(|flag| CFBoolean::from(flag).as_CFTypeRef())
+            );
+            assert_eq!(
+                dict_value(&dict, unsafe { kSecReturnAttributes })
+                    .map(|value| value.as_CFTypeRef()),
+                Some(CFBoolean::from(true).as_CFTypeRef())
+            );
+            assert_eq!(
+                dict_value(&dict, unsafe { kSecMatchLimit }).map(|value| value.as_CFTypeRef()),
+                Some(
+                    security_framework_static!(kSecMatchLimitAll, sec_string_value).as_CFTypeRef()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn a_synchronizable_delete_scopes_the_attribute_path_to_the_record() {
+        // The platform cannot name a synchronizable record with a
+        // persistent reference, so the delete narrows the caller's query
+        // by the record's own attributes instead: its access group and
+        // synchronizable flag when the query declared neither. No
+        // persistent reference ever travels in the scoped query.
+        let context = synthetic_context();
+        let item = MatchedItem {
+            reference: None,
+            protected: false,
+            access_group: Some("record-group".to_owned()),
+            synchronizable: Some(true),
+        };
+        let query = KeychainItemQuery::new("synthetic-service", "synthetic-account")
+            .unwrap()
+            .with_synchronizable(true);
+        let query_pairs = base_pairs(&query, &context, KeychainBackend::DataProtection).unwrap();
+        let dict = CFDictionary::from_CFType_pairs(&attribute_scoped_delete_pairs(
+            &query,
+            &query_pairs,
+            &item,
+        ));
+        assert!(dict_value(&dict, unsafe { kSecValuePersistentRef }).is_none());
+        assert_eq!(
+            dict_value(&dict, unsafe { kSecAttrAccessGroup })
+                .and_then(|value| value.downcast::<CFString>())
+                .map(|value| value.to_string())
+                .as_deref(),
+            Some("record-group")
+        );
+        assert_eq!(
+            dict_value(&dict, unsafe { kSecAttrSynchronizable }).map(|value| value.as_CFTypeRef()),
+            Some(CFBoolean::from(true).as_CFTypeRef())
+        );
+        // A query that declares the attributes keeps its own scope: the
+        // record's group is never substituted for the declared one.
+        let declared = KeychainItemQuery::new("synthetic-service", "synthetic-account")
+            .unwrap()
+            .with_access_group("declared-group")
+            .with_synchronizable(true);
+        let query_pairs = base_pairs(&declared, &context, KeychainBackend::DataProtection).unwrap();
+        let dict = CFDictionary::from_CFType_pairs(&attribute_scoped_delete_pairs(
+            &declared,
+            &query_pairs,
+            &item,
+        ));
+        assert_eq!(
+            dict_value(&dict, unsafe { kSecAttrAccessGroup })
+                .and_then(|value| value.downcast::<CFString>())
+                .map(|value| value.to_string())
+                .as_deref(),
+            Some("declared-group")
+        );
+    }
+
+    #[test]
+    fn an_unpinnable_record_refuses_the_write_path() {
+        // A matched record without a persistent reference — a
+        // synchronizable item — can never carry the required access
+        // control, so the write refuses it before any pinned mutation.
+        let unpinnable = MatchedItem {
+            reference: None,
+            protected: false,
+            access_group: None,
+            synchronizable: Some(true),
+        };
+        assert!(unpinnable.reference.is_none());
+        assert_eq!(
+            synchronizable_write_invalid().code(),
+            "credential_lease_keychain_synchronizable_write_invalid"
+        );
+    }
+
+    #[test]
+    fn the_tombstone_name_is_deterministic_and_the_lookup_scoped() {
+        // The tombstone account derives only from the parked record's
+        // account: the same input always names the same leftover, on any
+        // later call or process, and it can never collide with the
+        // account itself.
+        let name = replace_tombstone_account("synthetic-account");
+        assert_eq!(name, "credential-lease.replace.tombstone.synthetic-account");
+        assert_eq!(name, replace_tombstone_account("synthetic-account"));
+        assert_ne!(name, "synthetic-account");
+        let context = synthetic_context();
+        let query = KeychainItemQuery::new("synthetic-service", "synthetic-account").unwrap();
+        // With no declared access group the lookup follows the matched
+        // record's group; a declared group wins. The tombstone is never
+        // synchronizable — the swap only parks a pinnable record.
+        for (query, expected_group) in [
+            (query.clone(), Some("matched-group")),
+            (
+                query.clone().with_access_group("declared-group"),
+                Some("declared-group"),
+            ),
+        ] {
+            let dict = CFDictionary::from_CFType_pairs(&replace_tombstone_pairs(
+                &query,
+                name.as_str(),
+                Some("matched-group"),
+                &context,
+                KeychainBackend::DataProtection,
+            ));
+            assert_eq!(
+                dict_value(&dict, unsafe { kSecAttrAccount })
+                    .and_then(|value| value.downcast::<CFString>())
+                    .map(|value| value.to_string())
+                    .as_deref(),
+                Some(name.as_str())
+            );
+            assert_eq!(
+                dict_value(&dict, unsafe { kSecAttrAccessGroup })
+                    .and_then(|value| value.downcast::<CFString>())
+                    .map(|value| value.to_string())
+                    .as_deref(),
+                expected_group
+            );
+            assert_eq!(
+                dict_value(&dict, unsafe { kSecAttrSynchronizable })
+                    .map(|value| value.as_CFTypeRef()),
+                Some(CFBoolean::from(false).as_CFTypeRef())
+            );
+        }
+    }
+
+    #[test]
+    fn tombstone_recovery_decides_from_the_state_the_interruption_left() {
+        let tombstone = || {
+            ItemMatch::One(MatchedItem {
+                reference: Some(CFData::from_buffer(&[0xB0u8; 16])),
+                protected: false,
+                access_group: Some("matched-group".to_owned()),
+                synchronizable: Some(false),
+            })
+        };
+        let protected_match = || {
+            Some(MatchedItem {
+                reference: Some(CFData::from_buffer(&[0xC1u8; 16])),
+                protected: true,
+                access_group: None,
+                synchronizable: Some(false),
+            })
+        };
+        let unprotected_match = || {
+            Some(MatchedItem {
+                reference: Some(CFData::from_buffer(&[0xD2u8; 16])),
+                protected: false,
+                access_group: None,
+                synchronizable: Some(false),
+            })
+        };
+        // No leftover: the write dispatches on its own match.
+        assert_eq!(
+            tombstone_action(&ItemMatch::Absent, unprotected_match().as_ref()).unwrap(),
+            TombstoneAction::Proceed
+        );
+        // An ambiguous leftover refuses before any mutation.
+        assert_eq!(
+            tombstone_action(&ItemMatch::Ambiguous, unprotected_match().as_ref())
+                .unwrap_err()
+                .code(),
+            "credential_lease_keychain_item_ambiguous"
+        );
+        // The identity is free: the parked original is restored.
+        assert_eq!(
+            tombstone_action(&tombstone(), None).unwrap(),
+            TombstoneAction::Restore
+        );
+        // The swap's verified add landed: only the leftover's pinned
+        // deletion remains.
+        assert_eq!(
+            tombstone_action(&tombstone(), protected_match().as_ref()).unwrap(),
+            TombstoneAction::Cleanup
+        );
+        // An unprotected record holds the identity: a racing writer.
+        assert_eq!(
+            tombstone_action(&tombstone(), unprotected_match().as_ref()).unwrap(),
+            TombstoneAction::Duplicate
+        );
+        // A protected or unnameable record at the tombstone name is not a
+        // swap leftover — the swap only parks unprotected pinnable
+        // records — so it is foreign and refused untouched.
+        let protected_tombstone = ItemMatch::One(MatchedItem {
+            reference: Some(CFData::from_buffer(&[0xE3u8; 16])),
+            protected: true,
+            access_group: None,
+            synchronizable: Some(false),
+        });
+        for matched in [None, unprotected_match(), protected_match()] {
+            assert_eq!(
+                tombstone_action(&protected_tombstone, matched.as_ref())
+                    .unwrap_err()
+                    .code(),
+                "credential_lease_keychain_data_invalid"
+            );
+        }
+        let unnameable_tombstone = ItemMatch::One(MatchedItem {
+            reference: None,
+            protected: false,
+            access_group: None,
+            synchronizable: Some(true),
+        });
+        assert_eq!(
+            tombstone_action(&unnameable_tombstone, None)
+                .unwrap_err()
+                .code(),
+            "credential_lease_keychain_data_invalid"
         );
     }
 

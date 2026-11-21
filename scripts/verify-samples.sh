@@ -224,6 +224,87 @@ check_writable_channel_all() {
   fi
 }
 
+python3_available=0
+command -v python3 >/dev/null 2>&1 && python3_available=1
+
+check_socket_channel() {
+  # language, socket type ("STREAM" or "DGRAM"), expected status,
+  # expected output, command...
+  # A socket is write-capable by construction — refused before the first
+  # read — and the refusal must never touch the channel: the peer end
+  # proves nothing arrived. A datagram pair makes a stray write
+  # observable, since even an empty write would arrive as a datagram.
+  local language="$1"
+  local socktype="$2"
+  local expected_status="$3"
+  local expected_output="$4"
+  shift 4
+  if [ "$#" -eq 0 ] || [ "$python3_available" -ne 1 ]; then
+    return 0
+  fi
+  checks=$((checks + 1))
+  local result
+  result="$(python3 - "$socktype" "$@" <<'PY' || printf '||probe-failed\n'
+import os
+import socket
+import subprocess
+import sys
+
+kind = {"STREAM": socket.SOCK_STREAM, "DGRAM": socket.SOCK_DGRAM}[sys.argv[1]]
+near, peer = socket.socketpair(socket.AF_UNIX, kind)
+environment = dict(os.environ, FAIRLINY_HANDOFF_FD=str(near.fileno()))
+try:
+    outcome = subprocess.run(
+        sys.argv[2:],
+        env=environment,
+        pass_fds=(near.fileno(),),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+finally:
+    near.close()
+delivered = ""
+peer.setblocking(False)
+try:
+    arrived = peer.recv(16)
+    # A stream peer reports b"" only for a clean close; any bytes, and
+    # any datagram at all — even an empty one — is material the refused
+    # channel delivered.
+    if kind == socket.SOCK_DGRAM or arrived:
+        delivered = "delivered"
+except OSError:
+    pass
+print(f"{outcome.returncode}|{outcome.stdout.strip()}|{delivered}")
+PY
+)"
+  local status output delivered
+  status="${result%%|*}"
+  local rest="${result#*|}"
+  delivered="${rest##*|}"
+  output="${rest%|*}"
+  if [ "$status" != "$expected_status" ] \
+    || [ "$output" != "$expected_output" ] \
+    || [ "$delivered" != "" ]; then
+    echo "FAIL $language channel=socket/$socktype: status=$status output=$output delivered=$delivered (expected $expected_status/$expected_output/nothing)"
+    failures=$((failures + 1))
+  fi
+}
+
+check_socket_channel_all() {
+  local socktype="$1"
+  local expected_status="$2"
+  local expected_output="$3"
+  check_socket_channel rust "$socktype" "$expected_status" "$expected_output" "$rust_sample"
+  if [ -n "$go_sample" ]; then
+    check_socket_channel go "$socktype" "$expected_status" "$expected_output" "$go_sample"
+  fi
+  if [ "${#ts_command[@]}" -gt 0 ]; then
+    check_socket_channel typescript "$socktype" "$expected_status" "$expected_output" \
+      "${ts_command[@]}" "$root/samples/typescript/handoff.ts"
+  fi
+}
+
 for vector in "$vectors"/*.json; do
   case "$(basename "$vector")" in
     valid.json | valid-*.json)
@@ -258,6 +339,13 @@ check_channel_all "200" 2 "refused credential_lease_handoff_fd_unavailable"
 # write-only to /dev/null, each get the same refusal from every language.
 check_writable_channel_all "RDWR" 2 "refused credential_lease_handoff_fd_invalid"
 check_writable_channel_all "WRONLY" 2 "refused credential_lease_handoff_fd_invalid"
+
+# A socket end is write-capable by construction — its access mode is
+# always read-write — so every language refuses it the same way, and the
+# refusal must deliver nothing to the peer: a datagram pair would show
+# even an empty stray write arriving.
+check_socket_channel_all "STREAM" 2 "refused credential_lease_handoff_fd_invalid"
+check_socket_channel_all "DGRAM" 2 "refused credential_lease_handoff_fd_invalid"
 
 if [ "$checks" -eq 0 ]; then
   echo "FAIL samples: no language sample ran" >&2
