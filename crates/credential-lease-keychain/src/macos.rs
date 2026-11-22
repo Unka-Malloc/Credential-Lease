@@ -208,6 +208,418 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+/// The store the SecItem wrappers dispatch to while a test has one
+/// installed. The real Data Protection Keychain refuses every
+/// unentitled process outright — an ad hoc test build included — so the
+/// operation sequences a swap-recovery test needs (claim, takeover,
+/// resolution, mutation) can never run end to end against it. This
+/// stand-in implements the generic-password semantics the swap
+/// machinery depends on: records unique on service, account, and access
+/// group; the default group the platform fills on an unscoped add,
+/// filled here the same way; per-record persistent references; the
+/// attribute, data, and reference return shapes; and the duplicate and
+/// not-found statuses. The store is thread-local and the guard
+/// uninstalls it on drop — unwind included — so parallel tests never
+/// observe one another's scenario.
+#[cfg(test)]
+mod fake_store {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// One stored record: every attribute the operations query or
+    /// return, with the access group always concrete — the platform
+    /// fills the caller's default group when a record is written, not
+    /// when it is read back, and so does this store.
+    #[derive(Clone)]
+    pub(crate) struct Record {
+        pub(crate) service: String,
+        pub(crate) account: String,
+        pub(crate) access_group: String,
+        pub(crate) synchronizable: bool,
+        pub(crate) generic: Option<Vec<u8>>,
+        pub(crate) value: Option<Vec<u8>>,
+        pub(crate) persistent_ref: Vec<u8>,
+    }
+
+    impl Record {
+        /// A plain caller item: not synchronizable, no swap marker.
+        pub(crate) fn item(service: &str, account: &str, access_group: &str) -> Self {
+            Self {
+                service: service.to_owned(),
+                account: account.to_owned(),
+                access_group: access_group.to_owned(),
+                synchronizable: false,
+                generic: None,
+                value: Some(b"synthetic-value".to_vec()),
+                persistent_ref: Uuid::new_v4().into_bytes().to_vec(),
+            }
+        }
+    }
+
+    /// The installed store: the default group unscoped adds land in,
+    /// the records it holds, and the counter every added record's
+    /// persistent name derives from.
+    struct Store {
+        default_group: String,
+        records: Vec<Record>,
+        next_ref: u64,
+    }
+
+    thread_local! {
+        static STORE: RefCell<Option<Store>> = const { RefCell::new(None) };
+    }
+
+    /// Uninstalls the store on drop — including on a panicking unwind —
+    /// so no scenario leaks into another test this thread runs.
+    pub(crate) struct Guard(());
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            STORE.with(|cell| cell.borrow_mut().take());
+        }
+    }
+
+    /// Install the scenario `records` describes. `default_group` is the
+    /// group the platform would fill on an add that names no group —
+    /// stored records always name their group concretely, so a record
+    /// written without the attribute lands here exactly as Keychain
+    /// places it.
+    pub(crate) fn install(default_group: &str, records: Vec<Record>) -> Guard {
+        STORE.with(|cell| {
+            *cell.borrow_mut() = Some(Store {
+                default_group: default_group.to_owned(),
+                records,
+                next_ref: 0,
+            });
+        });
+        Guard(())
+    }
+
+    /// A snapshot of the store's records for a test's assertions.
+    pub(crate) fn records() -> Vec<Record> {
+        STORE.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .map(|store| store.records.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    /// What a SecItem dictionary asks of the store: the searchable
+    /// attributes, the new values an add or update carries, and the
+    /// requested return shapes.
+    struct Query {
+        service: Option<String>,
+        account: Option<String>,
+        access_group: Option<String>,
+        synchronizable: Option<bool>,
+        generic: Option<Vec<u8>>,
+        persistent_ref: Option<Vec<u8>>,
+        value: Option<Vec<u8>>,
+        return_attributes: bool,
+        return_reference: bool,
+        return_data: bool,
+        match_all: bool,
+    }
+
+    /// Project an operation-built dictionary onto the store's query
+    /// shape. Routing, authentication, and UI-policy pairs are the
+    /// operation's own contract with the platform — not match or
+    /// storage attributes — so the projection ignores them the way a
+    /// record would never carry them.
+    fn project(dict: &CFDictionary<CFString, CFType>) -> Query {
+        let dict = &dict.to_untyped();
+        // SAFETY: every key is an SDK-exported static CFString.
+        unsafe {
+            let flag = |key: CFStringRef| {
+                dictionary_value(dict, key)
+                    .and_then(|value| value.downcast::<CFBoolean>())
+                    .map(bool::from)
+                    == Some(true)
+            };
+            Query {
+                service: dictionary_string(dict, kSecAttrService),
+                account: dictionary_string(dict, kSecAttrAccount),
+                access_group: dictionary_string(dict, kSecAttrAccessGroup),
+                synchronizable: dictionary_value(dict, kSecAttrSynchronizable)
+                    .and_then(|value| value.downcast::<CFBoolean>())
+                    .map(bool::from),
+                generic: dictionary_data(dict, kSecAttrGeneric)
+                    .map(|generic| generic.bytes().to_vec()),
+                persistent_ref: dictionary_data(dict, kSecValuePersistentRef)
+                    .map(|reference| reference.bytes().to_vec()),
+                value: dictionary_data(dict, kSecValueData).map(|data| data.bytes().to_vec()),
+                return_attributes: flag(kSecReturnAttributes),
+                return_reference: flag(kSecReturnPersistentRef),
+                return_data: flag(kSecReturnData),
+                match_all: dictionary_value(dict, kSecMatchLimit).is_some_and(|value| {
+                    cf_equal_or_both_absent(value.as_CFTypeRef(), kSecMatchLimitAll.cast())
+                }),
+            }
+        }
+    }
+
+    /// The platform's match semantics for the searchable attributes:
+    /// every attribute the query names must equal the record's, and an
+    /// attribute the query omits matches anything — the access group
+    /// included, which is what lets an unscoped query span groups.
+    fn matches(record: &Record, query: &Query) -> bool {
+        query.service.as_deref().is_none_or(|v| v == record.service)
+            && query.account.as_deref().is_none_or(|v| v == record.account)
+            && query
+                .access_group
+                .as_deref()
+                .is_none_or(|v| v == record.access_group)
+            && query
+                .synchronizable
+                .is_none_or(|v| v == record.synchronizable)
+            && query
+                .generic
+                .as_deref()
+                .is_none_or(|v| Some(v) == record.generic.as_deref())
+            && query
+                .persistent_ref
+                .as_deref()
+                .is_none_or(|v| v == record.persistent_ref)
+    }
+
+    /// The ownership a returned object arrives with: +1, as every
+    /// SecItem result carries.
+    fn leak(value: CFType) -> CFTypeRef {
+        let reference = value.as_CFTypeRef();
+        std::mem::forget(value);
+        reference
+    }
+
+    /// One record's attribute projection for a return-attributes read:
+    /// the searchable attributes plus whichever of the persistent
+    /// reference and value data the query requested — the merge the
+    /// platform performs inside each returned dictionary.
+    fn attribute_dict(record: &Record, query: &Query) -> CFDictionary<CFString, CFType> {
+        // SAFETY: every key is an SDK-exported static CFString.
+        let mut pairs = unsafe {
+            vec![
+                (
+                    sec_key(kSecAttrService),
+                    CFString::from(record.service.as_str()).into_CFType(),
+                ),
+                (
+                    sec_key(kSecAttrAccount),
+                    CFString::from(record.account.as_str()).into_CFType(),
+                ),
+                (
+                    sec_key(kSecAttrAccessGroup),
+                    CFString::from(record.access_group.as_str()).into_CFType(),
+                ),
+                (
+                    sec_key(kSecAttrSynchronizable),
+                    CFBoolean::from(record.synchronizable).into_CFType(),
+                ),
+            ]
+        };
+        if let Some(generic) = &record.generic {
+            pairs.push((
+                sec_key(unsafe { kSecAttrGeneric }),
+                CFData::from_buffer(generic).into_CFType(),
+            ));
+        }
+        if query.return_reference {
+            pairs.push((
+                sec_key(unsafe { kSecValuePersistentRef }),
+                CFData::from_buffer(&record.persistent_ref).into_CFType(),
+            ));
+        }
+        if query.return_data {
+            pairs.push((
+                sec_key(unsafe { kSecValueData }),
+                CFData::from_buffer(record.value.as_deref().unwrap_or(&[])).into_CFType(),
+            ));
+        }
+        CFDictionary::from_CFType_pairs(&pairs)
+    }
+
+    /// `SecItemAdd`: records unique on service, account, and the
+    /// concrete group the item lands in — the declared group, or the
+    /// store's default when the add names none, as the platform fills
+    /// it.
+    pub(crate) fn add(
+        dict: &CFDictionary<CFString, CFType>,
+        result: *mut CFTypeRef,
+    ) -> Option<i32> {
+        STORE.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let store = guard.as_mut()?;
+            let query = project(dict);
+            let group = query
+                .access_group
+                .clone()
+                .unwrap_or_else(|| store.default_group.clone());
+            if store.records.iter().any(|record| {
+                query.service.as_deref() == Some(record.service.as_str())
+                    && query.account.as_deref() == Some(record.account.as_str())
+                    && record.access_group == group
+            }) {
+                return Some(errSecDuplicateItem);
+            }
+            let persistent_ref = format!("persistent-ref-{}", store.next_ref).into_bytes();
+            store.next_ref += 1;
+            store.records.push(Record {
+                persistent_ref: persistent_ref.clone(),
+                service: query.service.unwrap_or_default(),
+                account: query.account.unwrap_or_default(),
+                access_group: group,
+                synchronizable: query.synchronizable.unwrap_or(false),
+                generic: query.generic,
+                value: query.value,
+            });
+            if query.return_reference && !result.is_null() {
+                // SAFETY: result is a live out-pointer; the leaked object
+                // hands it the +1 ownership SecItemAdd returns.
+                unsafe {
+                    *result = leak(CFData::from_buffer(&persistent_ref).into_CFType());
+                }
+            }
+            Some(errSecSuccess)
+        })
+    }
+
+    /// `SecItemCopyMatching`: the match-all attribute reads arrive as a
+    /// CFArray of dictionaries — a lone match still boxed — while
+    /// limit-one reads arrive unboxed and a data-only read is a bare
+    /// CFData, each exactly the shape the operations handle.
+    pub(crate) fn copy_matching(
+        dict: &CFDictionary<CFString, CFType>,
+        result: *mut CFTypeRef,
+    ) -> Option<i32> {
+        STORE.with(|cell| {
+            let guard = cell.borrow();
+            let store = guard.as_ref()?;
+            let query = project(dict);
+            let matched: Vec<&Record> = store
+                .records
+                .iter()
+                .filter(|record| matches(record, &query))
+                .collect();
+            if matched.is_empty() {
+                return Some(errSecItemNotFound);
+            }
+            if !result.is_null() {
+                let value = if query.return_attributes {
+                    let dicts: Vec<CFType> = matched
+                        .iter()
+                        .map(|record| attribute_dict(record, &query).into_CFType())
+                        .collect();
+                    if query.match_all {
+                        CFArray::from_CFTypes(&dicts).into_CFType()
+                    } else {
+                        dicts.into_iter().next().expect("a match exists")
+                    }
+                } else if query.return_data {
+                    CFData::from_buffer(matched[0].value.as_deref().unwrap_or(&[])).into_CFType()
+                } else {
+                    // A reference-only or presence-only read answers the
+                    // first match's persistent name.
+                    CFData::from_buffer(&matched[0].persistent_ref).into_CFType()
+                };
+                // SAFETY: result is a live out-pointer; the leaked
+                // object hands it +1 ownership.
+                unsafe {
+                    *result = leak(value);
+                }
+            }
+            Some(errSecSuccess)
+        })
+    }
+
+    /// `SecItemUpdate`: every matching record takes the update's
+    /// attributes, and a resulting uniqueness collision refuses with
+    /// nothing changed, as the platform's atomic update does.
+    pub(crate) fn update(
+        dict: &CFDictionary<CFString, CFType>,
+        update: &CFDictionary<CFString, CFType>,
+    ) -> Option<i32> {
+        STORE.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let store = guard.as_mut()?;
+            let query = project(dict);
+            let changes = project(update);
+            let touched: Vec<bool> = store
+                .records
+                .iter()
+                .map(|record| matches(record, &query))
+                .collect();
+            if !touched.iter().any(|touched| *touched) {
+                return Some(errSecItemNotFound);
+            }
+            // The update is atomic: a renamed record colliding with an
+            // untouched one — or with another record the same update
+            // renamed — refuses before any record changes.
+            let mut keys = Vec::with_capacity(store.records.len());
+            for (record, touched) in store.records.iter().zip(&touched) {
+                keys.push((
+                    record.service.clone(),
+                    if *touched {
+                        changes
+                            .account
+                            .clone()
+                            .unwrap_or_else(|| record.account.clone())
+                    } else {
+                        record.account.clone()
+                    },
+                    if *touched {
+                        changes
+                            .access_group
+                            .clone()
+                            .unwrap_or_else(|| record.access_group.clone())
+                    } else {
+                        record.access_group.clone()
+                    },
+                ));
+            }
+            keys.sort();
+            if keys.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Some(errSecDuplicateItem);
+            }
+            for (record, touched) in store.records.iter_mut().zip(&touched) {
+                if !touched {
+                    continue;
+                }
+                if let Some(account) = &changes.account {
+                    record.account.clone_from(account);
+                }
+                if let Some(group) = &changes.access_group {
+                    record.access_group.clone_from(group);
+                }
+                if changes.generic.is_some() {
+                    record.generic.clone_from(&changes.generic);
+                }
+                if changes.value.is_some() {
+                    record.value.clone_from(&changes.value);
+                }
+            }
+            Some(errSecSuccess)
+        })
+    }
+
+    /// `SecItemDelete`: every matching record is removed — the unscoped
+    /// breadth that makes pinned deletes mandatory — and an empty match
+    /// reports not-found.
+    pub(crate) fn delete(dict: &CFDictionary<CFString, CFType>) -> Option<i32> {
+        STORE.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let store = guard.as_mut()?;
+            let query = project(dict);
+            let before = store.records.len();
+            store.records.retain(|record| !matches(record, &query));
+            Some(if store.records.len() == before {
+                errSecItemNotFound
+            } else {
+                errSecSuccess
+            })
+        })
+    }
+}
+
 fn keychain_effect(
     backend: KeychainBackend,
     effect: impl FnOnce() -> i32,
@@ -462,14 +874,8 @@ impl Keychain {
                     let update = CFDictionary::from_CFType_pairs(&secret_value_pairs(
                         secret.expose_bytes(),
                     )?);
-                    // SAFETY: pinned_dict and update own their CF values
-                    // for the synchronous call.
-                    let update_status = keychain_effect(store, || unsafe {
-                        SecItemUpdate(
-                            pinned_dict.as_concrete_TypeRef(),
-                            update.as_concrete_TypeRef(),
-                        )
-                    })?;
+                    let update_status =
+                        keychain_effect(store, || sec_item_update(&pinned_dict, &update))?;
                     match keychain_update_transition(update_status) {
                         KeychainUpdateTransition::Complete => {
                             let verified = ensure_write_protected(&pinned, store);
@@ -530,10 +936,8 @@ impl Keychain {
             ));
             let add_query = CFDictionary::from_CFType_pairs(&pairs);
             let mut added_reference: CFTypeRef = ptr::null();
-            // SAFETY: add_query owns all referenced values for the synchronous call.
-            let add_status = keychain_effect(store, || unsafe {
-                SecItemAdd(add_query.as_concrete_TypeRef(), &mut added_reference)
-            })?;
+            let add_status =
+                keychain_effect(store, || sec_item_add(&add_query, &mut added_reference))?;
             if add_status == errSecSuccess {
                 let verified = ensure_write_protected(
                     &pinned_result_reference(added_reference, context, store)?,
@@ -639,14 +1043,7 @@ impl Keychain {
             security_framework_static!(kSecAttrAccount, sec_key),
             CFString::from(parked.as_str()).into_CFType(),
         )]);
-        // SAFETY: pinned_dict and rename own their CF values for the
-        // synchronous call.
-        let rename_status = keychain_effect(store, || unsafe {
-            SecItemUpdate(
-                pinned_dict.as_concrete_TypeRef(),
-                rename.as_concrete_TypeRef(),
-            )
-        })?;
+        let rename_status = keychain_effect(store, || sec_item_update(&pinned_dict, &rename))?;
         if rename_status != errSecSuccess {
             // The original is untouched — the claim's journal resolves
             // to no parked record, so releasing it leaves nothing for
@@ -661,10 +1058,7 @@ impl Keychain {
             return status_result("write", rename_status).map(|_| ReplaceTransition::Done);
         }
         let mut added_reference: CFTypeRef = ptr::null();
-        // SAFETY: add_query owns all referenced values for the synchronous call.
-        let add_status = keychain_effect(store, || unsafe {
-            SecItemAdd(add_query.as_concrete_TypeRef(), &mut added_reference)
-        })?;
+        let add_status = keychain_effect(store, || sec_item_add(&add_query, &mut added_reference))?;
         // The restore payload puts the parked record back under its
         // original identity — still pinned to the same persistent
         // reference — on every path that cannot keep the swap.
@@ -678,12 +1072,8 @@ impl Keychain {
             // never erased — and the claim's drop marks the journal
             // released, so recovery is never blocked behind a writer
             // that already finished.
-            let restore_status = keychain_effect(store, || unsafe {
-                SecItemUpdate(
-                    pinned_dict.as_concrete_TypeRef(),
-                    restore.as_concrete_TypeRef(),
-                )
-            })?;
+            let restore_status =
+                keychain_effect(store, || sec_item_update(&pinned_dict, &restore))?;
             if restore_status != errSecSuccess {
                 return status_result("write", restore_status).map(|_| ReplaceTransition::Done);
             }
@@ -704,27 +1094,16 @@ impl Keychain {
             // replacement is verified, and a failed cleanup leaves the
             // recorded swap for the next call's recovery.
             let added_dict = CFDictionary::from_CFType_pairs(&added);
-            // SAFETY: added_dict and pinned_dict own their CF values for
-            // the synchronous calls.
-            let _ = keychain_effect(store, || unsafe {
-                SecItemDelete(added_dict.as_concrete_TypeRef())
-            });
-            let restore_status = keychain_effect(store, || unsafe {
-                SecItemUpdate(
-                    pinned_dict.as_concrete_TypeRef(),
-                    restore.as_concrete_TypeRef(),
-                )
-            })?;
+            let _ = keychain_effect(store, || sec_item_delete(&added_dict));
+            let restore_status =
+                keychain_effect(store, || sec_item_update(&pinned_dict, &restore))?;
             if restore_status != errSecSuccess {
                 return status_result("write", restore_status).map(|_| ReplaceTransition::Done);
             }
             let _ = claim.release();
             return Err(verify);
         }
-        // SAFETY: pinned_dict owns its CF values for the synchronous call.
-        let delete_status = keychain_effect(store, || unsafe {
-            SecItemDelete(pinned_dict.as_concrete_TypeRef())
-        })?;
+        let delete_status = keychain_effect(store, || sec_item_delete(&pinned_dict))?;
         if delete_status != errSecSuccess && delete_status != errSecItemNotFound {
             return status_result("delete", delete_status).map(|_| ReplaceTransition::Done);
         }
@@ -788,6 +1167,31 @@ impl Keychain {
             // record gets.
             ClaimOutcome::Blocked => return Ok(AddItemOutcome::Duplicate),
         };
+        // The identity is enumerated under the claim, for the same
+        // reason the delete enumerates under its own: the slot the
+        // claim covers is the group the matched record sits in, so the
+        // write can never land where the claim did not look. The
+        // enumeration runs before the recovered-occupies verdict below
+        // for the same reason: a resolution that restored an original
+        // in one group while another group already held a match leaves
+        // the identity holding two credentials — `Duplicate` would hand
+        // the caller an arbitrary match to compare, so ambiguity must
+        // be refused first. An unscoped add whose only match lives in a
+        // non-default access group claimed that group's slot — the
+        // existing record is the append-only contract's collision,
+        // reported `Duplicate` before any write rather than a second
+        // record minted into the caller's default group beside it. More
+        // than one match refuses ambiguous for the same reason a delete
+        // does.
+        let matched =
+            match with_keychain_backend(store, || find_matching_item(&query_pairs, store, true))? {
+                ItemMatch::Absent => None,
+                ItemMatch::Ambiguous => {
+                    claim.abandon();
+                    return Err(item_ambiguous());
+                }
+                ItemMatch::One(item) => Some(item),
+            };
         // The claim's resolution pass may have restored a parked
         // original or kept the swap's verified replacement: when the
         // identity is occupied in the group this add would write — and
@@ -801,25 +1205,6 @@ impl Keychain {
             let _ = claim.release();
             return Ok(AddItemOutcome::Duplicate);
         }
-        // The identity is enumerated under the claim, for the same
-        // reason the delete enumerates under its own: the slot the
-        // claim covers is the group the matched record sits in, so the
-        // write can never land where the claim did not look. An
-        // unscoped add whose only match lives in a non-default access
-        // group claimed that group's slot — the existing record is the
-        // append-only contract's collision, reported `Duplicate` before
-        // any write rather than a second record minted into the
-        // caller's default group beside it. More than one match refuses
-        // ambiguous for the same reason a delete does.
-        let matched =
-            match with_keychain_backend(store, || find_matching_item(&query_pairs, store, true))? {
-                ItemMatch::Absent => None,
-                ItemMatch::Ambiguous => {
-                    claim.abandon();
-                    return Err(item_ambiguous());
-                }
-                ItemMatch::One(item) => Some(item),
-            };
         if let Some(item) = matched.as_ref() {
             // The claim must cover the slot the matched record sits in —
             // the same coverage the write side requires.
@@ -833,10 +1218,7 @@ impl Keychain {
         let mut pairs = query_pairs;
         pairs.extend(protected_secret_pairs(secret.expose_bytes())?);
         let add_query = CFDictionary::from_CFType_pairs(&pairs);
-        // SAFETY: add_query owns all referenced values for the synchronous call.
-        let add_status = keychain_effect(store, || unsafe {
-            SecItemAdd(add_query.as_concrete_TypeRef(), ptr::null_mut())
-        })?;
+        let add_status = keychain_effect(store, || sec_item_add(&add_query, ptr::null_mut()))?;
         let outcome = if add_status == errSecSuccess {
             Ok(AddItemOutcome::Added)
         } else if add_status == errSecDuplicateItem {
@@ -946,10 +1328,14 @@ impl Keychain {
     /// together name one credential — one access group — or the delete
     /// refuses `credential_lease_keychain_item_ambiguous` and leaves
     /// every journal released for the caller that can address each
-    /// credential. A journal that never parked anything, like one an
-    /// interrupted add left, cannot wedge a scoped delete on a group it
-    /// never recorded. A swap a live writer still owns refuses the
-    /// delete with
+    /// credential. One group alone is not proof of one credential: a
+    /// visible record sharing the parked original's group must also
+    /// carry that swap's marker — be the replacement its own add
+    /// placed — or the pair is two independent records and the delete
+    /// refuses, preserving both records and the journal. A journal that
+    /// never parked anything, like one an interrupted add left, cannot
+    /// wedge a scoped delete on a group it never recorded. A swap a
+    /// live writer still owns refuses the delete with
     /// `credential_lease_keychain_swap_active` rather than racing it,
     /// and a delete scoped to synchronizable items never resolves the
     /// swap at all: the journal and the parked original are device-only
@@ -1036,6 +1422,22 @@ impl Keychain {
                     slot.preserve();
                     return Ok(());
                 }
+                // A visible record in the parked original's own group is
+                // the same credential only when it is this swap's marked
+                // replacement — the record the swap's own add placed.
+                // Anything else holding the identity beside the parked
+                // original is an independent record, and deleting the
+                // pair would erase two credentials the lookup showed as
+                // one: the journal and both records stay for the caller
+                // that can sort the contest out.
+                if let Some(visible) = item.as_ref() {
+                    if visible.access_group == record.access_group
+                        && visible.generic.as_deref() != Some(swap_marker(&slot.swap_id).as_slice())
+                    {
+                        slot.preserve();
+                        return Err(item_ambiguous());
+                    }
+                }
                 parked.push((index, record));
                 Ok(())
             })()
@@ -1096,10 +1498,7 @@ impl Keychain {
             None => attribute_scoped_delete_pairs(query, &query_pairs, &item),
         };
         let delete_dict = CFDictionary::from_CFType_pairs(&delete_pairs);
-        // SAFETY: delete_dict owns valid CF values for the synchronous call.
-        let status = keychain_effect(store, || unsafe {
-            SecItemDelete(delete_dict.as_concrete_TypeRef())
-        })?;
+        let status = keychain_effect(store, || sec_item_delete(&delete_dict))?;
         let result = if status == errSecItemNotFound {
             Ok(())
         } else {
@@ -1159,12 +1558,7 @@ impl Keychain {
         let status = with_classic_keychain_interaction(
             &SystemClassicKeychainInteraction,
             allow_interaction,
-            || {
-                // SAFETY: query owns valid CF values for the synchronous call.
-                keychain_effect_status(KeychainBackend::Classic, unsafe {
-                    SecItemDelete(query_dict.as_concrete_TypeRef())
-                })
-            },
+            || keychain_effect_status(KeychainBackend::Classic, sec_item_delete(&query_dict)),
         )?;
         if status == errSecItemNotFound {
             Ok(())
@@ -1616,6 +2010,56 @@ fn keychain_update_transition(status: i32) -> KeychainUpdateTransition {
     }
 }
 
+/// The `SecItemAdd` the platform — or the installed test store —
+/// runs. `result` carries the requested return object at +1 ownership.
+fn sec_item_add(dict: &CFDictionary<CFString, CFType>, result: *mut CFTypeRef) -> i32 {
+    #[cfg(test)]
+    if let Some(status) = fake_store::add(dict, result) {
+        return status;
+    }
+    // SAFETY: dict owns all referenced values for the synchronous call;
+    // result is a live out-pointer.
+    unsafe { SecItemAdd(dict.as_concrete_TypeRef(), result) }
+}
+
+/// The `SecItemCopyMatching` the platform — or the installed test
+/// store — runs. `result` carries the requested object at +1 ownership.
+fn sec_item_copy_matching(dict: &CFDictionary<CFString, CFType>, result: *mut CFTypeRef) -> i32 {
+    #[cfg(test)]
+    if let Some(status) = fake_store::copy_matching(dict, result) {
+        return status;
+    }
+    // SAFETY: dict owns all referenced values for the synchronous call;
+    // result is a live out-pointer.
+    unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), result) }
+}
+
+/// The `SecItemUpdate` the platform — or the installed test store —
+/// runs.
+fn sec_item_update(
+    dict: &CFDictionary<CFString, CFType>,
+    update: &CFDictionary<CFString, CFType>,
+) -> i32 {
+    #[cfg(test)]
+    if let Some(status) = fake_store::update(dict, update) {
+        return status;
+    }
+    // SAFETY: dict and update own all referenced values for the
+    // synchronous call.
+    unsafe { SecItemUpdate(dict.as_concrete_TypeRef(), update.as_concrete_TypeRef()) }
+}
+
+/// The `SecItemDelete` the platform — or the installed test store —
+/// runs.
+fn sec_item_delete(dict: &CFDictionary<CFString, CFType>) -> i32 {
+    #[cfg(test)]
+    if let Some(status) = fake_store::delete(dict) {
+        return status;
+    }
+    // SAFETY: dict owns all referenced values for the synchronous call.
+    unsafe { SecItemDelete(dict.as_concrete_TypeRef()) }
+}
+
 /// Run `SecItemCopyMatching` over `pairs`. Any returned object is owned
 /// before the status resolves or classic UI restores — in particular, a
 /// restore failure must drop the returned object. An absent item and an
@@ -1626,8 +2070,7 @@ fn copy_matching(
 ) -> Result<Option<CFType>, KeychainError> {
     let query = CFDictionary::from_CFType_pairs(pairs);
     let mut copied: CFTypeRef = ptr::null();
-    // SAFETY: query is valid and copied is an initialized out-pointer.
-    let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut copied) };
+    let status = sec_item_copy_matching(&query, &mut copied);
     let value = if copied.is_null() {
         None
     } else {
@@ -2944,10 +3387,7 @@ fn delete_pinned(
     pinned_dict: &CFDictionary<CFString, CFType>,
     store: KeychainBackend,
 ) -> Result<(), KeychainError> {
-    // SAFETY: pinned_dict owns valid CF values for the synchronous call.
-    let status = keychain_effect(store, || unsafe {
-        SecItemDelete(pinned_dict.as_concrete_TypeRef())
-    })?;
+    let status = keychain_effect(store, || sec_item_delete(pinned_dict))?;
     if status != errSecSuccess && status != errSecItemNotFound {
         status_result("delete", status)?;
     }
@@ -2965,14 +3405,7 @@ fn restore_parked(
         security_framework_static!(kSecAttrAccount, sec_key),
         CFString::from(account).into_CFType(),
     )]);
-    // SAFETY: pinned_dict and restore own their CF values for the
-    // synchronous call.
-    keychain_effect(store, || unsafe {
-        SecItemUpdate(
-            pinned_dict.as_concrete_TypeRef(),
-            restore.as_concrete_TypeRef(),
-        )
-    })
+    keychain_effect(store, || sec_item_update(pinned_dict, &restore))
 }
 
 /// Resolve the state an interrupted or failed replacement recorded —
@@ -3234,11 +3667,7 @@ impl SwapClaim {
             ))
             .into_CFType(),
         )]);
-        // SAFETY: pinned and update own their CF values for the
-        // synchronous call.
-        let status = keychain_effect(self.store, || unsafe {
-            SecItemUpdate(pinned.as_concrete_TypeRef(), update.as_concrete_TypeRef())
-        })?;
+        let status = keychain_effect(self.store, || sec_item_update(&pinned, &update))?;
         status_result("write", status)
     }
 
@@ -3455,11 +3884,7 @@ fn take_over_journal(
         ))
         .into_CFType(),
     )]);
-    // SAFETY: pinned and takeover own their CF values for the
-    // synchronous call.
-    let status = keychain_effect(store, || unsafe {
-        SecItemUpdate(pinned.as_concrete_TypeRef(), takeover.as_concrete_TypeRef())
-    })?;
+    let status = keychain_effect(store, || sec_item_update(&pinned, &takeover))?;
     if status == errSecItemNotFound {
         return Ok(JournalTakeover::Gone);
     }
@@ -3534,11 +3959,7 @@ fn write_journal(
         );
         let dict = CFDictionary::from_CFType_pairs(&pairs);
         let mut added: CFTypeRef = ptr::null();
-        // SAFETY: dict owns all referenced values for the synchronous
-        // call.
-        let status = keychain_effect(store, || unsafe {
-            SecItemAdd(dict.as_concrete_TypeRef(), &mut added)
-        })?;
+        let status = keychain_effect(store, || sec_item_add(&dict, &mut added))?;
         if status == errSecSuccess {
             // SAFETY: SecItemAdd returned its result object at +1
             // ownership.
@@ -3684,7 +4105,21 @@ fn claim_identity(
         }
     }
     let mut held = kept;
-    if !held.iter().any(|claim| claim.slot_group == needed_slot) {
+    // The slot the operation's mutation lands in must be covered — but
+    // only a mutation that exists. For a delete `needed_slot` is the
+    // matched record's group, and `None` means the enumeration found no
+    // record: the delete's only work is the pending cleanup the held
+    // journals already cover, so the parked-only recovery runs under
+    // them. Writing a fresh journal for `None` would collide with a
+    // taken-over journal the platform's default fill already placed in
+    // that same default group — the journal add asks for the group
+    // explicitly or not at all, while the stored record always names
+    // its group concretely. A write, by contrast, needs the slot its
+    // add lands in, which `None` — the caller's default group — still
+    // names.
+    let covered = held.iter().any(|claim| claim.slot_group == needed_slot)
+        || (matches!(mode, ClaimMode::RemoveForDelete) && needed_slot.is_none());
+    if !covered {
         held.push(write_journal(
             query,
             needed_slot.as_deref(),
@@ -3908,8 +4343,7 @@ fn silent_keychain_roundtrip_probe(backend: KeychainBackend) -> Result<(), Probe
         CFData::from_buffer(PROBE_MATERIAL).into_CFType(),
     ));
     let add_query = CFDictionary::from_CFType_pairs(&pairs);
-    // SAFETY: add_query owns all referenced values for the synchronous call.
-    let add_status = unsafe { SecItemAdd(add_query.as_concrete_TypeRef(), ptr::null_mut()) };
+    let add_status = sec_item_add(&add_query, ptr::null_mut());
     if add_status != errSecSuccess {
         return Err(ProbeFailure::Status(add_status));
     }
@@ -3925,8 +4359,7 @@ fn silent_keychain_roundtrip_probe(backend: KeychainBackend) -> Result<(), Probe
     ));
     let read_query = CFDictionary::from_CFType_pairs(&query_pairs);
     let mut copied: CFTypeRef = ptr::null();
-    // SAFETY: read_query is valid and copied is an initialized out-pointer.
-    let read_status = unsafe { SecItemCopyMatching(read_query.as_concrete_TypeRef(), &mut copied) };
+    let read_status = sec_item_copy_matching(&read_query, &mut copied);
     let read_result = if read_status != errSecSuccess {
         Err(ProbeFailure::Status(read_status))
     } else if copied.is_null() {
@@ -3957,8 +4390,7 @@ fn silent_keychain_roundtrip_probe(backend: KeychainBackend) -> Result<(), Probe
     let delete_query = CFDictionary::from_CFType_pairs(&delete_pairs);
     // The created probe item is cleaned up on every outcome — success,
     // read refusal, and undiagnosed result alike.
-    // SAFETY: delete_query owns valid CF values for the synchronous call.
-    let delete_status = unsafe { SecItemDelete(delete_query.as_concrete_TypeRef()) };
+    let delete_status = sec_item_delete(&delete_query);
     read_result?;
     if delete_status != errSecSuccess {
         return Err(ProbeFailure::Status(delete_status));
@@ -5517,6 +5949,206 @@ mod tests {
         assert!(delete_candidates_ambiguous(Some(&one), [&other]));
         assert!(delete_candidates_ambiguous(None, [&one, &other]));
         assert!(delete_candidates_ambiguous(Some(&one), [&same, &other]));
+    }
+
+    /// A journal the way an abandoned swap left it: the encoded swap
+    /// state under the reserved service, in the coordination slot's
+    /// concrete group, marked released so the recorded owner no longer
+    /// gates recovery — the state a takeover resolves without any
+    /// liveness proof.
+    fn released_journal(
+        service: &str,
+        account: &str,
+        slot_group: &str,
+        parked_group: Option<&str>,
+        swap_id: &Uuid,
+    ) -> fake_store::Record {
+        let mut journal = fake_store::Record::item(
+            REPLACE_STATE_SERVICE,
+            &swap_state_account(service, account),
+            slot_group,
+        );
+        journal.value = Some(encode_swap_state(
+            service,
+            account,
+            parked_group,
+            &swap_owner().unwrap(),
+            swap_id,
+            true,
+            None,
+        ));
+        journal
+    }
+
+    #[test]
+    fn a_parked_only_delete_reuses_the_held_journal_in_the_default_group() {
+        // An interrupted swap parked the original in the caller's
+        // default group and left only its journal there — the concrete
+        // group Keychain filled when the journal's unscoped add ran.
+        // The unscoped delete sees no visible record, so the slot a
+        // write would land in is `None` — but the taken-over journal
+        // already names that same default group concretely. The
+        // parked-only recovery must run under the held journal: a fresh
+        // one written to `None` lands in the same filled default group
+        // and collides with the journal already there, refusing the
+        // delete before the parked record is ever inspected.
+        let service = format!("synthetic-service-{}", Uuid::new_v4());
+        let account = "synthetic-account";
+        let group = "synthetic.default.group";
+        let swap_id = Uuid::new_v4();
+        let _store = fake_store::install(
+            group,
+            vec![
+                released_journal(&service, account, group, Some(group), &swap_id),
+                fake_store::Record::item(&service, &replace_parked_account(&swap_id), group),
+            ],
+        );
+        let keychain = Keychain {
+            backend: KeychainBackend::DataProtection,
+        };
+        let query = KeychainItemQuery::new(&service, account).unwrap();
+        keychain
+            .delete_item(&synthetic_context(), &query)
+            .expect("the held journal covers the parked-only delete");
+        // The delete spent both the parked original and the journal it
+        // ran under.
+        assert!(fake_store::records().is_empty());
+    }
+
+    #[test]
+    fn a_delete_preserves_an_unmarked_record_beside_a_parked_original() {
+        // One group alone is not one credential: the parked original
+        // and the visible record sit in the same group, but the visible
+        // record carries no marker — it is not the replacement this
+        // swap's own add placed, so the pair is two independent
+        // records. The delete refuses ambiguous and preserves both
+        // records and the journal for the caller that can sort the
+        // contest out.
+        let service = format!("synthetic-service-{}", Uuid::new_v4());
+        let account = "synthetic-account";
+        let swap_id = Uuid::new_v4();
+        let _store = fake_store::install(
+            "synthetic.default.group",
+            vec![
+                released_journal(&service, account, "group.a", Some("group.a"), &swap_id),
+                fake_store::Record::item(&service, &replace_parked_account(&swap_id), "group.a"),
+                fake_store::Record::item(&service, account, "group.a"),
+            ],
+        );
+        let keychain = Keychain {
+            backend: KeychainBackend::DataProtection,
+        };
+        let query = KeychainItemQuery::new(&service, account).unwrap();
+        let error = keychain
+            .delete_item(&synthetic_context(), &query)
+            .expect_err("the unmarked record is an independent credential");
+        assert_eq!(error.code(), "credential_lease_keychain_item_ambiguous");
+        // Both records and the journal stay: nothing the delete saw is
+        // erased over a contest it could not resolve.
+        assert_eq!(fake_store::records().len(), 3);
+    }
+
+    #[test]
+    fn a_delete_removes_the_marked_pair_beside_a_parked_original() {
+        // The same layout as the preserved case — parked original plus
+        // a visible record in its group — except the visible record
+        // carries this swap's marker: it is the replacement the swap's
+        // own add placed, so the pair is one credential's old and new
+        // values and the delete removes both under the held journal.
+        let service = format!("synthetic-service-{}", Uuid::new_v4());
+        let account = "synthetic-account";
+        let swap_id = Uuid::new_v4();
+        let mut visible = fake_store::Record::item(&service, account, "group.a");
+        visible.generic = Some(swap_marker(&swap_id));
+        let _store = fake_store::install(
+            "synthetic.default.group",
+            vec![
+                released_journal(&service, account, "group.a", Some("group.a"), &swap_id),
+                fake_store::Record::item(&service, &replace_parked_account(&swap_id), "group.a"),
+                visible,
+            ],
+        );
+        let keychain = Keychain {
+            backend: KeychainBackend::DataProtection,
+        };
+        let query = KeychainItemQuery::new(&service, account).unwrap();
+        keychain
+            .delete_item(&synthetic_context(), &query)
+            .expect("the marked pair is one credential");
+        assert!(fake_store::records().is_empty());
+    }
+
+    #[test]
+    fn an_add_reports_ambiguous_when_recovery_leaves_two_credentials() {
+        // The abandoned swap's resolution restores its parked original
+        // into its own group while an unrelated record already holds
+        // the identity in another: the unscoped enumeration then sees
+        // two credentials. The ambiguity must be refused before the
+        // recovered-occupies verdict can answer `Duplicate` — a caller
+        // resolving that outcome would compare an arbitrary match.
+        let service = format!("synthetic-service-{}", Uuid::new_v4());
+        let account = "synthetic-account";
+        let swap_id = Uuid::new_v4();
+        let _store = fake_store::install(
+            "synthetic.default.group",
+            vec![
+                released_journal(&service, account, "group.a", Some("group.a"), &swap_id),
+                fake_store::Record::item(&service, &replace_parked_account(&swap_id), "group.a"),
+                fake_store::Record::item(&service, account, "group.b"),
+            ],
+        );
+        let keychain = Keychain {
+            backend: KeychainBackend::DataProtection,
+        };
+        let secret = SecretBytes::try_from_bytes(vec![0xA5u8; 24]).unwrap();
+        let query = KeychainItemQuery::new(&service, account).unwrap();
+        let error = keychain
+            .add_item(&synthetic_context(), &query, &secret)
+            .expect_err("two recovered-era credentials are ambiguous");
+        assert_eq!(error.code(), "credential_lease_keychain_item_ambiguous");
+        // The restore ran inside the claim — the recovered original is
+        // back at the identity in its own group — but neither record is
+        // touched, and the journals the claim spent are gone.
+        let records = fake_store::records();
+        assert_eq!(records.len(), 2);
+        assert!(records
+            .iter()
+            .all(|record| { record.service == service && record.account == account }));
+    }
+
+    #[test]
+    fn an_add_reports_duplicate_for_the_recovered_record_alone() {
+        // The same recovery with no foreign record: the restored
+        // original is the identity's only occupant, so the unscoped add
+        // answers `Duplicate` — the recovered-occupies verdict the
+        // append-only contract relies on, reached only after the
+        // enumeration proved the identity unambiguous.
+        let service = format!("synthetic-service-{}", Uuid::new_v4());
+        let account = "synthetic-account";
+        let swap_id = Uuid::new_v4();
+        let _store = fake_store::install(
+            "synthetic.default.group",
+            vec![
+                released_journal(&service, account, "group.a", Some("group.a"), &swap_id),
+                fake_store::Record::item(&service, &replace_parked_account(&swap_id), "group.a"),
+            ],
+        );
+        let keychain = Keychain {
+            backend: KeychainBackend::DataProtection,
+        };
+        let secret = SecretBytes::try_from_bytes(vec![0xA5u8; 24]).unwrap();
+        let query = KeychainItemQuery::new(&service, account).unwrap();
+        assert_eq!(
+            keychain
+                .add_item(&synthetic_context(), &query, &secret)
+                .expect("the recovered record is the collision"),
+            AddItemOutcome::Duplicate
+        );
+        // The restored record alone remains — the journals were spent.
+        let records = fake_store::records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].account, account);
+        assert_eq!(records[0].access_group, "group.a");
     }
 
     #[test]
