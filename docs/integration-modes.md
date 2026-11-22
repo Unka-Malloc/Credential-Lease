@@ -6,9 +6,14 @@ Embed `credential-lease` directly in-process as the contract layer (handoff docu
 
 ```toml
 [dependencies]
-credential-lease = "0.3"
-credential-lease-keychain = "0.1" # OS-keychain custody backend
+credential-lease = { git = "https://github.com/Unka-Malloc/Credential-Lease", rev = "eaf0417649aa492f90aab25cff5d1404138f0dbf", version = "0.3" }
+credential-lease-keychain = { git = "https://github.com/Unka-Malloc/Credential-Lease", rev = "eaf0417649aa492f90aab25cff5d1404138f0dbf", version = "0.1" } # OS-keychain custody backend
 ```
+
+The published crates.io releases predate the documented handoff contract
+(`EgressScope`, the Unix descriptor intake, and `leaseExpiresAtEpochSeconds`),
+so the example pins the reviewed workspace revision instead of a registry
+version.
 
 Construct credentials with SecretBytes and LeasedCredential::new, validate a
 CredentialHandoff::new, and rebuild the receiving lease with

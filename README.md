@@ -20,9 +20,14 @@ Following the IAM session-credential model:
 
 ```toml
 [dependencies]
-credential-lease = "0.3"
-credential-lease-keychain = "0.1"
+credential-lease = { git = "https://github.com/Unka-Malloc/Credential-Lease", rev = "eaf0417649aa492f90aab25cff5d1404138f0dbf", version = "0.3" }
+credential-lease-keychain = { git = "https://github.com/Unka-Malloc/Credential-Lease", rev = "eaf0417649aa492f90aab25cff5d1404138f0dbf", version = "0.1" }
 ```
+
+The published crates.io releases predate the documented handoff contract
+(`EgressScope`, the Unix descriptor intake, and `leaseExpiresAtEpochSeconds`),
+so the example pins the reviewed workspace revision instead of a registry
+version.
 
 Given a decoded `CredentialHandoff<K>`, a host-provided `Arc<dyn LeaseEpochSource>`, and a requested credential kind, the runtime rebuilds the lease and resolves the credential.
 
