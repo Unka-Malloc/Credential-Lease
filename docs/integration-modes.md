@@ -1,11 +1,6 @@
 # Integration modes
 
-One way to consume this workspace: **SDK — embed the crates**. The
-`credential-lease` crate is a contract layer — handoff document,
-process-bound lease, epoch revocation signal, custody port — not a daemon,
-so there is no sidecar to run. The `credential-lease-keychain` crate is the
-workspace's OS-keychain custody backend; a host that keeps secrets in the
-system keyring embeds it as well.
+Embed `credential-lease` directly in-process as the contract layer (handoff documents, process-bound leases, epoch revocation signals, and `CustodyPort`), alongside `credential-lease-keychain` when backing secrets with the OS keyring.
 
 ## SDK — embed the crate
 
@@ -28,10 +23,7 @@ Boundary rules the consumer relies on:
   fail-closed, elsewhere). Item values cross its API only as `SecretBytes`;
   copied items expose a typed provenance projection, never the raw platform
   dictionary.
-- **Owner authorization stays with the host** — prompts, sessions and
-  revocation never enter this workspace; the backend only consumes an
-  already-authorized `KeychainAuthContext`. The `credential-lease` contract
-  crate itself performs no custody.
+- **Host-driven owner authorization** — prompts, sessions, and revocation stay in the host; `credential-lease-keychain` consumes an already-authorized `KeychainAuthContext`.
 - **Secret bytes serialize only in `HandoffDocument`** — the secret-bearing
   document travels only through a process-local channel, never disks, logs or
   configuration. Inventories, debug projections and error output contain no

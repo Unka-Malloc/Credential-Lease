@@ -1,55 +1,51 @@
 # Credential-Lease
 
-Host-neutral credential lease contract: custody holds root credentials;
-runtimes receive process-bound, revocable, time-limited leases.
+Host-neutral Rust contract and OS keychain custody backend for issuing process-bound, time-limited, revocable credential leases. Each lease carries only the credential material the host authorizes for that runtime.
 
-The crate owns its SecretBytes boundary type and depends on no product framework.
-Hosts supply credential-kind families, custody authorization and revocation sources;
-the runtime receives only authorized ephemeral lease material.
+Following the IAM session-credential model:
 
-The model follows the IAM session-credential shape rather than "give the
-application the key":
-
-- **Custody** (system keyring, persistence) lives in the
-  `credential-lease-keychain` backend, never in the contract crate; **owner
-  authorization** (prompts, sessions, revocation) stays with the host.
-- A **`CredentialHandoff`** — a closed JSON document — carries credential
-  material from the unlocking process to one runtime over a process-local
-  channel, together with the owner-declared **`EgressScope`**: the
-  parameterized host/port/path/method matchers, header injection
-  templates and fail-closed `allow_redirects` flag an outbound proxy
-  enforces per target.
-- The runtime rebuilds a **`CredentialLease`**: process-bound, time-limited,
-  and revoked the moment the custody epoch rotates.
-- Secret bytes never appear in inventories, configuration documents, debug
-  projections, or command results.
-
-What is leased is parameterized by `CredentialKind`: provider API keys are
-the first family; signed identity assertions are the designed-for next
-family. Each family pins its own handoff schema so documents can never
-cross families.
+- **Custody and authorization.** `credential-lease-keychain` reads protected items from the OS keychain using a host-authorized `KeychainAuthContext`. Owner prompts, sessions, and revocation belong to the host.
+- **Process-local handoff.** A closed JSON handoff passes credential material and owner-declared `EgressScope` rules over a process-local channel. On Unix, `FAIRLINY_HANDOFF_FD` carries the number of an inherited read-only descriptor. The outbound proxy enforces the scope's host, port, path prefix, and method matchers, applies header templates, and denies redirects by default.
+- **Process-bound leases.** The receiving process rebuilds a `CredentialLease` bound to its PID, deadlines, and custody epoch. Each resolution checks the host's active epoch, so rotating it invalidates leases issued under the previous epoch.
+- **Secret handling.** The handoff document is the only serialized form that carries credential bytes. Configs, inventories, debug formatting, and error output omit them. Each `CredentialKind` defines its own handoff schema.
 
 ## Crates
 
 | Crate | Contents |
 | --- | --- |
-| `credential-lease` | `SecretBytes`, `LeasedCredential`, `CredentialHandoff<K>`, `EgressScope`/`EgressTarget`/`HeaderTemplate`, `CredentialLease<K>`, `CredentialSlot<K>`, `LeaseEpochSource`, `CustodyPort` registry |
-| `credential-lease-keychain` | OS-keychain custody backend: protected SecItem operations on macOS (`Keychain`, `KeychainItemQuery`, `KeychainAuthContext`, `KeychainItem` with its typed `KeychainItemProvenance`), fail-closed `None` elsewhere |
+| `credential-lease` | `SecretBytes`, `LeasedCredential`, `CredentialHandoff<K>`, `EgressScope`/`EgressTarget`/`HeaderTemplate`, `CredentialLease<K>`, `CredentialSlot<K>`, `LeaseEpochSource`, and `CustodyPort` |
+| `credential-lease-keychain` | OS-keychain custody backend (`Keychain`, `KeychainItemQuery`, `KeychainAuthContext`, `KeychainItem`, `KeychainItemProvenance`). Uses macOS Keychain and fails closed on unsupported platforms. |
 
-## Language-neutral contract
+## Quick Usage
 
-The handoff document is specified in [docs/handoff.md](docs/handoff.md).
-Rust consumers link the crate; Go, TypeScript, and other consumers
-implement the contract against that document. The inherited-descriptor
-transport (`FAIRLINY_HANDOFF_FD`) and the shared Rust, Go, and TypeScript
-validation samples are specified in [docs/fd-handoff.md](docs/fd-handoff.md).
+```toml
+[dependencies]
+credential-lease = "0.3"
+credential-lease-keychain = "0.1"
+```
+
+Given a decoded `CredentialHandoff<K>`, a host-provided `Arc<dyn LeaseEpochSource>`, and a requested credential kind, the runtime rebuilds the lease and resolves the credential.
+
+```rust
+use credential_lease::CredentialLease;
+
+let lease = CredentialLease::from_handoff(handoff, epoch_source)?;
+let resolved = lease.resolve(kind)?;
+```
+
+See [crates/credential-lease/tests/handoff_flow.rs](crates/credential-lease/tests/handoff_flow.rs) for the complete end-to-end flow.
+
+## Cross-Language Contract
+
+Non-Rust hosts (Go, TypeScript) interoperate against the exact wire contract and descriptor protocol:
+
+- [docs/handoff.md](docs/handoff.md) — `CredentialHandoff` closed JSON schema and monotonic clock rules.
+- [docs/fd-handoff.md](docs/fd-handoff.md) — `FAIRLINY_HANDOFF_FD` descriptor handoff rules and Rust/Go/TypeScript samples.
+- [docs/integration-modes.md](docs/integration-modes.md) — embedding guide and boundary guarantees.
 
 ## Verify
 
-Requires Rust 1.89 or newer (the workspace `rust-version`) and `jq`,
-which `scripts/verify-samples.sh` uses to decode Cargo's JSON build
-report when locating the compiled sample executable. Go and Node.js are
-optional — the sample checks skip a language whose toolchain is absent.
+Requires Rust 1.89+ and `jq` (Go and Node.js are optional; `scripts/verify-samples.sh` skips missing toolchains):
 
 ```sh
 ./scripts/verify.sh
@@ -57,4 +53,4 @@ optional — the sample checks skip a language whose toolchain is absent.
 
 ## License
 
-Apache-2.0
+Apache-2.0.
