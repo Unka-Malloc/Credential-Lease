@@ -194,11 +194,26 @@ fn with_keychain_backend<T>(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The status the next `keychain_effect` reports in place of the
+    /// platform's — tests inject Keychain failures through it. Armed
+    /// per thread, only where a test sets it.
+    static INJECTED_KEYCHAIN_STATUS: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn keychain_effect(
     backend: KeychainBackend,
     effect: impl FnOnce() -> i32,
 ) -> Result<i32, KeychainError> {
-    with_keychain_backend(backend, || keychain_effect_status(backend, effect()))
+    with_keychain_backend(backend, || {
+        #[cfg(test)]
+        if let Some(status) = INJECTED_KEYCHAIN_STATUS.with(std::cell::Cell::get) {
+            return keychain_effect_status(backend, status);
+        }
+        keychain_effect_status(backend, effect())
+    })
 }
 
 fn keychain_effect_status(backend: KeychainBackend, status: i32) -> Result<i32, KeychainError> {
@@ -908,6 +923,7 @@ impl Keychain {
             // meant — but that comparison applies only once a parked
             // record is proven to exist: a claim that never parked
             // anything records no group to compare against.
+            claim.ensure_owned()?;
             match with_keychain_backend(store, || {
                 find_parked_record(
                     query.service,
@@ -938,6 +954,7 @@ impl Keychain {
                         context,
                         store,
                     ));
+                    claim.ensure_owned()?;
                     delete_pinned(&pinned, store)?;
                 }
             }
@@ -2099,10 +2116,13 @@ struct SwapStateValue {
     service: String,
     /// The account the swapped item lives under.
     account: String,
-    /// The access group the parked original was parked in — `None` for
-    /// an ungrouped record. Recorded at swap time so a later call
-    /// resolves the interruption by the swap's own scope, never by
-    /// whatever record the identity happens to hold then.
+    /// The access group the parked original was parked in — or, before
+    /// a swap learns it, the claim's own effective scope: the group the
+    /// claiming caller declared, `None` for an unscoped claim. Recorded
+    /// from the claim's first write so a later call resolves the
+    /// interruption by the operation's own scope, never by an
+    /// every-group lookup nor by whatever record the identity happens
+    /// to hold then.
     parked_group: Option<String>,
     /// The process that recorded the swap: recovery resolves the swap
     /// only when this owner is provably gone, so a live writer's journal
@@ -2227,7 +2247,8 @@ fn decode_swap_state(value: &[u8]) -> Option<SwapStateValue> {
 /// reference, the swap's identifier, the recording process's provable
 /// identity, whether the writer marked the record released, the lease
 /// path the recording call provably holds while it runs, and the
-/// access group the swap recorded for the parked original.
+/// access group the claim recorded — its effective scope until a swap
+/// parks the original and records that record's actual group.
 #[derive(Debug)]
 struct SwapState {
     reference: CFData,
@@ -2246,10 +2267,14 @@ struct SwapState {
 /// carries no access group: the journal is a single slot for the
 /// identity, so a caller scoped to one group can never hold a second
 /// journal while another caller mutates a different group's record.
-/// The parked original's group is recorded later, on the journal
-/// itself, once a swap knows it — `SwapClaim::set_parked_group`. The
-/// record is never synchronizable and is pinned for its owner's
-/// cleanup through `kSecReturnPersistentRef`.
+/// The value records the claim's own effective scope — the access
+/// group the caller declared — from its first write, so a claim
+/// abandoned before it could park still resolves by its own group
+/// instead of an every-group lookup; the parked original's actual
+/// group replaces it once a swap knows it —
+/// `SwapClaim::set_parked_group`. The record is never synchronizable
+/// and is pinned for its owner's cleanup through
+/// `kSecReturnPersistentRef`.
 fn swap_state_pairs(
     query: &KeychainItemQuery<'_>,
     swap_id: &Uuid,
@@ -2292,7 +2317,7 @@ fn swap_state_pairs(
         CFData::from_buffer(&encode_swap_state(
             query.service,
             query.account,
-            None,
+            query.access_group,
             owner,
             swap_id,
             false,
@@ -2435,11 +2460,15 @@ fn find_swap_states(
 /// record. Every swap-scoped lookup rides this scope, so an unscoped
 /// retry always resolves the records the swap itself placed in the
 /// group the swap put them in, not whichever group the identity happens
-/// to hold a record in.
+/// to hold a record in. The optional `marker` narrows the match to the
+/// swap's own `kSecAttrGeneric`-marked replacement: one swap places at
+/// most one marked record, so the narrowed lookup can never turn
+/// ambiguous on unrelated records other groups may hold.
 fn swap_scoped_lookup_pairs(
     service: &str,
     account: &str,
     group: Option<&str>,
+    marker: Option<&[u8]>,
     context: &KeychainAuthContext,
     store: KeychainBackend,
 ) -> Vec<(CFString, CFType)> {
@@ -2461,6 +2490,12 @@ fn swap_scoped_lookup_pairs(
         pairs.push((
             security_framework_static!(kSecAttrAccessGroup, sec_key),
             CFString::from(group).into_CFType(),
+        ));
+    }
+    if let Some(marker) = marker {
+        pairs.push((
+            security_framework_static!(kSecAttrGeneric, sec_key),
+            CFData::from_buffer(marker).into_CFType(),
         ));
     }
     pairs.push((
@@ -2495,6 +2530,7 @@ fn find_parked_record(
         service,
         &replace_parked_account(swap_id),
         parked_group,
+        None,
         context,
         store,
     );
@@ -2506,17 +2542,27 @@ fn find_parked_record(
 /// enumeration scope. A record sharing the service and account in a
 /// different group is not this swap's identity, so the verdict — and a
 /// rollback's pinned delete — sees exactly the record the swap's own
-/// add could have placed there.
+/// add could have placed there. While the original is parked the
+/// unfiltered lookup decides between restore, rollback, and a
+/// competing writer; with the parked original gone the only record the
+/// swap can still own at the identity is its own marked replacement,
+/// so the lookup is narrowed by that marker instead — a journal that
+/// never parked spends itself without an every-group identity read,
+/// and a foreign record holding the identity is left alone instead of
+/// contesting a spent claim into a permanent refusal.
 fn find_swap_identity(
     query: &KeychainItemQuery<'_>,
     state: &SwapState,
+    parked: &ItemMatch,
     context: &KeychainAuthContext,
     store: KeychainBackend,
 ) -> Result<ItemMatch, KeychainError> {
+    let marker = matches!(parked, ItemMatch::Absent).then(|| swap_marker(&state.swap_id));
     let pairs = swap_scoped_lookup_pairs(
         query.service,
         query.account,
         state.parked_group.as_deref(),
+        marker.as_deref(),
         context,
         store,
     );
@@ -2681,9 +2727,16 @@ fn restore_parked(
 fn resolve_recorded_swap(
     query: &KeychainItemQuery<'_>,
     state: &SwapState,
+    claim: &mut SwapClaim,
     context: &KeychainAuthContext,
     store: KeychainBackend,
 ) -> Result<SwapResolution, KeychainError> {
+    // The takeover proved ownership once; it is re-proven before the
+    // swap's records are inspected and again before each mutation, so
+    // a competing takeover that landed meanwhile — or a journal that
+    // was resolved and spent — ends this resolution instead of letting
+    // stale reads and writes land on records a new owner controls.
+    claim.ensure_owned()?;
     let parked_match = with_keychain_backend(store, || {
         find_parked_record(
             query.service,
@@ -2693,12 +2746,13 @@ fn resolve_recorded_swap(
             store,
         )
     })?;
-    let identity =
-        match with_keychain_backend(store, || find_swap_identity(query, state, context, store))? {
-            ItemMatch::Absent => None,
-            ItemMatch::Ambiguous => return Err(item_ambiguous()),
-            ItemMatch::One(item) => Some(item),
-        };
+    let identity = match with_keychain_backend(store, || {
+        find_swap_identity(query, state, &parked_match, context, store)
+    })? {
+        ItemMatch::Absent => None,
+        ItemMatch::Ambiguous => return Err(item_ambiguous()),
+        ItemMatch::One(item) => Some(item),
+    };
     let occupied = || SwapResolution::Occupied(state.parked_group.clone());
     let verdict = swap_verdict(state, &parked_match, identity.as_ref())?;
     match verdict {
@@ -2716,6 +2770,7 @@ fn resolve_recorded_swap(
                 context,
                 store,
             ));
+            claim.ensure_owned()?;
             let restore_status = restore_parked(&pinned, query.account, store)?;
             if restore_status == errSecDuplicateItem {
                 // A record claimed the identity between the enumeration
@@ -2738,6 +2793,7 @@ fn resolve_recorded_swap(
                 context,
                 store,
             ));
+            claim.ensure_owned()?;
             delete_pinned(&pinned, store)?;
             Ok(occupied())
         }
@@ -2756,6 +2812,7 @@ fn resolve_recorded_swap(
             };
             let identity_pinned =
                 CFDictionary::from_CFType_pairs(&pinned_pairs(identity, context, store));
+            claim.ensure_owned()?;
             delete_pinned(&identity_pinned, store)?;
             let pinned = CFDictionary::from_CFType_pairs(&pinned_pairs(
                 parked.reference.as_ref().expect("a pinnable parked record"),
@@ -2830,9 +2887,9 @@ struct SwapClaim {
     /// is marked released.
     service: String,
     account: String,
-    /// The access group the journal currently records for the parked
-    /// record — fixed up to the matched record's group before a swap
-    /// parks it.
+    /// The access group the journal currently records — the caller's
+    /// declared scope while nothing is parked, fixed up to the matched
+    /// record's actual group before a swap parks it.
     parked_group: Option<String>,
     /// This process's provable owner identity, as the journal recorded.
     owner: SwapOwner,
@@ -2916,8 +2973,9 @@ impl SwapClaim {
     }
 
     /// Record the parked original's actual group on the journal before
-    /// the swap renames the record — the claim was taken before the
-    /// matched item's group was known.
+    /// the swap renames the record — an unscoped claim learns it only
+    /// once the match is known, while a scoped one already recorded its
+    /// declared group at creation.
     fn set_parked_group(&mut self, parked_group: Option<String>) -> Result<(), KeychainError> {
         let previous = std::mem::replace(&mut self.parked_group, parked_group);
         if let Err(error) = self.write_state(false) {
@@ -2925,6 +2983,38 @@ impl SwapClaim {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Re-prove this claim still owns the journal — the same pinned
+    /// read-back the takeover ran, repeated before a recovery inspects
+    /// or mutates the swap's records: a competing takeover that landed
+    /// after this one, or a journal that was resolved and spent, ends
+    /// this operation's work instead of letting stale reads and
+    /// deletions land on records a new owner now controls. A lost
+    /// journal is not this claim's to mark: the claim is finished
+    /// without a write, so its drop can never stamp `released` over
+    /// another owner's live record.
+    fn ensure_owned(&mut self) -> Result<(), KeychainError> {
+        let Some(reference) = self.reference.as_ref() else {
+            return Ok(());
+        };
+        let mut read_pairs = pinned_pairs(reference, &self.context, self.store);
+        read_pairs.push((
+            security_framework_static!(kSecReturnData, sec_key),
+            CFBoolean::from(true).into_CFType(),
+        ));
+        let owned = copy_matching(&read_pairs, self.store)?
+            .and_then(|value| value.downcast::<CFData>())
+            .and_then(|data| decode_swap_state(data.bytes()))
+            .is_some_and(|decoded| {
+                decoded.owner == self.owner && decoded.swap_id == self.swap_id && !decoded.released
+            });
+        if owned {
+            Ok(())
+        } else {
+            self.finished = true;
+            Err(swap_active())
+        }
     }
 
     /// Spend the claim: the journal record is removed, so the identity
@@ -3050,7 +3140,7 @@ fn claim_identity(
                     store,
                     service: query.service.to_owned(),
                     account: query.account.to_owned(),
-                    parked_group: None,
+                    parked_group: query.access_group.map(str::to_owned),
                     owner,
                     finished: false,
                     recovered_group: None,
@@ -3157,7 +3247,7 @@ fn claim_identity(
             _lease: lease,
         };
         if let ClaimMode::Resolve = mode {
-            match resolve_recorded_swap(query, &state, context, store)? {
+            match resolve_recorded_swap(query, &state, &mut claim, context, store)? {
                 SwapResolution::Cleared => {}
                 SwapResolution::Occupied(group) => claim.recovered_group = Some(group),
                 // The identity is contested and the journal must stay:
@@ -4281,6 +4371,7 @@ mod tests {
             "synthetic-service",
             "synthetic-account",
             state.parked_group.as_deref(),
+            None,
             &context,
             KeychainBackend::DataProtection,
         ));
@@ -4295,15 +4386,36 @@ mod tests {
             dict_value(&dict, unsafe { kSecAttrSynchronizable }).map(|value| value.as_CFTypeRef()),
             Some(CFBoolean::from(false).as_CFTypeRef())
         );
+        assert!(dict_value(&dict, unsafe { kSecAttrGeneric }).is_none());
         // An ungrouped recorded scope carries no group selector at all.
         let ungrouped = CFDictionary::from_CFType_pairs(&swap_scoped_lookup_pairs(
             "synthetic-service",
             "synthetic-account",
             None,
+            None,
             &context,
             KeychainBackend::DataProtection,
         ));
         assert!(dict_value(&ungrouped, unsafe { kSecAttrAccessGroup }).is_none());
+        // The marker-scoped lookup — how a resolution with no parked
+        // original finds the swap's own replacement — carries the
+        // swap's durable marker in `kSecAttrGeneric`, so unrelated
+        // records sharing the identity can never match.
+        let marked = CFDictionary::from_CFType_pairs(&swap_scoped_lookup_pairs(
+            "synthetic-service",
+            "synthetic-account",
+            None,
+            Some(&swap_marker(&state.swap_id)),
+            &context,
+            KeychainBackend::DataProtection,
+        ));
+        assert_eq!(
+            dict_value(&marked, unsafe { kSecAttrGeneric })
+                .and_then(|value| value.downcast::<CFData>())
+                .map(|value| value.bytes().to_vec())
+                .as_deref(),
+            Some(swap_marker(&state.swap_id).as_slice())
+        );
     }
 
     #[test]
@@ -4467,9 +4579,11 @@ mod tests {
         // The record carries no access group on purpose — the journal
         // is one slot for the identity, so no caller's declared scope
         // can split the coordination slot into per-group journals a
-        // parallel mutation could hold at once. The parked original's
-        // group is recorded only once a swap knows it, on the journal
-        // itself.
+        // parallel mutation could hold at once. The value still records
+        // the claim's effective scope — the declared group — so a claim
+        // abandoned before it could park resolves by its own group, and
+        // the parked original's actual group replaces it once a swap
+        // knows it.
         let context = synthetic_context();
         let swap_id = Uuid::new_v4();
         let owner = SwapOwner {
@@ -4515,7 +4629,7 @@ mod tests {
                 .and_then(|value| value.downcast::<CFData>())
                 .unwrap();
             let decoded = decode_swap_state(state_value.bytes()).unwrap();
-            assert_eq!(decoded.parked_group, None);
+            assert_eq!(decoded.parked_group, query.access_group.map(str::to_owned));
             assert_eq!(decoded.owner, owner);
             assert_eq!(decoded.swap_id, swap_id);
             // The state record itself is pinnable for cleanup.
@@ -4757,6 +4871,109 @@ mod tests {
         holder.kill().unwrap();
         holder.wait().unwrap();
         assert!(!swap_owner_active(&leased()));
+    }
+
+    #[test]
+    fn a_failed_release_still_ends_operation_ownership() {
+        // The Keychain refuses both the journal's deletion and the
+        // released flag's write: the finished call's claim reports the
+        // failure, yet the journal its record leaves behind — owner
+        // live, never marked — still stops reading as owned the moment
+        // the call ends, because the recorded lease descriptor closed
+        // with it. A stranded claim is therefore recoverable by the
+        // next caller instead of blocking recovery until the process
+        // exits. The same holds for a claim dropped without release:
+        // its lost released-mark write changes nothing.
+        let journal_state = |owner: SwapOwner, swap_id: Uuid, lease_path: String| SwapState {
+            reference: CFData::from_buffer(&[0xF2u8; 16]),
+            swap_id,
+            owner,
+            released: false,
+            parked_group: None,
+            lease_path: Some(lease_path),
+        };
+        let stranded_claim = |swap_id: Uuid| {
+            let active = ActiveSwap::claim(swap_id).unwrap();
+            let lease = ClaimLease::acquire(&swap_id).unwrap();
+            SwapClaim {
+                swap_id,
+                reference: Some(CFData::from_buffer(&[0xF2u8; 16])),
+                context: synthetic_context(),
+                store: KeychainBackend::DataProtection,
+                service: "synthetic-service".to_owned(),
+                account: "synthetic-account".to_owned(),
+                parked_group: None,
+                owner: swap_owner().unwrap(),
+                finished: false,
+                recovered_group: None,
+                pending_cleanup: false,
+                lease_path: Some(lease.path.clone()),
+                _active: Some(active),
+                _lease: Some(lease),
+            }
+        };
+        INJECTED_KEYCHAIN_STATUS.with(|cell| cell.set(Some(errSecUnimplemented)));
+        let swap_id = Uuid::new_v4();
+        let owner;
+        let lease_path;
+        {
+            let mut claim = stranded_claim(swap_id);
+            owner = claim.owner;
+            lease_path = claim.lease_path.clone().unwrap();
+            // The deletion fails and the released flag cannot land
+            // either: the call reports the cleanup failure and finishes
+            // anyway. The claim's drop then ends the operation — the
+            // identifier leaves the registry and the lease closes.
+            assert!(claim.release().is_err());
+            assert!(claim.finished);
+        }
+        // A second stranded claim exercises the drop path: its released
+        // mark is lost to the same injected outage.
+        let dropped_id = Uuid::new_v4();
+        let dropped_owner;
+        let dropped_lease_path;
+        {
+            let dropped = stranded_claim(dropped_id);
+            dropped_owner = dropped.owner;
+            dropped_lease_path = dropped.lease_path.clone().unwrap();
+        }
+        INJECTED_KEYCHAIN_STATUS.with(|cell| cell.set(None));
+        // Both journals the store still holds read live-owned on their
+        // face — a live owner, never marked released — but the calls
+        // that owned them have ended, so the recorded lease paths no
+        // longer resolve to an open descriptor.
+        assert!(!swap_owner_active(&journal_state(
+            owner, swap_id, lease_path
+        )));
+        assert!(!swap_owner_active(&journal_state(
+            dropped_owner,
+            dropped_id,
+            dropped_lease_path.clone()
+        )));
+        // The same stranded record under a foreign owner resolves by
+        // the recorded lease alone: the process still runs, yet the
+        // call that ended no longer holds the descriptor.
+        let mut foreign = std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (sec, usec) = process_start(foreign.id()).unwrap();
+        let foreign_owner = SwapOwner {
+            pid: foreign.id(),
+            start_sec: sec,
+            start_usec: usec,
+        };
+        assert_eq!(
+            owner_holds_lease(foreign.id(), &dropped_lease_path),
+            Some(false)
+        );
+        assert!(!swap_owner_active(&journal_state(
+            foreign_owner,
+            dropped_id,
+            dropped_lease_path
+        )));
+        foreign.kill().unwrap();
+        foreign.wait().unwrap();
     }
 
     #[test]
