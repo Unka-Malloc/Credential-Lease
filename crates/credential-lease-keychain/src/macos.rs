@@ -25,7 +25,7 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::collections::BTreeSet;
 use std::ffi::{c_void, CStr};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::ptr;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -755,6 +755,14 @@ impl Keychain {
     /// any group — the add reports `Duplicate` instead of minting a
     /// second record beside the recovered one.
     ///
+    /// The identity is then enumerated under the claim, so the slot the
+    /// claim covers is provably the group the write lands in: an
+    /// existing record — wherever it sits — is the append-only
+    /// contract's collision and reports `Duplicate` before any write,
+    /// rather than an unscoped add writing a second record into the
+    /// caller's default group beside a match it never scoped to. More
+    /// than one match refuses `credential_lease_keychain_item_ambiguous`.
+    ///
     /// A query declaring `synchronizable` or routing to the classic store
     /// is refused before any SecItem call, for the same reason
     /// [`Keychain::set_item`] refuses them; so is a query naming the
@@ -792,6 +800,35 @@ impl Keychain {
         {
             let _ = claim.release();
             return Ok(AddItemOutcome::Duplicate);
+        }
+        // The identity is enumerated under the claim, for the same
+        // reason the delete enumerates under its own: the slot the
+        // claim covers is the group the matched record sits in, so the
+        // write can never land where the claim did not look. An
+        // unscoped add whose only match lives in a non-default access
+        // group claimed that group's slot — the existing record is the
+        // append-only contract's collision, reported `Duplicate` before
+        // any write rather than a second record minted into the
+        // caller's default group beside it. More than one match refuses
+        // ambiguous for the same reason a delete does.
+        let matched =
+            match with_keychain_backend(store, || find_matching_item(&query_pairs, store, true))? {
+                ItemMatch::Absent => None,
+                ItemMatch::Ambiguous => {
+                    claim.abandon();
+                    return Err(item_ambiguous());
+                }
+                ItemMatch::One(item) => Some(item),
+            };
+        if let Some(item) = matched.as_ref() {
+            // The claim must cover the slot the matched record sits in —
+            // the same coverage the write side requires.
+            if claim.for_slot(item.access_group.as_deref()).is_none() {
+                claim.abandon();
+                return Err(item_ambiguous());
+            }
+            let released = claim.release();
+            return released.map(|_| AddItemOutcome::Duplicate);
         }
         let mut pairs = query_pairs;
         pairs.extend(protected_secret_pairs(secret.expose_bytes())?);
@@ -903,12 +940,16 @@ impl Keychain {
     /// record the identity provably holds at that moment, never a
     /// snapshot another operation could have superseded while the
     /// delete looked away. An abandoned journal the claim took over
-    /// keeps its parked original under the same claim: the parked
-    /// record is removed only once it is proven to exist, and only
-    /// then does the recorded group's comparison apply — a journal
-    /// that never parked anything, like one an interrupted add left,
-    /// cannot wedge a scoped delete on a group it never recorded. A
-    /// swap a live writer still owns refuses the delete with
+    /// keeps its parked original under the same claim, and every
+    /// candidate is resolved and proven before the first deletion: the
+    /// visible record plus each taken-over swap's parked original must
+    /// together name one credential — one access group — or the delete
+    /// refuses `credential_lease_keychain_item_ambiguous` and leaves
+    /// every journal released for the caller that can address each
+    /// credential. A journal that never parked anything, like one an
+    /// interrupted add left, cannot wedge a scoped delete on a group it
+    /// never recorded. A swap a live writer still owns refuses the
+    /// delete with
     /// `credential_lease_keychain_swap_active` rather than racing it,
     /// and a delete scoped to synchronizable items never resolves the
     /// swap at all: the journal and the parked original are device-only
@@ -939,29 +980,35 @@ impl Keychain {
             }
             ItemMatch::One(item) => Some(item),
         };
+        // Every candidate the delete may remove is resolved and proven
+        // before the first deletion: the visible record plus each
+        // taken-over swap's parked original. Only once the whole
+        // candidate set is known does any record go — and when the set
+        // spans more than one credential — records in different access
+        // groups — the delete refuses ambiguous rather than erasing
+        // credentials the lookup never showed the caller.
         let mut bail = None;
-        for slot in &mut claim.claims {
+        let mut parked: Vec<(usize, MatchedItem)> = Vec::new();
+        for (index, slot) in claim.claims.iter_mut().enumerate() {
             if !slot.pending_cleanup {
                 continue;
             }
-            // The taken-over swap may still own a parked original — but
-            // only a delete whose declared scope can reach that record
-            // may touch it: a scoped delete addresses no credential in
-            // another group, so the journal is kept released for a
-            // caller that can address it instead of being spent over a
-            // parked record this delete must not erase.
-            if query.access_group.is_some() && query.access_group != slot.parked_group.as_deref() {
-                slot.preserve();
-                continue;
-            }
-            // An unscoped delete that matched a record in a different
-            // group than the swap parked cannot tell which item the
-            // caller meant — but that comparison applies only once a
-            // parked record is proven to exist: a claim that never
-            // parked anything records no group to compare against.
             bail = (|| -> Result<(), KeychainError> {
+                // The taken-over swap may still own a parked original —
+                // but only a delete whose declared scope can reach that
+                // record may touch it: a scoped delete addresses no
+                // credential in another group, so the journal is kept
+                // released for a caller that can address it instead of
+                // being spent over a parked record this delete must not
+                // erase.
+                if query.access_group.is_some()
+                    && query.access_group != slot.parked_group.as_deref()
+                {
+                    slot.preserve();
+                    return Ok(());
+                }
                 slot.ensure_owned()?;
-                let parked = match with_keychain_backend(store, || {
+                let record = match with_keychain_backend(store, || {
                     find_parked_record(
                         query.service,
                         &slot.swap_id,
@@ -970,34 +1017,62 @@ impl Keychain {
                         store,
                     )
                 })? {
+                    // A claim that never parked anything holds no group
+                    // to compare and no record to remove: its journal is
+                    // simply spent when the delete releases.
                     ItemMatch::Absent => {
                         slot.pending_cleanup = false;
                         return Ok(());
                     }
                     ItemMatch::Ambiguous => return Err(item_ambiguous()),
-                    ItemMatch::One(parked) => parked,
+                    ItemMatch::One(record) => record,
                 };
-                if parked.protected || parked.reference.is_none() {
+                if record.protected || record.reference.is_none() {
                     return Err(data_invalid());
                 }
-                if let Some(item) = item.as_ref() {
-                    if item.access_group.as_deref() != slot.parked_group.as_deref() {
-                        return Err(item_ambiguous());
-                    }
+                if query.access_group.is_some()
+                    && query.access_group != record.access_group.as_deref()
+                {
+                    slot.preserve();
+                    return Ok(());
                 }
-                let pinned = CFDictionary::from_CFType_pairs(&pinned_pairs(
-                    parked.reference.as_ref().expect("a pinnable parked record"),
-                    context,
-                    store,
-                ));
-                slot.ensure_owned()?;
-                delete_pinned(&pinned, store)?;
-                slot.pending_cleanup = false;
+                parked.push((index, record));
                 Ok(())
             })()
             .err();
             if bail.is_some() {
                 break;
+            }
+        }
+        // The candidate set is complete: it must name one credential —
+        // one access group. A visible record plus parked originals, or
+        // parked originals alone, that sit in different groups are
+        // several credentials an unscoped query cannot choose between;
+        // their journals stay released for the caller that can address
+        // each one.
+        if bail.is_none()
+            && delete_candidates_ambiguous(item.as_ref(), parked.iter().map(|(_, record)| record))
+        {
+            bail = Some(item_ambiguous());
+        }
+        if bail.is_none() {
+            for (index, record) in &parked {
+                bail = (|| -> Result<(), KeychainError> {
+                    let slot = &mut claim.claims[*index];
+                    slot.ensure_owned()?;
+                    let pinned = CFDictionary::from_CFType_pairs(&pinned_pairs(
+                        record.reference.as_ref().expect("a pinnable parked record"),
+                        context,
+                        store,
+                    ));
+                    delete_pinned(&pinned, store)?;
+                    slot.pending_cleanup = false;
+                    Ok(())
+                })()
+                .err();
+                if bail.is_some() {
+                    break;
+                }
             }
         }
         if let Some(error) = bail {
@@ -1831,6 +1906,24 @@ fn attribute_scoped_delete_pairs(
     pairs
 }
 
+/// Whether the resolved delete candidates — the visible record and
+/// every proven parked original — span more than one credential: more
+/// than one access group. It runs only once the whole candidate set is
+/// resolved, so a `true` verdict arrives before the first deletion
+/// rather than after the first parked record is already gone.
+fn delete_candidates_ambiguous<'a>(
+    visible: Option<&'a MatchedItem>,
+    parked: impl IntoIterator<Item = &'a MatchedItem>,
+) -> bool {
+    visible
+        .into_iter()
+        .chain(parked)
+        .map(|item| item.access_group.as_deref())
+        .collect::<BTreeSet<_>>()
+        .len()
+        > 1
+}
+
 /// The service every swap-state record lives under: a reserved namespace
 /// outside the caller's own items, so a state record can never collide
 /// with an item the backend serves.
@@ -2073,6 +2166,34 @@ fn claim_lease_name(identity_account: &str) -> String {
     format!("lease-{hash:016x}")
 }
 
+/// The directory every caller on this user names identically for an
+/// identity's lease. `std::env::temp_dir` answers each caller's own
+/// `TMPDIR` — which differs between sessions, containers, and
+/// environments — so two callers resolving their own temporary
+/// directory could hold separate "exclusive" locks over one shared
+/// Keychain journal. The lease therefore lives under the
+/// machine-shared `/private/var/tmp` — a stable path every process of
+/// this user reaches — inside a directory only this user may write.
+/// `None` when the directory cannot be created or proved ours: the
+/// caller refuses the operation rather than locking where another
+/// user controls the namespace.
+fn claim_lease_directory() -> Option<std::path::PathBuf> {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let directory =
+        std::path::PathBuf::from("/private/var/tmp").join(format!("credential-lease-{uid}"));
+    std::fs::create_dir_all(&directory).ok()?;
+    let metadata = std::fs::metadata(&directory).ok()?;
+    // A directory another user placed here is not ours to lock inside.
+    if metadata.uid() != uid {
+        return None;
+    }
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).ok()?;
+    }
+    Some(directory)
+}
+
 /// The open descriptor — and exclusive lock — that proves a claim's
 /// operation is still running and serializes every coordinated caller
 /// on the identity. The file is one per identity: acquired before any
@@ -2105,22 +2226,18 @@ impl ClaimLease {
         if INJECTED_LEASE_FAILURE.with(std::cell::Cell::get) {
             return Err(claim_lease_unavailable());
         }
-        let candidate = std::env::temp_dir()
-            .join("credential-lease")
-            .join(claim_lease_name(identity_account));
-        let opened = candidate
-            .parent()
-            .and_then(|directory| std::fs::create_dir_all(directory).ok())
-            .and_then(|()| {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .read(true)
-                    .write(true)
-                    .truncate(false)
-                    .mode(0o600)
-                    .open(&candidate)
-                    .ok()
-            });
+        let Some(directory) = claim_lease_directory() else {
+            return Err(claim_lease_unavailable());
+        };
+        let candidate = directory.join(claim_lease_name(identity_account));
+        let opened = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&candidate)
+            .ok();
         let Some(file) = opened else {
             return Err(claim_lease_unavailable());
         };
@@ -2171,7 +2288,16 @@ fn swap_owner() -> Result<SwapOwner, KeychainError> {
 /// released journal is abandoned by definition: the writer marked it
 /// the moment its operation ended, whatever state its records are in,
 /// so ownership stops at the mark instead of at process exit.
-fn swap_owner_active(state: &SwapState) -> bool {
+///
+/// `held_lease` is the canonical path of the identity lease this call
+/// already holds. Every coordinated journal is written under that one
+/// exclusive lock, so a journal recorded under `held_lease` was written
+/// by the operation that last held it — that operation ended the moment
+/// the lock moved to this call, whatever the recorded owner's liveness
+/// or inspectability says. Only a journal recorded under a different
+/// lock, or under none, falls back to the owner's liveness and the
+/// recorded descriptor's presence.
+fn swap_owner_active(state: &SwapState, held_lease: &str) -> bool {
     if state.released {
         return false;
     }
@@ -2180,6 +2306,9 @@ fn swap_owner_active(state: &SwapState) -> bool {
         // here still holds the identifier: a finished call's residue is
         // orphaned and recoverable.
         return active_swaps().contains(&state.swap_id);
+    }
+    if state.lease_path.as_deref() == Some(held_lease) {
+        return false;
     }
     match process_start(state.owner.pid) {
         Some((sec, usec)) if sec == state.owner.start_sec && usec == state.owner.start_usec => {
@@ -2256,12 +2385,14 @@ struct SwapStateValue {
     /// recovery until the process exits.
     released: bool,
     /// The canonical path of the lease file the recording call holds:
-    /// the operation's provable handle, so a call that ended without
-    /// its released mark landing — a journal write lost to a temporary
-    /// outage — still stops owning the journal when the descriptor
-    /// closes. `None` on records too old to carry it, or written by a
-    /// caller that could not create the file: both keep the
-    /// process-lifetime proof.
+    /// the operation's provable handle. Because every coordinated
+    /// caller takes the same exclusive lock, a journal recorded under
+    /// the lock the recovering call holds resolves the moment that
+    /// lock is acquired; a journal recorded under a different lock, or
+    /// under none, still proves its call ended once the owner's
+    /// descriptor table no longer lists it. `None` on records too old
+    /// to carry it, or written by a caller that could not create the
+    /// file: both keep the process-lifetime proof.
     lease_path: Option<String>,
 }
 
@@ -3498,7 +3629,10 @@ fn claim_identity(
     // A journal a provably-live writer owns blocks the identity
     // outright: no record of any swap is touched while an operation
     // may still be running it.
-    if states.iter().any(swap_owner_active) {
+    if states
+        .iter()
+        .any(|state| swap_owner_active(state, &lease.path))
+    {
         return Ok(ClaimOutcome::Active);
     }
     for state in &states {
@@ -5110,16 +5244,19 @@ mod tests {
             start_sec: own_sec,
             start_usec: own_usec,
         };
-        assert!(!swap_owner_active(&state(self_owner, swap_id)));
+        // These journals record no lease, so the held-lease argument is
+        // any name that cannot collide with the recorded `None`.
+        let held = "synthetic-held-lease";
+        assert!(!swap_owner_active(&state(self_owner, swap_id), held));
         {
             let _claimed = ActiveSwap::claim(swap_id).unwrap();
-            assert!(swap_owner_active(&state(self_owner, swap_id)));
+            assert!(swap_owner_active(&state(self_owner, swap_id), held));
             // A second in-process claim on the same identifier is
             // refused: the recorded owner cannot tell threads apart, so
             // the registry arbitrates them.
             assert!(ActiveSwap::claim(swap_id).is_none());
         }
-        assert!(!swap_owner_active(&state(self_owner, swap_id)));
+        assert!(!swap_owner_active(&state(self_owner, swap_id), held));
         // A live foreign process at its recorded start instant is an
         // active writer; once it exits, the same recorded owner is
         // provably gone and the journal resolves.
@@ -5134,14 +5271,14 @@ mod tests {
             start_usec: usec,
         };
         let swap_id = Uuid::new_v4();
-        assert!(swap_owner_active(&state(foreign, swap_id)));
+        assert!(swap_owner_active(&state(foreign, swap_id), held));
         // A pid answering with a different start instant is a reuse —
         // the recorded owner is gone.
         let reused = SwapOwner {
             start_sec: sec.saturating_add(1),
             ..foreign
         };
-        assert!(!swap_owner_active(&state(reused, swap_id)));
+        assert!(!swap_owner_active(&state(reused, swap_id), held));
         // A journal marked released reads abandoned even while its
         // recorded owner still runs — the writer finished, so recovery
         // never waits on its process exit.
@@ -5149,28 +5286,33 @@ mod tests {
             released: true,
             ..state(foreign, swap_id)
         };
-        assert!(!swap_owner_active(&released));
+        assert!(!swap_owner_active(&released, held));
         child.kill().unwrap();
         child.wait().unwrap();
-        assert!(!swap_owner_active(&state(foreign, swap_id)));
+        assert!(!swap_owner_active(&state(foreign, swap_id), held));
     }
 
     #[test]
     fn a_lease_path_proves_the_call_ended_despite_a_live_owner() {
-        // The recorded lease is the call's own descriptor: a foreign
-        // owner that no longer holds it has ended its operation even
-        // while the process itself still runs — the released mark may
-        // never have landed, and recovery must not wait on its exit.
-        let lease = ClaimLease::acquire(&format!("synthetic-lease-probe-{}", Uuid::new_v4()))
+        // The recorded lease is the operation's lock: a journal
+        // recorded under the lock this call holds was written by the
+        // operation that last held it, and the exclusive lock moved —
+        // that operation is over however live the recorded owner still
+        // is and however unavailable its descriptors are to inspect. A
+        // journal recorded under a different lock keeps the
+        // conservative proofs: the recorded owner's liveness, then the
+        // recorded descriptor's presence.
+        let held = ClaimLease::acquire(&format!("synthetic-lease-probe-{}", Uuid::new_v4()))
             .unwrap()
             .expect("a fresh identity's lease is free");
         let own_pid = std::process::id();
-        assert_eq!(owner_holds_lease(own_pid, &lease.path), Some(true));
-        drop(lease);
-        assert_eq!(
-            owner_holds_lease(own_pid, "/private/tmp/credential-lease/claim-gone"),
-            Some(false)
-        );
+        assert_eq!(owner_holds_lease(own_pid, &held.path), Some(true));
+        let gone = ClaimLease::acquire(&format!("synthetic-lease-gone-{}", Uuid::new_v4()))
+            .unwrap()
+            .expect("a fresh identity's lease is free");
+        let gone_path = gone.path.clone();
+        drop(gone);
+        assert_eq!(owner_holds_lease(own_pid, &gone_path), Some(false));
 
         let state = |owner: SwapOwner, swap_id: Uuid, lease_path: Option<String>| SwapState {
             reference: CFData::from_buffer(&[0xE1u8; 16]),
@@ -5181,9 +5323,6 @@ mod tests {
             parked_group: None,
             lease_path,
         };
-        // A live child that never held the recorded path has ended its
-        // call — the journal is orphaned even though the writer's
-        // process is still running.
         let mut idle = std::process::Command::new("/bin/cat")
             .stdin(std::process::Stdio::piped())
             .spawn()
@@ -5195,46 +5334,85 @@ mod tests {
             start_usec: usec,
         };
         let swap_id = Uuid::new_v4();
-        assert!(!swap_owner_active(&state(
-            owner,
-            swap_id,
-            Some("/private/tmp/credential-lease/claim-never-held".to_owned())
-        )));
+        // A live foreign owner whose journal names the held lease has
+        // ended its call — the lock moved to this process, so the
+        // journal resolves with no descriptor inspection at all.
+        assert!(!swap_owner_active(
+            &state(owner, swap_id, Some(held.path.clone())),
+            &held.path
+        ));
+        // A journal under a lock this call does not hold answers through
+        // the recorded descriptor instead: the idle child holds nothing
+        // open there, so its call is over too.
+        assert!(!swap_owner_active(
+            &state(owner, swap_id, Some(gone_path.clone())),
+            &held.path
+        ));
         idle.kill().unwrap();
         idle.wait().unwrap();
 
-        // A live child still holding the recorded descriptor keeps the
-        // journal live-owned for exactly as long as its call runs.
-        let held = ClaimLease::acquire(&format!("synthetic-lease-held-{swap_id}"))
+        // A live child still holding a foreign recorded descriptor
+        // keeps its journal live-owned for exactly as long as it holds
+        // it — a different lock can prove nothing about that call.
+        let foreign = ClaimLease::acquire(&format!("synthetic-lease-foreign-{swap_id}"))
             .unwrap()
             .expect("a fresh identity's lease is free");
+        let foreign_path = foreign.path.clone();
+        drop(foreign);
         let mut holder = std::process::Command::new("/bin/sh")
             .args([
                 "-c",
                 "exec 9<\"$1\"; sleep 60",
                 "holder",
-                held.path.as_str(),
+                foreign_path.as_str(),
             ])
             .spawn()
             .unwrap();
         let (sec, usec) = process_start(holder.id()).unwrap();
-        let owner = SwapOwner {
+        let holder_owner = SwapOwner {
             pid: holder.id(),
             start_sec: sec,
             start_usec: usec,
         };
-        let leased = || state(owner, swap_id, Some(held.path.clone()));
+        let leased = || state(holder_owner, swap_id, Some(foreign_path.clone()));
         for _ in 0..200 {
-            if owner_holds_lease(holder.id(), &held.path) == Some(true) {
+            if owner_holds_lease(holder.id(), &foreign_path) == Some(true) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(owner_holds_lease(holder.id(), &held.path), Some(true));
-        assert!(swap_owner_active(&leased()));
+        assert_eq!(owner_holds_lease(holder.id(), &foreign_path), Some(true));
+        assert!(swap_owner_active(&leased(), &held.path));
+        // Acquiring the very lock the journal names is the
+        // operation-lifetime proof: the child's open descriptor is not
+        // the lock, so the journal resolves the moment this call holds
+        // it — even while the child's descriptor stays open.
+        let reacquired = acquire_when_free(&format!("synthetic-lease-foreign-{swap_id}"));
+        assert_eq!(reacquired.path, foreign_path);
+        assert!(!swap_owner_active(&leased(), &reacquired.path));
+        drop(reacquired);
         holder.kill().unwrap();
         holder.wait().unwrap();
-        assert!(!swap_owner_active(&leased()));
+        assert!(!swap_owner_active(&leased(), &held.path));
+    }
+
+    /// Acquire an identity's lease once the last holder's descriptor is
+    /// gone. A thread that forked a child while the lease was open pins
+    /// the same open file description — and its lock — until the
+    /// child's exec closes the inherited copy, so a lock freed by the
+    /// holder's own close can read busy for that fork's span: the
+    /// acquisition polls over that window instead of demanding the
+    /// descriptor vanish inside one scheduling slice. A lock that is
+    /// genuinely still held never frees and the caller reports it.
+    fn acquire_when_free(identity_account: &str) -> ClaimLease {
+        for _ in 0..2000 {
+            match ClaimLease::acquire(identity_account) {
+                Ok(Some(lease)) => return lease,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Err(error) => panic!("the lease cannot be set up: {}", error.code()),
+            }
+        }
+        panic!("the ended operation's lock never freed");
     }
 
     #[test]
@@ -5248,7 +5426,11 @@ mod tests {
         // claim's owner record while the first still mutates its
         // records.
         let context = synthetic_context();
-        let query = KeychainItemQuery::new("synthetic-service", "synthetic-account").unwrap();
+        // The identity is unique to this run: the lease file is shared
+        // by every process of this user, so a fixed name would collide
+        // with any other copy of this suite running in parallel.
+        let account = format!("synthetic-account-{}", Uuid::new_v4());
+        let query = KeychainItemQuery::new("synthetic-service", &account).unwrap();
         let identity = swap_state_account(query.service, query.account);
         let held = ClaimLease::acquire(&identity)
             .unwrap()
@@ -5262,7 +5444,79 @@ mod tests {
         drop(held);
         // The lease is the operation's own lifetime: closing it frees
         // the identity even when no journal mark landed.
-        assert!(ClaimLease::acquire(&identity).unwrap().is_some());
+        let _ = acquire_when_free(&identity);
+    }
+
+    #[test]
+    fn the_identity_lease_contends_across_temporary_directories() {
+        // The lease names one file every caller of this user shares —
+        // it cannot live under a per-process temporary directory: two
+        // callers with different TMPDIR values would otherwise lock
+        // separate files over one shared Keychain journal and race
+        // their takeovers. The parent acquires the identity's lease,
+        // then a child launched under a different TMPDIR must report
+        // the identity busy on the same lock — the child's own
+        // temporary directory is never consulted.
+        const CHILD_IDENTITY: &str = "CREDENTIAL_LEASE_TEST_CHILD_IDENTITY";
+        if let Ok(identity) = std::env::var(CHILD_IDENTITY) {
+            assert!(ClaimLease::acquire(&identity).unwrap().is_none());
+            return;
+        }
+        let identity = format!("synthetic-cross-tmpdir-{}", Uuid::new_v4());
+        let held = ClaimLease::acquire(&identity)
+            .unwrap()
+            .expect("a fresh identity's lease is free");
+        let other_tmp =
+            std::env::temp_dir().join(format!("credential-lease-tmpdir-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&other_tmp).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "macos::tests::the_identity_lease_contends_across_temporary_directories",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_IDENTITY, &identity)
+            .env("TMPDIR", &other_tmp)
+            .status()
+            .unwrap();
+        drop(held);
+        let _ = std::fs::remove_dir(&other_tmp);
+        assert!(status.success());
+    }
+
+    #[test]
+    fn delete_candidates_refuse_more_than_one_credential() {
+        // The delete's candidate set — the visible record and every
+        // proven parked original — must name one credential before the
+        // first deletion: records in several access groups are several
+        // credentials an unscoped delete cannot choose between.
+        let item = |group: Option<&str>| MatchedItem {
+            reference: Some(CFData::from_buffer(&[0xABu8; 16])),
+            protected: false,
+            access_group: group.map(str::to_owned),
+            synchronizable: None,
+            generic: None,
+        };
+        let empty: [&MatchedItem; 0] = [];
+        // Nothing matched at all, or one record alone: the delete can
+        // proceed — there is nothing to choose between.
+        assert!(!delete_candidates_ambiguous(None, empty));
+        let one = item(Some("group-a"));
+        assert!(!delete_candidates_ambiguous(None, [&one]));
+        assert!(!delete_candidates_ambiguous(Some(&one), empty));
+        // A visible record and a parked original in the same group are
+        // one credential: the parked copy goes, then the record.
+        let same = item(Some("group-a"));
+        assert!(!delete_candidates_ambiguous(Some(&one), [&same]));
+        let ungrouped = item(None);
+        assert!(!delete_candidates_ambiguous(Some(&ungrouped), [&ungrouped]));
+        // Records in different groups — visible or parked — are several
+        // credentials: refused before any deletion runs.
+        let other = item(Some("group-b"));
+        assert!(delete_candidates_ambiguous(Some(&one), [&other]));
+        assert!(delete_candidates_ambiguous(None, [&one, &other]));
+        assert!(delete_candidates_ambiguous(Some(&one), [&same, &other]));
     }
 
     #[test]
@@ -5356,21 +5610,26 @@ mod tests {
             dropped_lease_path = dropped.lease_path.clone().unwrap();
         }
         INJECTED_KEYCHAIN_STATUS.with(|cell| cell.set(None));
-        // Both journals the store still holds read live-owned on their
-        // face — a live owner, never marked released — but the calls
-        // that owned them have ended, so the recorded lease paths no
-        // longer resolve to an open descriptor.
-        assert!(!swap_owner_active(&journal_state(
-            owner, swap_id, lease_path
-        )));
-        assert!(!swap_owner_active(&journal_state(
-            dropped_owner,
-            dropped_id,
-            dropped_lease_path.clone()
-        )));
-        // The same stranded record under a foreign owner resolves by
-        // the recorded lease alone: the process still runs, yet the
-        // call that ended no longer holds the descriptor.
+        // Each stranded journal resolves the moment the next caller
+        // acquires the identity's lease: holding the same exclusive
+        // lock proves the operation that wrote the record has ended,
+        // whatever the recorded owner's liveness or inspectability
+        // says.
+        for (swap_id, owner, lease_path) in [
+            (swap_id, owner, lease_path),
+            (dropped_id, dropped_owner, dropped_lease_path.clone()),
+        ] {
+            let held = acquire_when_free(&format!("synthetic-identity-{swap_id}"));
+            assert_eq!(held.path, lease_path);
+            assert!(!swap_owner_active(
+                &journal_state(owner, swap_id, lease_path),
+                &held.path
+            ));
+        }
+        // The same stranded record under a foreign owner resolves
+        // through the recorded lease's descriptor when the held lock
+        // is a different one: the process still runs, yet the call
+        // that ended no longer holds the descriptor.
         let mut foreign = std::process::Command::new("/bin/cat")
             .stdin(std::process::Stdio::piped())
             .spawn()
@@ -5385,11 +5644,10 @@ mod tests {
             owner_holds_lease(foreign.id(), &dropped_lease_path),
             Some(false)
         );
-        assert!(!swap_owner_active(&journal_state(
-            foreign_owner,
-            dropped_id,
-            dropped_lease_path
-        )));
+        assert!(!swap_owner_active(
+            &journal_state(foreign_owner, dropped_id, dropped_lease_path),
+            "synthetic-unrelated-lease"
+        ));
         foreign.kill().unwrap();
         foreign.wait().unwrap();
     }
